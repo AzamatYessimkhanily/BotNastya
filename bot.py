@@ -32,10 +32,10 @@ BUFFER_DELAY = 6.0
 MOYKLASS_BASE_URL = "https://api.moyklass.com/v1/company"
 LEAD_CLASS_ID = 341820
 MANAGER_ID = 98753
-SESSION_TIMEOUT = 5 * 60 * 60  # 5 часов
-IDLE_TIMEOUT = 2 * 60 * 60     # 2 часа (время до напоминания)
+SESSION_TIMEOUT = 5 * 60 * 60 # 5 часов
 
-# --- ТЕЛЕФОНЫ МЕНЕДЖЕРОВ ---
+# --- ТЕЛЕФОНЫ МЕНЕДЖЕРОВ (ИЗ ТВОЕГО ТЕКСТА) ---
+# Ключ: ID филиала (или название). Значение: Номер телефона.
 BRANCH_PHONES = {
     37754: "+7 778 104 8197", # Аркада (Аяулым Жумажановна)
     42763: "+7 778 104 8127", # Камал (Шолпан Жолдыбаевна)
@@ -51,7 +51,7 @@ BRANCH_PHONES = {
     "default": "+7 708 174 7426" # Общий
 }
 
-# КАРТА ФИЛИАЛОВ
+# КАРТА ФИЛИАЛОВ (Для поиска ID)
 FILIALS_MAP = {
     "аркада": 37754, "arkada": 37754,
     "камал": 42763, "kamal": 42763,
@@ -70,79 +70,163 @@ FILIALS_MAP = {
     "49а": 61507
 }
 
-# --- 2. СИСТЕМНЫЙ ПРОМПТ ---
+# --- 2. ПОЛНЫЙ СИСТЕМНЫЙ ПРОМПТ (ТВОЙ НОВЫЙ ТЕКСТ) ---
 SYSTEM_PROMPT = """
-Вы — консультант шахматной академии GMCA и сети шахматных кружков при школах GM Legends в Астане.
-Ваша задача — помочь клиенту выбрать формат обучения, собрать информацию и передать её менеджеру.
+Ты — консультант шахматной академии GMCA и сети школьных шахматных кружков GM Legends в Астане. Твоя цель: помочь выбрать формат обучения, собрать данные клиента и передать заявку в CRM Moyklass через функцию register_client_request. Ты не записываешь напрямую и не подтверждаешь время — этим занимается управляющий/менеджер после получения заявки.
 
-Шаг 1. Приветствие и возраст.
-«Здравствуйте! 🌸 Меня зовут Алия, я консультант шахматной академии GMCA. Как я могу к вам обращаться? Вы ищете обучение для себя или для ребёнка?»
-Если ребенок: Узнай возраст и опыт (разряд).
+⸻
 
-Шаг 2. Выбор филиала и ПРОВЕРКА ШКОЛЫ.
-ВАЖНОЕ ИЗМЕНЕНИЕ: Не перечисляй адреса текстом.
-Скажи клиенту:
-«Чтобы выбрать удобный филиал, пожалуйста, посмотрите карту наших локаций по ссылке:
-👉 https://gmchess.kz/obuchenievshkole/
-Напишите мне, какой филиал или школа вам подходит.»
+1) Как общаться
+	•	Пиши живым, естественным языком, без “скрипта”, без фиксированных шаблонов и одинаковых фраз.
+	•	Всегда отвечай на вопрос клиента по смыслу, даже если он “ломает шаги” (спросил цену, адрес, онлайн, пробный, расписание и т.д.).
+	•	После ответа мягко вернись к сбору недостающих данных, чтобы оформить заявку.
+	•	Не перегружай вопросами: спрашивай только то, что реально нужно для подбора и заявки.
 
-🔴 КРИТИЧЕСКИ ВАЖНАЯ ПРОВЕРКА (ПРОТОКОЛ БЕЗОПАСНОСТИ):
-Как только клиент называет школу (филиал GM Legends), ты ОБЯЗАНА спросить:
-«Подскажите, ваш ребенок является учеником этой школы?»
+⸻
 
-Сценарий А: Клиент говорит "НЕТ" (ребенок не учится в этой школе).
-Ты отвечаешь:
-«К сожалению, согласно строгому протоколу безопасности школы, мы не можем принимать на кружок детей, которые там не обучаются. 😔
-Но вы можете записаться в наши профессиональные Академии GMCA (открытый доступ для всех):
-1. Филиал "Аркада" (р-н Хан-Шатыр)
-2. Филиал "Камал" (пр. Улы Дала)
-Какой из них вам ближе?»
-(НЕ записывай клиента в школу, если он там не учится).
+2) Что обязательно выяснить (минимум данных)
 
-Сценарий Б: Клиент говорит "ДА" (ребенок учится в этой школе).
-Отвечаешь: «Отлично! Тогда мы можем продолжить оформление в эту группу.»
+Собери и сохрани для заявки:
+	•	Имя обратившегося
+	•	Телефон обратившегося
+	•	Для кого обучение: взрослый или ребёнок
+	•	Если ребёнок: имя ребёнка (если нужно), возраст
+	•	Опыт/стаж и/или разряд (если есть)
+	•	Формат: офлайн/онлайн
+	•	Выбранный филиал/школа (клиент выбирает сам)
 
-Сценарий В: Клиент выбирает GMCA (Аркада или Камал).
-Сразу переходи к оформлению, вопрос про школу задавать не нужно.
+⸻
 
-ЛОГИКА ПО УРОВНЮ ИГРЫ:
-- Если 2 разряд и выше: Только GMCA (Аркада/Камал). В школьные кружки (GM Legends) таких сильных детей не берем.
-- Взрослые: Только индивидуально и только в GMCA.
+3) Критические правила и запреты (строго)
 
-Шаг 3. Пробное занятие.
-Если клиент подходит (новичок или слабый разряд) — предложи бесплатный пробный урок.
-Исключения (не предлагать пробный): 2 разряд и выше, взрослые.
+3.1. Про “ближайший филиал”
 
-Шаг 4. Сбор данных и Финал.
-Собери: Имя, Телефон, Возраст, Опыт, Филиал.
-Вызови функцию `register_client_request`.
-После вызова функции попрощайся и скажи, что заявка передана.
-ОБЯЗАТЕЛЬНО дай номер управляющего выбранного филиала (если филиал определен).
+Ты НЕ умеешь определять, какой филиал ближе по адресу.
+Запрещено писать: «вам ближе…», «учитывая ваш адрес…», «самый ближайший…» и любые догадки.
+Если клиент спрашивает “какой ближе” — честно скажи, что не можешь точно посчитать, и предложи выбрать самому.
 
---- СПРАВОЧНИК УПРАВЛЯЮЩИХ (ДЛЯ ТВОЕГО ОТВЕТА) ---
-Аркада: Аяулым Жумажановна +7 778 104 8197
-Камал: Шолпан Жолдыбаевна +7 778 104 8127
-Binom Алтынсарина / Riviera / РФМШ: Томирис Ержанқызы +7 771 231 4549
-Binom Кекилбаева / Кадыр Мырза Али / Steppe: Айгерим Аманжолқызы +7 775 254 2671
-Harmony: Адиль мырза +7 778 200 2088
-NGS: Ясмин +7 771 857 5505
-Quantum: Зарина +7 705 287 6382
+3.2. Про адреса и ссылки
+	•	Не перечисляй адреса филиалов и 2GIS-ссылки из промпта.
+	•	Если клиент спрашивает “адрес/где вы/какие филиалы/скинь локации” — отправляй одну ссылку:
+https://gmchess.kz/obuchenievshkole/
+И попроси клиента написать, какой филиал/школу он выбирает.
 
---- ЦЕНЫ ---
-GMCA (Академия): 30-40 тыс тг/мес.
-GM Legends (Школы): от 30 тыс тг (Binom от 20 тыс тг).
-Индивидуально: от 7000 тг/урок.
+3.3. Про взрослых
+
+Взрослых обучаете только индивидуально.
+Цена: от 7 000 тг за урок (1 астрономический час), зависит от квалификации тренера.
+Взрослым не предлагать GM Legends.
+
+3.4. Никогда не называть управляющих “тренерами”
+
+Люди, указанные в базе, — управляющие филиалов, не тренеры.
+
+⸻
+
+4) Логика подбора (главное ядро)
+
+4.1. Высокий уровень (только GMCA, без GM Legends)
+
+Если у ребёнка:
+	•	опыт > 3 лет ИЛИ 2 разряд/1 разряд → предлагай только GMCA (офлайн или онлайн).
+	•	опыт > 5 лет ИЛИ КМС/МС → предлагай только GMCA, приоритет GMCA (Аркада), если офлайн не подходит — онлайн.
+GM Legends в этих случаях запрещён.
+
+4.2. Начальный/средний уровень (можно GMCA и GM Legends)
+
+Если:
+	•	нет опыта, или
+	•	3/4/5 разряд, или
+	•	нет разряда
+→ можно предлагать GMCA и GM Legends (если ребёнок).
+
+4.3. Важное предупреждение: ребёнок 13+ без опыта
+
+Если возраст ребёнка 13+ и опыта нет — предупреди родителя: в начале ребёнок может тренироваться с более младшими, обычно 2–3 месяца, потом догоняет; вы постараетесь быстрее перевести к более старшим.
+
+⸻
+
+5) Бесплатное пробное занятие (правила)
+
+Обычно можно предложить бесплатный пробный урок, но есть исключения.
+
+НЕ предлагать пробный, если:
+	•	клиент занимался шахматами более 6 месяцев, или
+	•	у клиента есть разряд (при этом 5 разряд не считается — он выдуманный), или
+	•	ребёнок 3 разряд / 2 разряд / 1 разряд / КМС / Мастер спорта.
+
+Предлагать пробный, если:
+	•	опыта нет или опыт < 6 месяцев.
+
+Допущение:
+	•	если клиент с 4 разрядом сам спросил про пробный — можно согласиться.
+
+⸻
+
+6) Цены, расписание, онлайн (если спрашивают)
+
+Используй эти факты, не придумывай:
+
+GMCA (дети, группы)
+	•	Начинающие / 5 / 4 разряд — 30 000 тг/мес, 3 раза в неделю по 1 часу
+	•	3 разряд — 35 000 тг/мес, 3 раза в неделю по 1,5 часа
+	•	1–2 разряд — 40 000 тг/мес, 3 раза в неделю по 2 часа
+	•	КМС — 40 000 тг/мес, 3 раза в неделю по 2 часа
+
+Индивидуальные
+	•	от 7 000 тг / урок (1 час)
+
+GM Legends
+	•	во всех школах (кроме Binom) — от 30 000 тг/мес
+	•	в школах Binom — от 20 000 тг/мес
+
+Время занятий
+	•	GMCA — утром/до обеда/после обеда/вечером
+	•	GM Legends — после уроков или до уроков (2 смена)
+
+Онлайн
+	•	стоимость как в GMCA очно
+
+⸻
+
+7) Как завершать диалог
+
+Когда собраны (Имя, Телефон, Возраст, Опыт, Филиал) — вызови register_client_request.
+Не пиши “Новая заявка…” текстом. Только функция.
+
+После успешного вызова:
+	•	поблагодари, скажи что передал(а) заявку управляющему филиала, он свяжется и согласует время.
+	•	также передай клиенту номер телефона управляющего выбранным филиалом:
+[Номер бот подставит автоматически из базы знаний, если выбран филиал]
+
+⸻
+
+8) Работа с существующими учениками
+
+Если система показывает [СИСТЕМНОЕ ДОСЬЕ КЛИЕНТА]:
+	1.	не спрашивай имя и телефон,
+	2.	дай расписание ближайшего урока и имя преподавателя,
+	3.	если вопрос сложный — дай номер менеджера,
+	4.	если данных нет: сообщи, что пока не видишь информацию о занятиях.
+
+⸻
+
+9) Франшиза (только если клиент спросил)
+
+Если интерес к франшизе — уточни (опыт, город, почему шахматы) и дай номер: Данияр +7 777 955 9999.
+
+⚠️ ТЕХНИЧЕСКОЕ ЗАДАНИЕ:
+Когда собраны данные (Имя, Телефон, Возраст, Опыт, Филиал), вызовите `register_client_request`.
+Не пишите "Новая заявка..." текстом. Только через функцию.
 """
 
 app = FastAPI()
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# Хранилище данных
 chat_history: Dict[str, List[Dict]] = {}
 message_buffers: Dict[str, Dict] = {}
 known_users: Dict[str, dict] = {}
-last_activity: Dict[str, float] = {}
-conversation_status: Dict[str, str] = {} # "active", "registered", "nudged"
+last_activity: Dict[str, float] = {} 
 
 # --- 3. CRM МОДУЛЬ ---
 class MoyKlassCRM:
@@ -157,6 +241,7 @@ class MoyKlassCRM:
                     resp = await client.post(f"{MOYKLASS_BASE_URL}/auth/getToken", json={"apiKey": self.api_key})
                     if resp.status_code == 200:
                         self.token = resp.json()["accessToken"]
+                        logger.info("✅ CRM: Токен получен")
                     else:
                         logger.error(f"❌ Auth Error: {resp.text}")
                         return None
@@ -166,9 +251,11 @@ class MoyKlassCRM:
         return {"x-access-token": self.token, "Content-Type": "application/json"}
 
     async def get_schedule(self, user_id, headers):
+        """Получает расписание + ИМЕНА ПРЕПОДАВАТЕЛЕЙ"""
         schedule_text = "Нет ближайших уроков."
         try:
             async with httpx.AsyncClient() as client:
+                # 1. Скачиваем список учителей
                 teachers_map = {}
                 try:
                     r_mgr = await client.get(f"{MOYKLASS_BASE_URL}/managers", headers=headers)
@@ -177,9 +264,13 @@ class MoyKlassCRM:
                             teachers_map[m['id']] = m['name']
                 except: pass
 
+                # 2. Скачиваем уроки
                 today = datetime.now().strftime("%Y-%m-%d")
                 future = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
-                params = {"userId": user_id, "date": [today, future], "includeLessons": "true", "limit": 3, "sort": "date"}
+                params = {
+                    "userId": user_id, "date": [today, future],
+                    "includeLessons": "true", "limit": 3, "sort": "date"
+                }
                 
                 resp = await client.get(f"{MOYKLASS_BASE_URL}/lessonRecords", headers=headers, params=params)
                 if resp.status_code == 200:
@@ -190,9 +281,11 @@ class MoyKlassCRM:
                             lesson = rec.get("lesson", {})
                             d = lesson.get("date", "")
                             t = lesson.get("beginTime", "")
+                            
                             t_ids = lesson.get("teacherIds", [])
                             t_names = [teachers_map.get(tid, "Тренер") for tid in t_ids]
                             teacher_str = ", ".join(t_names) if t_names else "без тренера"
+                            
                             lessons_list.append(f"{d} в {t} (Преп: {teacher_str})")
                         schedule_text = "; ".join(lessons_list)
         except Exception as e:
@@ -209,6 +302,7 @@ class MoyKlassCRM:
         return "Группа"
 
     async def find_user_smart(self, phone):
+        """УМНЫЙ ПОИСК (7, 8, +7, +8) + ДОСЬЕ"""
         headers = await self._get_headers()
         if not headers: return None
         
@@ -225,13 +319,16 @@ class MoyKlassCRM:
                 try:
                     url = f"{MOYKLASS_BASE_URL}/users?phone={p}&includeJoins=true"
                     resp = await client.get(url, headers=headers)
+                    
                     if resp.status_code == 200:
                         data = resp.json()
                         users = data.get("users", [])
                         if users:
                             user = users[0]
                             user_id = user['id']
+                            logger.info(f"✅ НАЙДЕН КЛИЕНТ: {user['name']} (ID {user_id})")
                             
+                            # --- СБОР ДОСЬЕ ---
                             groups_text = "Нет активных групп"
                             active_filial_id = None
                             joins = user.get("joins", [])
@@ -250,12 +347,17 @@ class MoyKlassCRM:
                             schedule_text = await self.get_schedule(user_id, headers)
                             
                             dossier = {
-                                "id": user_id, "name": user['name'], "groups": groups_text,
-                                "schedule": schedule_text, "balance": user.get('balans', 0),
+                                "id": user_id,
+                                "name": user['name'],
+                                "groups": groups_text,
+                                "schedule": schedule_text,
+                                "balance": user.get('balans', 0),
                                 "filial_id": active_filial_id
                             }
                             return {"user": user, "dossier": dossier}
                 except: pass
+        
+        logger.info(f"👤 Клиент не найден (проверено {len(phones_to_try)} вар).")
         return None
 
     async def create_lead(self, name, phone, age, experience, preference):
@@ -264,17 +366,20 @@ class MoyKlassCRM:
         wa_link = f"https://wa.me/{clean_phone}"
         
         filial_id = None
-        mgr_phone_text = ""
+        mgr_phone_text = "" # Номер менеджера для ответа
 
         if preference:
             branch_lower = preference.lower()
             for key, f_id in FILIALS_MAP.items():
                 if key in branch_lower:
                     filial_id = f_id
+                    # Находим телефон менеджера этого филиала
                     mgr_phone = BRANCH_PHONES.get(f_id, BRANCH_PHONES["default"])
                     mgr_phone_text = f"Номер управляющего филиалом: {mgr_phone}"
                     break
         
+        logger.info(f"📍 Выбран филиал: {preference} -> ID {filial_id}")
+
         # ДР
         birth_attr = []
         try:
@@ -284,8 +389,13 @@ class MoyKlassCRM:
         except: pass
 
         full_text = (
-            f"🤖 БОТ ЗАЯВКА:\n👤 {name}\n📱 {phone}\n📍 Выбор: {preference}\n"
-            f"👶 Возраст: {age}\n♟️ Опыт: {experience}\n🔗 WhatsApp: {wa_link}"
+            f"🤖 БОТ ЗАЯВКА:\n"
+            f"👤 {name}\n"
+            f"📱 {phone}\n"
+            f"📍 Выбор: {preference}\n"
+            f"👶 Возраст: {age}\n"
+            f"♟️ Опыт: {experience}\n"
+            f"🔗 WhatsApp: {wa_link}"
         )
 
         async with httpx.AsyncClient() as client:
@@ -299,8 +409,10 @@ class MoyKlassCRM:
                 })
             else:
                 payload = {
-                    "name": name, "phone": clean_phone, 
-                    "responsibles": [MANAGER_ID], "attributes": birth_attr
+                    "name": name, 
+                    "phone": clean_phone, 
+                    "responsibles": [MANAGER_ID],
+                    "attributes": birth_attr
                 }
                 if filial_id: payload["filials"] = [filial_id]
 
@@ -313,6 +425,7 @@ class MoyKlassCRM:
                 else:
                     return f"ERROR CRM: {create_resp.text}"
 
+            # Заявка
             join_payload = {
                 "userId": user_id, "statusId": 1, "classId": LEAD_CLASS_ID,
                 "comment": full_text, "managerId": MANAGER_ID
@@ -320,6 +433,7 @@ class MoyKlassCRM:
             if filial_id: join_payload["filialId"] = filial_id
             await client.post(f"{MOYKLASS_BASE_URL}/joins", headers=headers, json=join_payload)
 
+            # Задача
             try:
                 now = datetime.now().strftime("%Y-%m-%d")
                 await client.post(f"{MOYKLASS_BASE_URL}/tasks", headers=headers, json={
@@ -329,7 +443,8 @@ class MoyKlassCRM:
                 })
             except: pass
 
-            final_msg = f"СИСТЕМНОЕ СООБЩЕНИЕ: УСПЕХ. Заявка создана. "
+            # Добавляем в ответ номер менеджера, если филиал был определен
+            final_msg = f"СИСТЕМНОЕ СООБЩЕНИЕ: УСПЕХ. Заявка создана. Попрощайся. "
             if mgr_phone_text:
                 final_msg += f"ОБЯЗАТЕЛЬНО напиши клиенту этот номер: {mgr_phone_text}"
             
@@ -343,7 +458,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "register_client_request",
-            "description": "Записать заявку в CRM. Вызывать в конце диалога.",
+            "description": "Записать заявку в CRM.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -359,41 +474,11 @@ tools = [
     }
 ]
 
-# --- 5. WHATSAPP & BACKGROUND TASKS ---
+# --- 5. WHATSAPP ---
 async def send_whatsapp(chat_id, text):
     url = f"https://api.green-api.com/waInstance{GREEN_API_ID}/sendMessage/{GREEN_API_TOKEN}"
     async with httpx.AsyncClient() as client:
         await client.post(url, json={"chatId": chat_id, "message": text})
-
-async def check_idle_chats():
-    """Фоновая задача: проверяет зависшие диалоги каждые 5 минут"""
-    while True:
-        try:
-            current_time = time.time()
-            # Создаем копию ключей, чтобы не было ошибки при изменении словаря
-            for chat_id, last_time in list(last_activity.items()):
-                status = conversation_status.get(chat_id, "active")
-                
-                # Если прошло больше 2 часов, статус активен (не зарегистрирован) и еще не напоминали
-                if (current_time - last_time > IDLE_TIMEOUT) and status == "active":
-                    
-                    logger.info(f"⏰ Напоминание для {chat_id}")
-                    nudge_text = "Здравствуйте! Мы с вами не закончили оформление заявки. Подскажите, у вас остались какие-то вопросы или сложности с выбором?"
-                    
-                    # Отправляем сообщение
-                    await send_whatsapp(chat_id, nudge_text)
-                    
-                    # Добавляем это в историю, чтобы ИИ знал о напоминании
-                    if chat_id in chat_history:
-                        chat_history[chat_id].append({"role": "assistant", "content": nudge_text})
-                    
-                    # Меняем статус, чтобы не спамить
-                    conversation_status[chat_id] = "nudged"
-                    
-        except Exception as e:
-            logger.error(f"Error in watchdog: {e}")
-        
-        await asyncio.sleep(300) # Проверка каждые 5 минут
 
 # --- 6. ЛОГИКА ---
 async def process_dialog(chat_id):
@@ -402,48 +487,55 @@ async def process_dialog(chat_id):
     user_text = " ".join(buffer["messages"])
     logger.info(f"📩 Обработка для {chat_id}: {user_text}")
 
-    # Обновляем время активности и сбрасываем сессию если нужно
+    # Сброс сессии
     current_time = time.time()
     if chat_id in last_activity:
         if current_time - last_activity[chat_id] > SESSION_TIMEOUT:
             logger.info(f"🧹 Сброс памяти для {chat_id}")
             chat_history.pop(chat_id, None)
             known_users.pop(chat_id, None)
-            conversation_status[chat_id] = "active" # Сброс статуса
-    
     last_activity[chat_id] = current_time
-    
-    # Если это новый диалог или после сброса
+
     if chat_id not in chat_history:
         chat_history[chat_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
-        conversation_status[chat_id] = "active"
         
+        # --- ДОБАВЬ ЭТОТ БЛОК СЮДА ---
         current_phone = chat_id.split("@")[0]
         chat_history[chat_id].append({
             "role": "system", 
-            "content": f"[ТЕЛЕФОН КЛИЕНТА]: {current_phone}. Если клиент пишет 'запиши на этот номер', используй этот."
+            "content": f"[ТЕЛЕФОН КЛИЕНТА]: {current_phone}. Если клиент пишет 'запиши на этот номер' или 'мой номер', бери этот."
         })
-        
-        # Проверка клиента
+        # --- ПРОВЕРКА КЛИЕНТА + ДОСЬЕ ---
         if chat_id not in known_users:
             phone = chat_id.split("@")[0]
             found = await crm.find_user_smart(phone)
+            
             if found:
                 user_obj = found["user"]
                 dossier = found["dossier"]
                 known_users[chat_id] = user_obj
-                conversation_status[chat_id] = "registered" # Существующий клиент считается "закрытым" в плане лида
                 
+                # Определяем телефон менеджера филиала (если есть)
                 mgr_contact = ""
                 if dossier["filial_id"] and dossier["filial_id"] in BRANCH_PHONES:
                      mgr_contact = f"Его менеджер: {BRANCH_PHONES[dossier['filial_id']]}."
 
                 inject_msg = (
-                    f"[СИСТЕМНОЕ ДОСЬЕ КЛИЕНТА]\nИмя: {dossier['name']}\nГруппы: {dossier['groups']}\n"
-                    f"Ближайшие уроки: {dossier['schedule']}\nБаланс: {dossier['balance']}\n{mgr_contact}\n"
-                    f"ИНСТРУКЦИЯ: Это действующий ученик! Сразу переходи к делу (расписание/проблема). Не регистрируй как нового."
+                    f"[СИСТЕМНОЕ ДОСЬЕ КЛИЕНТА]\n"
+                    f"Имя: {dossier['name']}\n"
+                    f"Группы: {dossier['groups']}\n"
+                    f"Ближайшие уроки: {dossier['schedule']}\n"
+                    f"Баланс: {dossier['balance']}\n"
+                    f"{mgr_contact}\n"
+                    f"ИНСТРУКЦИЯ: Это действующий ученик! НЕ СПРАШИВАЙ ИМЯ И ТЕЛЕФОН.\n"
+                    f"1. Поздоровайся по имени.\n"
+                    f"2. Если есть урок в поле 'Ближайшие уроки', ОБЯЗАТЕЛЬНО скажи: 'Ждем вас [Дата/Время] на уроке с [Имя преподавателя]'.\n"
+                    f"3. Если нет — спроси, чем помочь.\n"
+                    f"4. Если вопрос сложный, дай номер менеджера филиала."
                 )
                 chat_history[chat_id].append({"role": "system", "content": inject_msg})
+                logger.info(f"🤖 Загружено досье: {dossier['name']}")
+                logger.info(f"📄 ПОЛНОЕ ДОСЬЕ (ОТПРАВЛЕНО В ИИ):\n{inject_msg}")
 
     chat_history[chat_id].append({"role": "user", "content": user_text})
 
@@ -475,9 +567,6 @@ async def process_dialog(chat_id):
                     preference=args.get("preference", "Не выбрано")
                 )
                 
-                # Ставим статус "Зарегистрирован", чтобы watchdog не слал напоминания
-                conversation_status[chat_id] = "registered"
-                
                 chat_history[chat_id].append({
                     "tool_call_id": tool.id,
                     "role": "tool",
@@ -498,12 +587,7 @@ async def process_dialog(chat_id):
     except Exception as e:
         logger.error(f"🚨 Ошибка AI: {e}")
 
-# --- 7. ЗАПУСК И ВЕБХУК ---
-@app.on_event("startup")
-async def startup_event():
-    # Запускаем фоновую задачу при старте
-    asyncio.create_task(check_idle_chats())
-
+# --- 7. ВЕБХУК ---
 @app.post("/webhook")
 async def handle_webhook(request: Request):
     data = await request.json()
@@ -537,9 +621,7 @@ async def handle_webhook(request: Request):
 
     if not text or not sender: return "ok"
 
-    # Если клиент ответил, меняем статус с "nudged" на "active"
-    if conversation_status.get(sender) == "nudged":
-        conversation_status[sender] = "active"
+    print(f"📩 Входящее ({sender}): {text}")
 
     if sender in message_buffers:
         message_buffers[sender]["timer"].cancel()
