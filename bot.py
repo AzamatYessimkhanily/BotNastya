@@ -528,7 +528,7 @@ async def process_dialog(chat_id):
 
     try:
         response = await openai_client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4-turbo",
             messages=chat_history[chat_id],
             tools=tools,
             tool_choice="auto",
@@ -562,7 +562,7 @@ async def process_dialog(chat_id):
                 })
 
             final = await openai_client.chat.completions.create(
-                model="gpt-4o", messages=chat_history[chat_id]
+                model="gpt-4-turbo", messages=chat_history[chat_id]
             )
             bot_answer = final.choices[0].message.content
         else:
