@@ -6,6 +6,7 @@ import re
 import io
 import logging
 import time
+from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from fastapi import FastAPI, Request
@@ -27,6 +28,13 @@ GREEN_API_TOKEN = os.getenv("GREEN_API_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MOYKLASS_API_KEY = os.getenv("MOYKLASS_API_KEY")
 
+# Контакт управляющего Quantum STEM: задайте на сервере QUANTUM_MANAGER_PHONE и при необходимости QUANTUM_MANAGER_NAME в .env
+QUANTUM_MANAGER_NAME = os.getenv("QUANTUM_MANAGER_NAME", "Зарина устаз")
+QUANTUM_MANAGER_PHONE = os.getenv("QUANTUM_MANAGER_PHONE", "+7 705 287 6382")
+_QUANTUM_CONTACT_LINE = (
+    f"GM Legends Quantum STEM School: {QUANTUM_MANAGER_NAME} — {QUANTUM_MANAGER_PHONE}"
+)
+
 BUFFER_DELAY = 6.0
 MOYKLASS_BASE_URL = "https://api.moyklass.com/v1/company"
 LEAD_CLASS_ID = 341820
@@ -43,7 +51,7 @@ BRANCH_PHONES = {
     "harmony": "+7 778 200 2088",  # Harmony (Адиль мырза)
     60426: "+7 775 254 2671",   # Steppe/МША (Айгерим)
     "ngs": "+7 771 857 5505",   # NGS (Ясмин)
-    "quantum": "+7 705 287 6382",  # Quantum (Зарина)
+    "quantum": QUANTUM_MANAGER_PHONE,  # Quantum (имя/номер — из .env)
     "рфмш": "+7 771 231 4549",  # РФМШ (Томирис)
     "default": "+7 708 174 7426"   # Общий
 }
@@ -67,7 +75,7 @@ FILIALS_MAP = {
 }
 
 # --- 2. СИСТЕМНЫЙ ПРОМПТ ---
-SYSTEM_PROMPT = """
+_SYSTEM_PROMPT_TEMPLATE = """
 Ты — Алия, консультант шахматной академии GMCA и сети шахматных кружков при школах GM Legends в Астане.
 Твоя задача — работать как живой консультант: поздороваться, представиться, коротко уточнить запрос и мягко привести клиента к записи.
 
@@ -93,10 +101,15 @@ SYSTEM_PROMPT = """
 ПРИВЕТСТВИЕ:
 "Здравствуйте! Меня зовут Алия, я консультант шахматной академии 😊 Подскажите, для кого рассматриваете обучение — для ребёнка или для себя?"
 
-ВАЖНО ДЛЯ ШКОЛЬНЫХ ФИЛИАЛОВ:
-- Если клиент пишет про школу/школьный филиал (например: Riviera, Binom, Harmony, Steppe, NGS, Quantum, РФМШ, "в школе", "в ривьере"), считай, что речь о детском обучении.
-- В таких случаях НЕ задавай вопрос "для ребёнка или для себя" и НЕ предлагай вариант "для себя".
-- Сразу уточняй только детские параметры: возраст ребёнка, опыт/разряд, удобное время.
+КРИТИЧЕСКИ ВАЖНО — GM LEGENDS В ШКОЛАХ (кружки при школах):
+- Кружок в конкретной школе доступен ТОЛЬКО ученикам этой школы (как уже указано для Harmony — так же для Riviera, Binom, Steppe, NGS, Quantum, РФМШ и т.д.).
+- Не предлагай кружок при школе, не называй цены/расписание по школе и не давай контакт управляющего школы, пока клиент явно не подтвердил, что ребёнок УЖЕ учится в этой школе.
+- Если школу ещё не подтвердили — веди через GMCA (Аркада/Камал) или онлайн; школьный филиал упоминай только как вариант после подтверждения статуса ученика.
+- ЗАПРЕЩЕНО придумывать общий минимальный возраст для кружков при школах (в частности, нельзя писать «с 4 лет в кружках при школах» и подобное). Возрастной набор и состав группы в школе — только через управляющего после подтверждения, что ребёнок из этой школы.
+- Если клиент пишет про школу/название школы — считай, что тема детская: не спрашивай «для себя», но ОБЯЗАТЕЛЬНО уточни статус ученика школы, прежде чем обещать место в кружке этой школы.
+
+ВОЗРАСТ И ИНДИВИДУАЛЬНЫЕ ЗАНЯТИЯ (GMCA):
+- Индивидуальные занятия в академии GMCA — ориентир «с 5 лет» допустим, если это соответствует текущей политике; если возраст меньше — честно скажи, что рано для индивидуального формата, и не подменяй это предложением школьного кружка без подтверждённой школы.
 
 ═══════════════════════════════════════
 СЕГМЕНТАЦИЯ КЛИЕНТОВ (8 ТИПОВ)
@@ -105,12 +118,13 @@ SYSTEM_PROMPT = """
 По ходу диалога определи, к какой категории относится клиент, и веди по соответствующему сценарию:
 
 ТИП 1: РОДИТЕЛИ ДЕТЕЙ-НОВИЧКОВ (ребёнок только начинает)
-→ Уточни возраст. Предложи ближайший филиал GM Legends или GMCA.
+→ Уточни возраст. По умолчанию предлагай GMCA (Аркада/Камал) или онлайн.
+→ Кружок GM Legends при школе — только если клиент подтвердил, что ребёнок учится в одной из наших школ; иначе не предлагай школьный кружок как замену «пораньше».
 → Предложи бесплатный пробный урок.
 → Если возраст 13+ и нет опыта — мягко предупреди, что первое время ребёнок будет тренироваться с младшими, но обычно за 2-3 месяца догоняет сверстников; мы тоже постараемся быстрее продвинуть его к ребятам постарше.
 
 ТИП 2: РОДИТЕЛИ ДЕТЕЙ С НИЗКИМ/СРЕДНИМ УРОВНЕМ (1-й юношеский разряд и ниже)
-→ 4 разряд, 5 разряд (5 разряд = выдуманный, считай как новичок), нет разряда — предложи филиал (GM Legends или GMCA).
+→ 4 разряд, 5 разряд (5 разряд = выдуманный, считай как новичок), нет разряда — предложи GMCA или онлайн; GM Legends в школе — только если подтверждено, что ребёнок ученик этой школы.
 → 3 разряд — предложи GMCA (Аркада или Камал).
 → Пробный урок: только если опыт менее 6 месяцев и нет разряда (3+ разряд не считая 5-й). Если у 4-разрядника клиент САМ спросил про пробный — можно допустить.
 
@@ -147,7 +161,7 @@ SYSTEM_PROMPT = """
 Шаг 1. ПРИВЕТСТВИЕ И ОПРЕДЕЛЕНИЕ ПОТРЕБНОСТИ
 - Поздоровайся, представься как Алия.
 - Обычно уточни: для кого обучение (ребёнок / взрослый)?
-- ИСКЛЮЧЕНИЕ: если запрос явно про школьный филиал/школьные занятия, не спрашивай про взрослого и веди диалог только как по ребёнку.
+- ИСКЛЮЧЕНИЕ: если запрос явно про школьный филиал/название школы — не спрашивай «для себя», веди как про ребёнка, но сначала выясни: ребёнок уже ученик этой школы? Только после «да» обсуждай кружок в этой школе.
 - Уточни возраст и опыт/разряд (если ребёнок).
 
 Шаг 2. ПОДБОР ФИЛИАЛА
@@ -157,7 +171,7 @@ GMCA (профессиональная академия) — от 30 000 тг/м
 📍 Аркада — ул. Айтеке би 15, ЖК "Аркада-1", район Манхэттана, за ТРЦ "Хан-Шатыр" (https://go.2gis.com/gkCPX)
 📍 Камал — пр. Улы Дала 65/2, ЖК "Камал-3", район школы «Дарын» (https://go.2gis.com/zAWEk)
 
-GM Legends (шахматный кружок при школах):
+GM Legends (шахматный кружок при школах) — только для учеников соответствующей школы; внешним клиентам список не разворачивай, пока не подтверждён статус ученика:
 📍 Binom School им. Ы. Алтынсарина
 📍 Binom School им. Кекилбаева (https://go.2gis.com/KDbzR)
 📍 Binom School им. Қадыр Мырза Әлі (https://go.2gis.com/gKycJ)
@@ -175,7 +189,7 @@ https://gmchess.kz/obuchenievshkole/
 Если это взрослый — предлагай только GMCA (в школах взрослых не обучаем).
 
 ЛОГИКА ПОДБОРА ПО УРОВНЮ:
-- Нет опыта / 5 разряд / 4 разряд / нет разряда → любой филиал (GM Legends или GMCA).
+- Нет опыта / 5 разряд / 4 разряд / нет разряда → GMCA или онлайн; GM Legends в школе — только если подтверждено, что ребёнок ученик этой школы.
 - 3 разряд → GMCA (Аркада или Камал).
 - Опыт 3+ лет / 2 разряд / 1 разряд → GMCA (Аркада или Камал).
 - Опыт 5+ лет / КМС / Мастер спорта → GMCA Аркада.
@@ -217,7 +231,7 @@ GM Legends Riviera: Томирис Ержанқызы — +7 771 231 4549
 GM Legends Harmony School: Адиль мырза — +7 778 200 2088
 GM Legends Steppe School (МША): Айгерим Аманжолқызы — +7 775 254 2671
 GM Legends NGS Астана: мисс Ясмин — +7 771 857 5505
-GM Legends Quantum STEM School: Зарина устаз — +7 705 287 6382
+__QUANTUM_CONTACT_LINE__
 РФМШ: Томирис Ержанқызы — +7 771 231 4549
 
 ═══════════════════════════════════════
@@ -233,6 +247,7 @@ GM Legends Quantum STEM School: Зарина устаз — +7 705 287 6382
 Индивидуальные занятия — от 7 000 тг за 1 урок (1 час).
 
 СТОИМОСТЬ — GM Legends (кружки при школах):
+• Цифры ниже называй только если клиент уже подтвердил, что ребёнок учится в этой школе и речь именно о кружке в его школе; иначе сначала GMCA/онлайн.
 • Все школы (кроме Binom) — от 30 000 тг/мес.
 • Школы Binom — от 20 000 тг/мес.
 
@@ -249,6 +264,11 @@ GM Legends — школьный кружок (от нуля до 2 разряд�
 Методика: Живое преподавание + ChessClass (видеоуроки чемпионов).
 GM Camp (лагерь): Досуг без гаджетов.
 Qosymsha (Damubala): Бесплатное обучение за счёт государства.
+
+ПРОГРАММА QOSYMSHA / DAMUBALA (в т.ч. вопросы на казахском: «Дамубала», «даму бала», «қосымша»):
+- Пойми запрос: речь о государственной программе бесплатного/льготного обучения (Qosymsha / Damubala).
+- Кратко: при наличии программы это обучение за счёт государства для подходящих категорий; точные условия, документы и запись зависят от филиала и текущих правил.
+- Не обещай участие, если нет данных; предложи оставить заявку или уточнить у управляющего выбранного филиала (GMCA Аркада/Камал или школьный — после подтверждения школы).
 
 ═══════════════════════════════════════
 РАБОТА С СУЩЕСТВУЮЩИМИ УЧЕНИКАМИ
@@ -268,6 +288,11 @@ Qosymsha (Damubala): Бесплатное обучение за счёт гос�
 - Успешный результат: 1) оформлена заявка в CRM, либо 2) клиент получил исчерпывающий ответ и оставил контакт.
 """
 
+SYSTEM_PROMPT = _SYSTEM_PROMPT_TEMPLATE.replace(
+    "__QUANTUM_CONTACT_LINE__",
+    _QUANTUM_CONTACT_LINE,
+)
+
 app = FastAPI()
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
@@ -275,6 +300,27 @@ chat_history: Dict[str, List[Dict]] = {}
 message_buffers: Dict[str, Dict] = {}
 known_users: Dict[str, dict] = {}
 last_activity: Dict[str, float] = {}
+# Защита от повторной доставки одного и того же входящего (Green API) и гонок при обработке
+seen_incoming_ids: Dict[str, deque] = defaultdict(lambda: deque(maxlen=400))
+_dialog_locks: Dict[str, asyncio.Lock] = {}
+
+
+def _dialog_lock(chat_id: str) -> asyncio.Lock:
+    if chat_id not in _dialog_locks:
+        _dialog_locks[chat_id] = asyncio.Lock()
+    return _dialog_locks[chat_id]
+
+
+def _voice_download_url(msg_data: dict) -> Optional[str]:
+    if not msg_data:
+        return None
+    for key in ("fileMessageData", "voiceMessageData", "audioMessageData"):
+        block = msg_data.get(key)
+        if isinstance(block, dict):
+            url = block.get("downloadUrl")
+            if url:
+                return url
+    return None
 
 # --- 3. CRM МОДУЛЬ ---
 class MoyKlassCRM:
@@ -526,107 +572,108 @@ async def send_whatsapp(chat_id, text):
 
 # --- 6. ЛОГИКА ДИАЛОГА ---
 async def process_dialog(chat_id):
-    buffer = message_buffers.pop(chat_id, None)
-    if not buffer:
-        return
-    user_text = " ".join(buffer["messages"])
-    logger.info(f"Обработка для {chat_id}: {user_text}")
+    async with _dialog_lock(chat_id):
+        buffer = message_buffers.pop(chat_id, None)
+        if not buffer:
+            return
+        user_text = " ".join(buffer["messages"])
+        logger.info(f"Обработка для {chat_id}: {user_text}")
 
-    current_time = time.time()
-    if chat_id in last_activity:
-        if current_time - last_activity[chat_id] > SESSION_TIMEOUT:
-            logger.info(f"Сброс памяти для {chat_id}")
-            chat_history.pop(chat_id, None)
-            known_users.pop(chat_id, None)
-    last_activity[chat_id] = current_time
+        current_time = time.time()
+        if chat_id in last_activity:
+            if current_time - last_activity[chat_id] > SESSION_TIMEOUT:
+                logger.info(f"Сброс памяти для {chat_id}")
+                chat_history.pop(chat_id, None)
+                known_users.pop(chat_id, None)
+        last_activity[chat_id] = current_time
 
-    if chat_id not in chat_history:
-        chat_history[chat_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        if chat_id not in chat_history:
+            chat_history[chat_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-        current_phone = chat_id.split("@")[0]
-        chat_history[chat_id].append({
-            "role": "system",
-            "content": f"[ТЕЛЕФОН КЛИЕНТА]: {current_phone}. Если клиент пишет 'запиши на этот номер' или 'мой номер', бери этот."
-        })
+            current_phone = chat_id.split("@")[0]
+            chat_history[chat_id].append({
+                "role": "system",
+                "content": f"[ТЕЛЕФОН КЛИЕНТА]: {current_phone}. Если клиент пишет 'запиши на этот номер' или 'мой номер', бери этот."
+            })
 
-        if chat_id not in known_users:
-            phone = chat_id.split("@")[0]
-            found = await crm.find_user_smart(phone)
+            if chat_id not in known_users:
+                phone = chat_id.split("@")[0]
+                found = await crm.find_user_smart(phone)
 
-            if found:
-                user_obj = found["user"]
-                dossier = found["dossier"]
-                known_users[chat_id] = user_obj
+                if found:
+                    user_obj = found["user"]
+                    dossier = found["dossier"]
+                    known_users[chat_id] = user_obj
 
-                mgr_contact = ""
-                if dossier["filial_id"] and dossier["filial_id"] in BRANCH_PHONES:
-                    mgr_contact = f"Его менеджер: {BRANCH_PHONES[dossier['filial_id']]}."
+                    mgr_contact = ""
+                    if dossier["filial_id"] and dossier["filial_id"] in BRANCH_PHONES:
+                        mgr_contact = f"Его менеджер: {BRANCH_PHONES[dossier['filial_id']]}."
 
-                inject_msg = (
-                    f"[СИСТЕМНОЕ ДОСЬЕ КЛИЕНТА]\n"
-                    f"Имя: {dossier['name']}\n"
-                    f"Группы: {dossier['groups']}\n"
-                    f"Ближайшие уроки: {dossier['schedule']}\n"
-                    f"Баланс: {dossier['balance']}\n"
-                    f"{mgr_contact}\n"
-                    f"ИНСТРУКЦИЯ: Это действующий ученик! НЕ СПРАШИВАЙ ИМЯ И ТЕЛЕФОН.\n"
-                    f"1. Поздоровайся по имени.\n"
-                    f"2. Если есть урок в поле 'Ближайшие уроки', ОБЯЗАТЕЛЬНО скажи: 'Ждем вас [Дата/Время] на уроке с [Имя преподавателя]'.\n"
-                    f"3. Если нет — спроси, чем помочь.\n"
-                    f"4. Если вопрос сложный, дай номер менеджера филиала."
-                )
-                chat_history[chat_id].append({"role": "system", "content": inject_msg})
-                logger.info(f"Загружено досье: {dossier['name']}")
+                    inject_msg = (
+                        f"[СИСТЕМНОЕ ДОСЬЕ КЛИЕНТА]\n"
+                        f"Имя: {dossier['name']}\n"
+                        f"Группы: {dossier['groups']}\n"
+                        f"Ближайшие уроки: {dossier['schedule']}\n"
+                        f"Баланс: {dossier['balance']}\n"
+                        f"{mgr_contact}\n"
+                        f"ИНСТРУКЦИЯ: Это действующий ученик! НЕ СПРАШИВАЙ ИМЯ И ТЕЛЕФОН.\n"
+                        f"1. Поздоровайся по имени.\n"
+                        f"2. Если есть урок в поле 'Ближайшие уроки', ОБЯЗАТЕЛЬНО скажи: 'Ждем вас [Дата/Время] на уроке с [Имя преподавателя]'.\n"
+                        f"3. Если нет — спроси, чем помочь.\n"
+                        f"4. Если вопрос сложный, дай номер менеджера филиала."
+                    )
+                    chat_history[chat_id].append({"role": "system", "content": inject_msg})
+                    logger.info(f"Загружено досье: {dossier['name']}")
 
-    chat_history[chat_id].append({"role": "user", "content": user_text})
+        chat_history[chat_id].append({"role": "user", "content": user_text})
 
-    try:
-        response = await openai_client.chat.completions.create(
-            model="gpt-4-turbo",
-            messages=chat_history[chat_id],
-            tools=tools,
-            tool_choice="auto",
-            temperature=0.5
-        )
-        msg = response.choices[0].message
-
-        if msg.tool_calls:
-            chat_history[chat_id].append(msg)
-            for tool in msg.tool_calls:
-                args = json.loads(tool.function.arguments)
-                logger.info(f"CRM вызов: {args}")
-
-                phone_to_save = args.get("client_phone")
-                if not phone_to_save or "не указа" in phone_to_save.lower():
-                    phone_to_save = chat_id.split("@")[0]
-
-                result_text = await crm.create_lead(
-                    name=args.get("client_name", "Клиент"),
-                    phone=phone_to_save,
-                    age=args.get("client_age", "-"),
-                    experience=args.get("experience", "-"),
-                    preference=args.get("preference", "Не выбрано")
-                )
-
-                chat_history[chat_id].append({
-                    "tool_call_id": tool.id,
-                    "role": "tool",
-                    "name": tool.function.name,
-                    "content": result_text
-                })
-
-            final = await openai_client.chat.completions.create(
-                model="gpt-4-turbo", messages=chat_history[chat_id]
+        try:
+            response = await openai_client.chat.completions.create(
+                model="gpt-4-turbo",
+                messages=chat_history[chat_id],
+                tools=tools,
+                tool_choice="auto",
+                temperature=0.5
             )
-            bot_answer = final.choices[0].message.content
-        else:
-            bot_answer = msg.content
+            msg = response.choices[0].message
 
-        chat_history[chat_id].append({"role": "assistant", "content": bot_answer})
-        await send_whatsapp(chat_id, bot_answer)
+            if msg.tool_calls:
+                chat_history[chat_id].append(msg)
+                for tool in msg.tool_calls:
+                    args = json.loads(tool.function.arguments)
+                    logger.info(f"CRM вызов: {args}")
 
-    except Exception as e:
-        logger.error(f"Ошибка AI: {e}")
+                    phone_to_save = args.get("client_phone")
+                    if not phone_to_save or "не указа" in phone_to_save.lower():
+                        phone_to_save = chat_id.split("@")[0]
+
+                    result_text = await crm.create_lead(
+                        name=args.get("client_name", "Клиент"),
+                        phone=phone_to_save,
+                        age=args.get("client_age", "-"),
+                        experience=args.get("experience", "-"),
+                        preference=args.get("preference", "Не выбрано")
+                    )
+
+                    chat_history[chat_id].append({
+                        "tool_call_id": tool.id,
+                        "role": "tool",
+                        "name": tool.function.name,
+                        "content": result_text
+                    })
+
+                final = await openai_client.chat.completions.create(
+                    model="gpt-4-turbo", messages=chat_history[chat_id]
+                )
+                bot_answer = final.choices[0].message.content
+            else:
+                bot_answer = msg.content
+
+            chat_history[chat_id].append({"role": "assistant", "content": bot_answer})
+            await send_whatsapp(chat_id, bot_answer)
+
+        except Exception as e:
+            logger.error(f"Ошибка AI: {e}")
 
 # --- 7. ВЕБХУК ---
 @app.post("/webhook")
@@ -636,7 +683,18 @@ async def handle_webhook(request: Request):
         return "ok"
 
     sender = data.get("senderData", {}).get("chatId")
-    msg_data = data.get("messageData", {})
+    if not sender:
+        return "ok"
+
+    msg_data = data.get("messageData") or {}
+    id_message = data.get("idMessage") or msg_data.get("idMessage")
+    if id_message:
+        dq = seen_incoming_ids[sender]
+        if id_message in dq:
+            logger.info(f"Повтор webhook idMessage={id_message} для {sender}, пропуск")
+            return "ok"
+        dq.append(id_message)
+
     text = ""
 
     msg_type = msg_data.get("typeMessage")
@@ -644,11 +702,19 @@ async def handle_webhook(request: Request):
         text = msg_data["textMessageData"]["textMessage"]
     elif msg_type == "extendedTextMessage":
         text = msg_data["extendedTextMessageData"]["text"]
-    elif msg_type == "audioMessage":
+    elif msg_type in ("audioMessage", "voiceMessage"):
+        url = _voice_download_url(msg_data)
+        if not url:
+            logger.error(f"Нет downloadUrl для голосового type={msg_type}, keys={list(msg_data.keys())}")
+            await send_whatsapp(
+                sender,
+                "Получила голосовое, но не смогла загрузить файл. Напишите, пожалуйста, текстом — так я точно отвечу.",
+            )
+            return "ok"
         try:
-            url = msg_data["fileMessageData"]["downloadUrl"]
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
                 audio_response = await client.get(url)
+                audio_response.raise_for_status()
                 audio_bytes = audio_response.content
 
             audio_file = io.BytesIO(audio_bytes)
@@ -660,8 +726,16 @@ async def handle_webhook(request: Request):
             logger.info(f"ГС распознано: {text}")
         except Exception as e:
             logger.error(f"Ошибка аудио: {e}")
+            try:
+                await send_whatsapp(
+                    sender,
+                    "Не получилось распознать голосовое. Повторите запись или напишите текстом, пожалуйста.",
+                )
+            except Exception as send_err:
+                logger.error(f"Не удалось отправить ответ про голосовое: {send_err}")
+            return "ok"
 
-    if not text or not sender:
+    if not text:
         return "ok"
 
     logger.info(f"Входящее ({sender}): {text}")
