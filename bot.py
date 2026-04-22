@@ -88,6 +88,7 @@ _SYSTEM_PROMPT_TEMPLATE = """
 ═══════════════════════════════════════
 - КОРОТКО. Одно сообщение — одна мысль. Максимум 3–4 предложения.
 - Пиши как живой человек в WhatsApp — без формальных блоков, без длинных списков.
+- Всегда отвечай на том же языке, на котором написал клиент в последнем сообщении (казахский -> казахский, русский -> русский).
 - Никогда не задавай два вопроса в одном сообщении.
 - Не давай всю информацию сразу — ответил на одно, подожди реакции, потом продолжай.
 - Если клиент пишет коротко или расплывчато — задавай уточняющий вопрос.
@@ -387,6 +388,49 @@ def _voice_download_url(msg_data: dict) -> Optional[str]:
             if url:
                 return url
     return None
+
+
+def _detect_user_language(text: str) -> str:
+    # Простая и надежная эвристика: специфические казахские буквы -> казахский.
+    lowered = (text or "").lower()
+    if any(ch in lowered for ch in "әіңғүұқөһ"):
+        return "kk"
+    if re.search(r"[а-яё]", lowered):
+        return "ru"
+    return "other"
+
+
+def _extract_main_text(msg_data: dict) -> str:
+    msg_type = msg_data.get("typeMessage")
+    if msg_type == "textMessage":
+        return (msg_data.get("textMessageData", {}) or {}).get("textMessage", "")
+    if msg_type == "extendedTextMessage":
+        return (msg_data.get("extendedTextMessageData", {}) or {}).get("text", "")
+    if msg_type == "quotedMessage":
+        ext = (msg_data.get("extendedTextMessageData", {}) or {})
+        txt = ext.get("text", "")
+        if txt:
+            return txt
+        return (msg_data.get("textMessageData", {}) or {}).get("textMessage", "")
+    return ""
+
+
+def _extract_quoted_text(msg_data: dict) -> str:
+    quoted = msg_data.get("quotedMessage") or {}
+    if not isinstance(quoted, dict):
+        return ""
+
+    q_type = quoted.get("typeMessage")
+    if q_type == "textMessage":
+        return (quoted.get("textMessageData", {}) or {}).get("textMessage", "")
+    if q_type in ("extendedTextMessage", "quotedMessage"):
+        ext = (quoted.get("extendedTextMessageData", {}) or {})
+        return ext.get("text", "") or ""
+    if q_type in ("audioMessage", "voiceMessage"):
+        return "[голосовое сообщение]"
+    if q_type == "imageMessage":
+        return "[изображение]"
+    return quoted.get("text", "") or ""
 
 # --- 3. CRM МОДУЛЬ ---
 class MoyKlassCRM:
@@ -691,7 +735,22 @@ async def process_dialog(chat_id):
                     chat_history[chat_id].append({"role": "system", "content": inject_msg})
                     logger.info(f"Загружено досье: {dossier['name']}")
 
-        chat_history[chat_id].append({"role": "user", "content": user_text})
+        lang = _detect_user_language(user_text)
+        if lang == "kk":
+            user_payload = (
+                "[ЯЗЫК КЛИЕНТА: казахский. ОТВЕЧАЙ СТРОГО НА КАЗАХСКОМ. "
+                "НЕ переключайся на русский, если клиент сам не попросил.]\n"
+                f"{user_text}"
+            )
+        elif lang == "ru":
+            user_payload = (
+                "[ЯЗЫК КЛИЕНТА: русский. ОТВЕЧАЙ НА РУССКОМ.]\n"
+                f"{user_text}"
+            )
+        else:
+            user_payload = user_text
+
+        chat_history[chat_id].append({"role": "user", "content": user_payload})
 
         try:
             response = await openai_client.chat.completions.create(
@@ -762,13 +821,9 @@ async def handle_webhook(request: Request):
         dq.append(id_message)
 
     text = ""
-
     msg_type = msg_data.get("typeMessage")
-    if msg_type == "textMessage":
-        text = msg_data["textMessageData"]["textMessage"]
-    elif msg_type == "extendedTextMessage":
-        text = msg_data["extendedTextMessageData"]["text"]
-    elif msg_type in ("audioMessage", "voiceMessage"):
+
+    if msg_type in ("audioMessage", "voiceMessage"):
         url = _voice_download_url(msg_data)
         if not url:
             logger.error(f"Нет downloadUrl для голосового type={msg_type}, keys={list(msg_data.keys())}")
@@ -800,6 +855,15 @@ async def handle_webhook(request: Request):
             except Exception as send_err:
                 logger.error(f"Не удалось отправить ответ про голосовое: {send_err}")
             return "ok"
+    else:
+        text = _extract_main_text(msg_data).strip()
+        quoted_text = _extract_quoted_text(msg_data).strip()
+        if quoted_text:
+            # Передаем контекст реплая, чтобы "Да/Нет" правильно интерпретировались.
+            text = (
+                f"[REPLY_TO]: {quoted_text}\n"
+                f"[CLIENT_MESSAGE]: {text}"
+            ).strip()
 
     if not text:
         return "ok"
