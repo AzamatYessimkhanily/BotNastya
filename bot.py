@@ -89,6 +89,7 @@ _SYSTEM_PROMPT_TEMPLATE = """
 - КОРОТКО. Одно сообщение — одна мысль. Максимум 3–4 предложения.
 - Пиши как живой человек в WhatsApp — без формальных блоков, без длинных списков.
 - Всегда отвечай на том же языке, на котором написал клиент в последнем сообщении (казахский -> казахский, русский -> русский).
+- Определяй язык по самому тексту клиента каждый раз заново, без опоры на заранее заданные ключевые слова.
 - Если клиент просит "қазақша/казакша/казахша" или пишет, что не понимает русский, НЕМЕДЛЕННО переключайся на казахский и продолжай только на казахском.
 - ЗАПРЕЩЕНО писать фразы вроде "я обязан отвечать на русском" или любые объяснения, почему не можешь говорить по-казахски.
 - Никогда не задавай два вопроса в одном сообщении.
@@ -390,31 +391,6 @@ def _voice_download_url(msg_data: dict) -> Optional[str]:
             if url:
                 return url
     return None
-
-
-def _detect_user_language(text: str) -> str:
-    # Эвристика: казахские спецбуквы + частые казахские слова (в т.ч. без диакритики).
-    lowered = (text or "").lower()
-    if any(ch in lowered for ch in "әіңғүұқөһ"):
-        return "kk"
-    if re.search(r"\b(қазақша|казакша|казахша|kazaqsha|kazaksha|kazakhsha)\b", lowered):
-        return "kk"
-
-    kk_hits = 0
-    kk_markers = (
-        "маган", "маған", "сиз", "сіз", "керек", "туралы", "мектеп",
-        "тусинбеймин", "түсінбеймін", "жазыныз", "жазыңыз", "салем",
-        "сәлем", "калай", "қалай", "рахмет", "көмек", "көмектес",
-    )
-    for marker in kk_markers:
-        if marker in lowered:
-            kk_hits += 1
-    if kk_hits >= 2:
-        return "kk"
-
-    if re.search(r"[а-яё]", lowered):
-        return "ru"
-    return "other"
 
 
 def _extract_main_text(msg_data: dict) -> str:
@@ -752,20 +728,12 @@ async def process_dialog(chat_id):
                     chat_history[chat_id].append({"role": "system", "content": inject_msg})
                     logger.info(f"Загружено досье: {dossier['name']}")
 
-        lang = _detect_user_language(user_text)
-        if lang == "kk":
-            user_payload = (
-                "[ЯЗЫК КЛИЕНТА: казахский. ОТВЕЧАЙ СТРОГО НА КАЗАХСКОМ. "
-                "НЕ переключайся на русский, если клиент сам не попросил.]\n"
-                f"{user_text}"
-            )
-        elif lang == "ru":
-            user_payload = (
-                "[ЯЗЫК КЛИЕНТА: русский. ОТВЕЧАЙ НА РУССКОМ.]\n"
-                f"{user_text}"
-            )
-        else:
-            user_payload = user_text
+        user_payload = (
+            "[ОПРЕДЕЛИ ЯЗЫК ЭТОГО СООБЩЕНИЯ КЛИЕНТА САМОСТОЯТЕЛЬНО "
+            "И ОТВЕТЬ НА ЭТОМ ЖЕ ЯЗЫКЕ. ЕСЛИ КЛИЕНТ ПРОСИТ КОНКРЕТНЫЙ ЯЗЫК — "
+            "СРАЗУ ПЕРЕКЛЮЧИСЬ НА НЕГО.]\n"
+            f"{user_text}"
+        )
 
         chat_history[chat_id].append({"role": "user", "content": user_payload})
 
