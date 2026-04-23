@@ -103,7 +103,8 @@ _SYSTEM_PROMPT_TEMPLATE = """
 КАТЕГОРИЧЕСКИЕ ЗАПРЕТЫ
 ═══════════════════════════════════════
 - ЗАПРЕЩЕНО предлагать школьный кружок GM Legends, пока клиент явно не подтвердил, что ребёнок УЖЕ УЧИТСЯ в этой конкретной школе.
-- ЗАПРЕЩЕНО называть минимальный возраст для школьных кружков ("с 4 лет", "с 5 лет" и т.п.) — возрастные условия у каждой школы свои; направляй к управляющему после подтверждения статуса ученика.
+- Минимальный возраст для записи сейчас — с 5 лет. Если ребенку меньше 5 лет: не оформляй заявку, корректно объясни ограничение и предложи вернуться, когда исполнится 5.
+- ЗАПРЕЩЕНО писать, что набор идет с 4 лет или давать противоречивую информацию по возрасту.
 - ЗАПРЕЩЕНО показывать список школьных филиалов как общий список для всех — они только для учеников этих школ.
 - ЗАПРЕЩЕНО предлагать детям с 2 разрядом и выше школьный кружок — только GMCA или индивидуально.
 - ЗАПРЕЩЕНО предлагать пробный урок взрослым и детям с разрядом 3+ (кроме случая, когда клиент сам спросил о 4-м разряде).
@@ -495,6 +496,44 @@ class MoyKlassCRM:
             pass
         return "Группа"
 
+    @staticmethod
+    def _digits(value: str) -> str:
+        return re.sub(r"[^\d]", "", value or "")
+
+    @staticmethod
+    def _extract_age_number(age_value: str) -> Optional[int]:
+        try:
+            match = re.search(r"\d+", str(age_value))
+            return int(match.group()) if match else None
+        except Exception:
+            return None
+
+    def _pick_manager_phone(self, filial_id, matched_key: Optional[str]) -> str:
+        # Для "сборного" filial_id 54672 выбираем телефон по конкретному ключу школы.
+        if matched_key and matched_key in BRANCH_PHONES:
+            return BRANCH_PHONES[matched_key]
+        if filial_id in BRANCH_PHONES:
+            return BRANCH_PHONES[filial_id]
+        return BRANCH_PHONES["default"]
+
+    async def _resolve_manager_id(self, client: httpx.AsyncClient, headers: dict, manager_phone: str) -> int:
+        manager_phone_digits = self._digits(manager_phone)
+        if not manager_phone_digits:
+            return MANAGER_ID
+        try:
+            resp = await client.get(f"{MOYKLASS_BASE_URL}/managers", headers=headers)
+            if resp.status_code != 200:
+                return MANAGER_ID
+            managers = resp.json() or []
+            for manager in managers:
+                for field in ("phone", "mobilePhone", "phoneNumber", "tel"):
+                    candidate = self._digits(str(manager.get(field, "")))
+                    if candidate and (candidate.endswith(manager_phone_digits[-10:]) or manager_phone_digits.endswith(candidate[-10:])):
+                        return manager.get("id", MANAGER_ID)
+        except Exception as e:
+            logger.warning(f"Не удалось определить managerId по телефону {manager_phone}: {e}")
+        return MANAGER_ID
+
     async def find_user_smart(self, phone):
         headers = await self._get_headers()
         if not headers:
@@ -560,24 +599,34 @@ class MoyKlassCRM:
         wa_link = f"https://wa.me/{clean_phone}"
 
         filial_id = None
+        matched_key = None
         mgr_phone_text = ""
 
         if preference:
             branch_lower = preference.lower()
             for key, f_id in FILIALS_MAP.items():
                 if key in branch_lower:
+                    matched_key = key
                     filial_id = f_id
-                    mgr_phone = BRANCH_PHONES.get(f_id, BRANCH_PHONES["default"])
+                    mgr_phone = self._pick_manager_phone(filial_id, matched_key)
                     mgr_phone_text = f"Номер управляющего филиалом: {mgr_phone}"
                     break
 
         logger.info(f"Выбран филиал: {preference} -> ID {filial_id}")
 
         birth_attr = []
+        age_num = self._extract_age_number(age)
         try:
-            age_num = int(re.search(r'\d+', str(age)).group())
-            year = datetime.now().year - age_num
-            birth_attr = [{"attributeId": 1, "value": f"{year}-01-01"}]
+            if age_num is not None:
+                if age_num < 5:
+                    return (
+                        "СИСТЕМНОЕ СООБЩЕНИЕ: ЗАЯВКУ В CRM НЕ СОЗДАВАЙ. "
+                        "Причина: ребенку меньше 5 лет. "
+                        "Корректно объясни, что сейчас набор с 5 лет, "
+                        "поблагодари и предложи вернуться, когда ребенку исполнится 5."
+                    )
+                year = datetime.now().year - age_num
+                birth_attr = [{"attributeId": 1, "value": f"{year}-01-01"}]
         except Exception:
             pass
 
@@ -592,6 +641,8 @@ class MoyKlassCRM:
         )
 
         async with httpx.AsyncClient() as client:
+            manager_phone = self._pick_manager_phone(filial_id, matched_key)
+            manager_id = await self._resolve_manager_id(client, headers, manager_phone)
             user_id = None
             found_data = await self.find_user_smart(clean_phone)
 
@@ -604,7 +655,7 @@ class MoyKlassCRM:
                 payload = {
                     "name": name,
                     "phone": clean_phone,
-                    "responsibles": [MANAGER_ID],
+                    "responsibles": [manager_id],
                     "attributes": birth_attr
                 }
                 if filial_id:
@@ -621,7 +672,7 @@ class MoyKlassCRM:
 
             join_payload = {
                 "userId": user_id, "statusId": 1, "classId": LEAD_CLASS_ID,
-                "comment": full_text, "managerId": MANAGER_ID
+                "comment": full_text, "managerId": manager_id
             }
             if filial_id:
                 join_payload["filialId"] = filial_id
@@ -632,7 +683,7 @@ class MoyKlassCRM:
                 await client.post(f"{MOYKLASS_BASE_URL}/tasks", headers=headers, json={
                     "userId": user_id, "body": full_text,
                     "beginDate": now, "endDate": now,
-                    "typeId": 1, "managerId": MANAGER_ID
+                    "typeId": 1, "managerId": manager_id
                 })
             except Exception:
                 pass
