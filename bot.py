@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 GREEN_API_ID = os.getenv("GREEN_API_ID")
 GREEN_API_TOKEN = os.getenv("GREEN_API_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# Модель OpenAI: по умолчанию gpt-4o-mini (дешевле gpt-4-turbo). Переопределение: OPENAI_MODEL в .env
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 MOYKLASS_API_KEY = os.getenv("MOYKLASS_API_KEY")
 
 # Контакт Quantum STEM: при необходимости переопределить через QUANTUM_MANAGER_PHONE / QUANTUM_MANAGER_NAME в .env
@@ -97,8 +99,11 @@ _SYSTEM_PROMPT_TEMPLATE = """
 - Если клиент пишет коротко или расплывчато — задавай уточняющий вопрос.
 - Если клиент не ответил или ответил односложно — переформулируй или предложи варианты выбора ("Вы ищете очные занятия или онлайн?").
 - Не давить. Уровень напора — 5/10. Мягко направляй к следующему шагу.
-- После двух безрезультатных попыток продвинуть диалог — напиши: "Если будут вопросы — пишите в любое время, всегда рада помочь! 😊" и больше не настаивай.
-- НЕ используй фразу "На здоровье" в ответах клиенту. Вместо этого: "Пожалуйста", "Рада помочь", "Обращайтесь".
+- После двух безрезультатных попыток продвинуть диалог — напиши: "Если будут вопросы — пишите в любое время, всегда рада помочь 😊" и больше не настаивай.
+- ЗАПРЕЩЕНО писать "На здоровье", "на здоровье" и любые варианты — звучит как издёвка в переписке. Благодарность отвечай: "Пожалуйста", "Рада была помочь", "Хорошего дня".
+- НЕ используй восклицательные знаки в сообщениях клиенту. Завершай предложения точкой, без «!».
+- Диалог идёт в WhatsApp: номер клиента уже известен системе. НЕ проси "напишите номер" или "перезвоним на ваш номер" для связи в этом чате — скажи, что заявку передадите, и при необходимости уточни только другой контакт, если клиент сам хочет другой номер.
+- "Спасибо", "до свидания", "всего доброго" — вежливое прощание. Это НЕ жалоба: не используй сценарий "жаль что возникло недопонимание" и не начинай опрос негативного опыта.
 
 ═══════════════════════════════════════
 КАТЕГОРИЧЕСКИЕ ЗАПРЕТЫ
@@ -109,7 +114,7 @@ _SYSTEM_PROMPT_TEMPLATE = """
 - ЗАПРЕЩЕНО показывать список школьных филиалов как общий список для всех — они только для учеников этих школ.
 - ЗАПРЕЩЕНО предлагать детям с 2 разрядом и выше школьный кружок — только GMCA или индивидуально.
 - ЗАПРЕЩЕНО предлагать пробный урок взрослым и детям с разрядом 3+ (кроме случая, когда клиент сам спросил о 4-м разряде).
-- ЗАПРЕЩЕНО брать телефон до того, как выяснены ключевые данные (возраст, уровень, формат).
+- Для оформления заявки в CRM используй номер из [ТЕЛЕФОН КЛИЕНТА], если клиент сам не дал другой. Не выдумывай запрос телефона как условие связи в WhatsApp.
 - ЗАПРЕЩЕНО называть точное расписание по дням/времени — только управляющий филиала.
 - ЗАПРЕЩЕНО обещать скидки, акции или конкретные спортивные результаты ("гарантируем разряд за 3 месяца" и т.п.).
 - ЗАПРЕЩЕНО критиковать конкурентов или обсуждать темы, не связанные с шахматами/GMCA.
@@ -716,7 +721,7 @@ tools = [
                 "type": "object",
                 "properties": {
                     "client_name": {"type": "string", "description": "Имя клиента"},
-                    "client_phone": {"type": "string", "description": "Телефон клиента"},
+                    "client_phone": {"type": "string", "description": "Телефон: в WhatsApp укажи номер из чата, если клиент не дал другой явно"},
                     "client_age": {"type": "string", "description": "Возраст (ребёнка или клиента)"},
                     "experience": {"type": "string", "description": "Опыт в шахматах / разряд"},
                     "preference": {"type": "string", "description": "Выбранный филиал или формат обучения"}
@@ -728,7 +733,21 @@ tools = [
 ]
 
 # --- 5. WHATSAPP ---
+def sanitize_bot_outgoing(text: Optional[str]) -> str:
+    """Убираем запрещённые формулировки и восклицательные знаки — модель иногда их игнорирует."""
+    if not text:
+        return ""
+    t = text
+    t = re.sub(r"(?i)\bна\s+здоровье\b[!.,\s]*", "Пожалуйста. ", t)
+    t = t.replace("!", ".")
+    t = re.sub(r"\.{3,}", ".", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
 async def send_whatsapp(chat_id, text):
+    # Доп. нормализация на случай прямых вызовов (голосовые ошибки и т.д.)
+    text = sanitize_bot_outgoing(text)
     url = f"https://api.green-api.com/waInstance{GREEN_API_ID}/sendMessage/{GREEN_API_TOKEN}"
     async with httpx.AsyncClient() as client:
         await client.post(url, json={"chatId": chat_id, "message": text})
@@ -756,7 +775,11 @@ async def process_dialog(chat_id):
             current_phone = chat_id.split("@")[0]
             chat_history[chat_id].append({
                 "role": "system",
-                "content": f"[ТЕЛЕФОН КЛИЕНТА]: {current_phone}. Если клиент пишет 'запиши на этот номер' или 'мой номер', бери этот."
+                "content": (
+                    f"[ТЕЛЕФОН КЛИЕНТА]: {current_phone}. Чат в WhatsApp — номер уже есть. "
+                    f"Для заявки в CRM используй этот номер; не проси продиктовать телефон для связи здесь, "
+                    f"если клиент сам не попросил указать другой."
+                )
             })
 
             if chat_id not in known_users:
@@ -799,7 +822,7 @@ async def process_dialog(chat_id):
 
         try:
             response = await openai_client.chat.completions.create(
-                model="gpt-4-turbo",
+                model=OPENAI_MODEL,
                 messages=chat_history[chat_id],
                 tools=tools,
                 tool_choice="auto",
@@ -833,14 +856,15 @@ async def process_dialog(chat_id):
                     })
 
                 final = await openai_client.chat.completions.create(
-                    model="gpt-4-turbo", messages=chat_history[chat_id]
+                    model=OPENAI_MODEL, messages=chat_history[chat_id]
                 )
                 bot_answer = final.choices[0].message.content
             else:
                 bot_answer = msg.content
 
-            chat_history[chat_id].append({"role": "assistant", "content": bot_answer})
-            await send_whatsapp(chat_id, bot_answer)
+            sanitized_answer = sanitize_bot_outgoing(bot_answer)
+            chat_history[chat_id].append({"role": "assistant", "content": sanitized_answer})
+            await send_whatsapp(chat_id, sanitized_answer)
 
         except Exception as e:
             logger.error(f"Ошибка AI: {e}")
