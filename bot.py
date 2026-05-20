@@ -99,7 +99,7 @@ _SYSTEM_PROMPT_TEMPLATE = """
 - Если клиент пишет коротко или расплывчато — задавай уточняющий вопрос.
 - Если клиент не ответил или ответил односложно — переформулируй или предложи варианты выбора ("Вы ищете очные занятия или онлайн?").
 - Не давить. Уровень напора — 5/10. Мягко направляй к следующему шагу.
-- После двух безрезультатных попыток продвинуть диалог — напиши: "Если будут вопросы — пишите в любое время, всегда рада помочь 😊" и больше не настаивай.
+- После двух безрезультатных попыток продвинуть диалог (клиент не отвечает или игнорирует вопрос) — напиши: "Если будут вопросы — пишите в любое время, всегда рада помочь 😊" и больше не настаивай. Это правило НЕ применяется, если клиент ещё не выбрал филиал или не дал имя ребёнка — в этом случае одну попытку сделай.
 - ЗАПРЕЩЕНО писать "На здоровье", "на здоровье" и любые варианты — звучит как издёвка в переписке. Благодарность отвечай: "Пожалуйста", "Рада была помочь", "Хорошего дня".
 - НЕ используй восклицательные знаки в сообщениях клиенту. Завершай предложения точкой, без «!».
 - Диалог идёт в WhatsApp: номер клиента уже известен системе. НЕ проси "напишите номер" или "перезвоним на ваш номер" для связи в этом чате — скажи, что заявку передадите, и при необходимости уточни только другой контакт, если клиент сам хочет другой номер.
@@ -197,22 +197,22 @@ _SYSTEM_PROMPT_TEMPLATE = """
 2. Имя обратившегося.
 3. Возраст ребёнка.
 4. Опыт / разряд.
-5. Ссылка на карту: https://gmchess.kz/obuchenievshkole/ — "Посмотрите, какой филиал удобен?"
+5. Ссылка на карту: https://gmchess.kz/obuchenievshkole/ — "Посмотрите, какой филиал удобен — GMCA Аркада, GMCA Камал или онлайн?"
+   ВАЖНО: После отправки ссылки ОБЯЗАТЕЛЬНО жди конкретного ответа о филиале. Если клиент ответил не по теме (например, опять про опыт ребёнка) — мягко уточни: "Кстати, какой из вариантов вам ближе — Аркада, Камал или онлайн?"
+   НЕ переходи к шагу 7, пока не знаешь конкретный филиал.
 6. Если клиент выбрал школу GM Legends: "Ваш ребёнок учится в [название школы]?"
    — ДА → оформляем запись в кружок этой школы.
    — НЕТ → объясни по протоколу безопасности школы (см. блок выше), затем предложи GMCA (Аркада/Камал) или онлайн. При желании предложи письмо для администрации школы (см. ниже).
-7. Пробный урок (только новичкам / слабому уровню).
-8. Сбор: имя ребёнка + телефон.
-9. Вызов register_client_request + контакт управляющего.
+7. Пробный урок (только новичкам / слабому уровню). Предложи И СРАЗУ спроси: "Как зовут вашего сына/дочку?" — не жди отдельного сообщения.
+8. Как только получено имя ребёнка — НЕМЕДЛЕННО вызывай register_client_request. Не спрашивай "хотите, чтобы я оформила?" — просто скажи "Оформляю заявку" и вызывай функцию.
+9. После успешной регистрации: передай контакт управляющего и попрощайся.
 
 ДЛЯ ВЗРОСЛЫХ:
 1. Приветствие + уточнение, что сам хочет учиться.
 2. Имя.
 3. Сообщи: только индивидуально, от 7 000 тг/урок (очно или онлайн).
-4. Ссылка на карту или уточни онлайн → "Какой формат удобнее?"
-5. Удобное время (не точное расписание — уточнит управляющий).
-6. Сбор телефона.
-7. Вызов register_client_request.
+4. Ссылка на карту или уточни онлайн → "Какой формат удобнее — GMCA Аркада, Камал или онлайн?"
+5. Как только известны имя + формат/филиал — НЕМЕДЛЕННО вызывай register_client_request. Телефон берётся из [ТЕЛЕФОН КЛИЕНТА].
 
 ЕСЛИ ШКОЛА НЕ В ПАРТНЁРАХ (ребёнок не учится ни в одной из наших школ):
 → Предложи GMCA (Аркада/Камал) или онлайн.
@@ -252,8 +252,8 @@ _SYSTEM_PROMPT_TEMPLATE = """
 - Вопрос о сотрудничестве, партнёрстве, аренде, найме.
 - Нет точного ответа в базе знаний.
 
-Перед передачей: "Передам ваш вопрос менеджеру. Напишите, пожалуйста, ваш номер телефона?"
-После: "Он свяжется с вами в ближайшее время. На всякий случай его контакт: [имя — номер]."
+Перед передачей: "Хорошо, передам ваш вопрос менеджеру." (номер не запрашивай — он уже известен системе)
+После: "Менеджер свяжется с вами в ближайшее время. На всякий случай его контакт: [имя — номер]."
 
 ═══════════════════════════════════════
 КОНТАКТЫ УПРАВЛЯЮЩИХ
@@ -338,6 +338,24 @@ GM Legends — после уроков или до уроков (2 смена).
 Формулировка: "Рекомендую начать с бесплатного пробного урока 🎓 — так ребёнок познакомится с тренером и сразу поймёт, нравится ли ему."
 
 ═══════════════════════════════════════
+МОМЕНТ РЕГИСТРАЦИИ — ДОЖИМАНИЕ
+═══════════════════════════════════════
+Если клиент проявил интерес (согласился на пробный, спросил о записи, обсудил конкретный филиал):
+→ Спроси имя ребёнка: "Как зовут вашего сына/дочку?"
+→ Как только получил имя — вызови register_client_request, не откладывая.
+→ НЕ спрашивай повторно "Хотите, чтобы я оформила?" — клиент уже проявил интерес.
+→ ЗАПРЕЩЕНО говорить "Передам ваш интерес управляющему" вместо создания заявки через register_client_request.
+
+Признаки, что пора регистрировать (даже если клиент говорит "спасибо" или "подумаем"):
+- Известны возраст и опыт ребёнка
+- Клиент выбрал или обсудил конкретный филиал
+- Клиент не отказался явно ("нет", "не надо")
+
+Если клиент говорит "Спасибо, потом решим" и имя ещё не получено:
+→ Скажи: "Конечно. Могу сразу оформить предварительную заявку — так менеджер будет готов к вашему звонку. Как зовут вашего сына/дочку?"
+→ Одна попытка. Если отказывается — прими и попрощайся.
+
+═══════════════════════════════════════
 QOSYMSHA / DAMUBALA
 ═══════════════════════════════════════
 Если клиент спрашивает про Qosymsha, Дамубала, «дамубала», «қосымша», «бесплатно от государства»:
@@ -367,10 +385,13 @@ GM Legends — школьный кружок (от нуля до 2 разряд�
 5. Вопросы по оплате/переносу → контакт управляющего их филиала.
 
 ═══════════════════════════════════════
-ТЕХНИЧЕСКОЕ
+ТЕХНИЧЕСКОЕ — ПРАВИЛА ВЫЗОВА register_client_request
 ═══════════════════════════════════════
-Когда собраны имя, телефон, возраст/формат, опыт, филиал — вызови register_client_request.
-Успешный результат: 1) заявка в CRM, 2) клиент получил исчерпывающий ответ и оставил контакт.
+Когда собраны: имя ребёнка/взрослого, телефон (из [ТЕЛЕФОН КЛИЕНТА]), возраст, опыт, конкретный филиал — НЕМЕДЛЕННО вызови register_client_request.
+НЕ жди дополнительного подтверждения — вызывай сразу.
+НЕ говори "передам ваш интерес" вместо вызова функции.
+preference = КОНКРЕТНЫЙ ФИЛИАЛ: "GMCA Аркада", "GMCA Камал", "онлайн" или название школы (например, "Riviera"). Никогда не передавай просто "GMCA" без уточнения.
+Успешный результат: 1) заявка в CRM, 2) клиент получил контакт управляющего.
 """
 
 SYSTEM_PROMPT = _SYSTEM_PROMPT_TEMPLATE.replace(
@@ -442,20 +463,25 @@ def _extract_quoted_text(msg_data: dict) -> str:
 
 # --- 3. CRM МОДУЛЬ ---
 class MoyKlassCRM:
+    _TOKEN_TTL = 3300  # секунд (~55 мин), обновляем до истечения часа
+
     def __init__(self, api_key):
         self.api_key = api_key
         self.token = None
+        self.token_fetched_at = 0.0
 
     async def _get_headers(self):
-        if not self.token:
+        now = time.time()
+        if not self.token or (now - self.token_fetched_at) > self._TOKEN_TTL:
             async with httpx.AsyncClient() as client:
                 try:
                     resp = await client.post(f"{MOYKLASS_BASE_URL}/auth/getToken", json={"apiKey": self.api_key})
                     if resp.status_code == 200:
                         self.token = resp.json()["accessToken"]
-                        logger.info("CRM: Токен получен")
+                        self.token_fetched_at = time.time()
+                        logger.info("CRM: Токен получен/обновлён")
                     else:
-                        logger.error(f"Auth Error: {resp.text}")
+                        logger.error(f"Auth Error: {resp.status_code} {resp.text}")
                         return None
                 except Exception as e:
                     logger.error(f"Connection Error: {e}")
@@ -609,6 +635,13 @@ class MoyKlassCRM:
 
     async def create_lead(self, name, phone, age, experience, preference):
         headers = await self._get_headers()
+        if not headers:
+            logger.error("create_lead: не удалось получить токен CRM")
+            return (
+                "СИСТЕМНОЕ СООБЩЕНИЕ: ОШИБКА CRM (авторизация). "
+                "Дай клиенту контакт управляющего напрямую и скажи что заявку оформит менеджер."
+            )
+
         clean_phone = re.sub(r"[^\d]", "", phone)
         wa_link = f"https://wa.me/{clean_phone}"
 
@@ -626,7 +659,7 @@ class MoyKlassCRM:
                     mgr_phone_text = f"Номер управляющего филиалом: {mgr_phone}"
                     break
 
-        logger.info(f"Выбран филиал: {preference} -> ID {filial_id}")
+        logger.info(f"Выбран филиал: {preference!r} -> ID {filial_id}, matched_key={matched_key!r}")
 
         if not filial_id:
             return (
@@ -665,14 +698,19 @@ class MoyKlassCRM:
         async with httpx.AsyncClient() as client:
             manager_phone = self._pick_manager_phone(filial_id, matched_key)
             manager_id = await self._resolve_manager_id(client, headers, manager_phone)
+            logger.info(f"create_lead: manager_id={manager_id}, manager_phone={manager_phone}")
+
             user_id = None
             found_data = await self.find_user_smart(clean_phone)
 
             if found_data:
                 user_id = found_data["user"]["id"]
-                await client.post(f"{MOYKLASS_BASE_URL}/userComments", headers=headers, json={
-                    "userId": user_id, "comment": full_text
-                })
+                logger.info(f"create_lead: найден существующий пользователь id={user_id}")
+                comment_resp = await client.post(
+                    f"{MOYKLASS_BASE_URL}/userComments", headers=headers,
+                    json={"userId": user_id, "comment": full_text}
+                )
+                logger.info(f"create_lead: userComments -> {comment_resp.status_code}")
             else:
                 payload = {
                     "name": name,
@@ -683,14 +721,30 @@ class MoyKlassCRM:
                 if filial_id:
                     payload["filials"] = [filial_id]
 
+                logger.info(f"create_lead: создаём нового пользователя payload={payload}")
                 create_resp = await client.post(f"{MOYKLASS_BASE_URL}/users", headers=headers, json=payload)
+                logger.info(f"create_lead: POST /users -> {create_resp.status_code} {create_resp.text[:300]}")
+
                 if create_resp.status_code in [200, 201]:
                     user_id = create_resp.json()["id"]
-                    await client.post(f"{MOYKLASS_BASE_URL}/userComments", headers=headers, json={
-                        "userId": user_id, "comment": full_text
-                    })
+                    comment_resp = await client.post(
+                        f"{MOYKLASS_BASE_URL}/userComments", headers=headers,
+                        json={"userId": user_id, "comment": full_text}
+                    )
+                    logger.info(f"create_lead: userComments -> {comment_resp.status_code}")
                 else:
-                    return f"ERROR CRM: {create_resp.text}"
+                    logger.error(f"create_lead: не удалось создать пользователя: {create_resp.status_code} {create_resp.text}")
+                    return (
+                        f"СИСТЕМНОЕ СООБЩЕНИЕ: ОШИБКА CRM (не удалось создать пользователя, код {create_resp.status_code}). "
+                        "Дай клиенту контакт управляющего напрямую."
+                    )
+
+            if user_id is None:
+                logger.error("create_lead: user_id не получен, заявка не создана")
+                return (
+                    "СИСТЕМНОЕ СООБЩЕНИЕ: ОШИБКА CRM (user_id не получен). "
+                    "Дай клиенту контакт управляющего напрямую."
+                )
 
             join_payload = {
                 "userId": user_id, "statusId": 1, "classId": LEAD_CLASS_ID,
@@ -698,18 +752,30 @@ class MoyKlassCRM:
             }
             if filial_id:
                 join_payload["filialId"] = filial_id
-            await client.post(f"{MOYKLASS_BASE_URL}/joins", headers=headers, json=join_payload)
+
+            logger.info(f"create_lead: POST /joins payload={join_payload}")
+            join_resp = await client.post(f"{MOYKLASS_BASE_URL}/joins", headers=headers, json=join_payload)
+            logger.info(f"create_lead: POST /joins -> {join_resp.status_code} {join_resp.text[:300]}")
+
+            if join_resp.status_code not in [200, 201]:
+                logger.error(f"create_lead: ошибка создания заявки joins: {join_resp.status_code} {join_resp.text}")
+                return (
+                    f"СИСТЕМНОЕ СООБЩЕНИЕ: ОШИБКА CRM (заявка не создана, код {join_resp.status_code}). "
+                    "Дай клиенту контакт управляющего напрямую и скажи: 'Менеджер оформит запись лично'."
+                )
 
             try:
                 now = datetime.now().strftime("%Y-%m-%d")
-                await client.post(f"{MOYKLASS_BASE_URL}/tasks", headers=headers, json={
+                task_resp = await client.post(f"{MOYKLASS_BASE_URL}/tasks", headers=headers, json={
                     "userId": user_id, "body": full_text,
                     "beginDate": now, "endDate": now,
                     "typeId": 1, "managerId": manager_id
                 })
-            except Exception:
-                pass
+                logger.info(f"create_lead: POST /tasks -> {task_resp.status_code}")
+            except Exception as e:
+                logger.warning(f"create_lead: задача не создана: {e}")
 
+            logger.info(f"create_lead: УСПЕХ — заявка создана для {name} ({clean_phone}), филиал {filial_id}")
             final_msg = "СИСТЕМНОЕ СООБЩЕНИЕ: УСПЕХ. Заявка создана. Попрощайся. "
             if mgr_phone_text:
                 final_msg += f"ОБЯЗАТЕЛЬНО напиши клиенту этот номер: {mgr_phone_text}"
@@ -876,6 +942,13 @@ async def process_dialog(chat_id):
 
         except Exception as e:
             logger.error(f"Ошибка AI: {e}")
+            try:
+                await send_whatsapp(
+                    chat_id,
+                    "Произошла техническая ошибка. Напишите ещё раз или обратитесь к менеджеру напрямую."
+                )
+            except Exception as send_err:
+                logger.error(f"Не удалось отправить fallback: {send_err}")
 
 # --- 7. ВЕБХУК ---
 @app.post("/webhook")
