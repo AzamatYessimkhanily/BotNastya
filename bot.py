@@ -62,6 +62,42 @@ BRANCH_PHONES = {
     "default": "+7 708 174 7426"    # Общий
 }
 
+BRANCH_MANAGERS = {
+    37754: ("Аяулым Жумажановна", "+7 778 104 8197"),
+    42763: ("Шолпан Жолдыбаевна", "+7 778 104 8127"),
+    44021: ("Томирис Ержанқызы", "+7 771 231 4549"),
+    54673: ("Айгерим Аманжолқызы", "+7 775 254 2671"),
+    54648: ("Айгерим Аманжолқызы", "+7 775 254 2671"),
+    47033: ("Томирис Ержанқызы", "+7 771 231 4549"),
+    54675: ("Айгерим Аманжолқызы", "+7 775 254 2671"),
+    54674: ("Айгерим Аманжолқызы", "+7 775 254 2671"),
+    "harmony": ("Адиль мырза", "+7 778 200 2088"),
+    60426: ("Айгерим Аманжолқызы", "+7 775 254 2671"),
+    "ngs": ("Ясмин", "+7 771 857 5505"),
+    "quantum": (QUANTUM_MANAGER_NAME, QUANTUM_MANAGER_PHONE),
+    "рфмш": ("Томирис Ержанқызы", "+7 771 231 4549"),
+    50847: ("Айгерим Аманжолқызы", "+7 775 254 2671"),
+    "online": ("Айгерим Аманжолқызы", "+7 775 254 2671"),
+    "default": ("наш управляющий", "+7 708 174 7426"),
+}
+
+FAILED_LEADS_FILE = os.getenv("FAILED_LEADS_FILE", "failed_leads.jsonl")
+
+
+def _log_failed_lead(payload: dict, reason: str) -> None:
+    """Сохраняем неоформленный лид локально, чтобы вручную восстановить позже."""
+    try:
+        record = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "reason": reason,
+            **payload,
+        }
+        with open(FAILED_LEADS_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        logger.warning(f"FAILED LEAD сохранён локально: {record}")
+    except Exception as exc:
+        logger.error(f"Не удалось записать failed lead в {FAILED_LEADS_FILE}: {exc}")
+
 FILIALS_MAP = {
     "аркада": 37754, "arkada": 37754,
     "камал": 42763, "kamal": 42763,
@@ -120,6 +156,9 @@ _SYSTEM_PROMPT_TEMPLATE = """
 - ЗАПРЕЩЕНО критиковать конкурентов или обсуждать темы, не связанные с шахматами/GMCA.
 - ЗАПРЕЩЕНО писать "Новая заявка..." или любой её вариант текстом. Только через функцию register_client_request.
 - ЗАПРЕЩЕНО давать конфиденциальные данные (телефоны других клиентов, расписание тренера и т.д.).
+- ЗАПРЕЩЕНО говорить клиенту, что заявка «не оформлена», «временно недоступна», «техническая ошибка», «технические проблемы», «попробуем позже». Если система прислала handoff — заявка уже зафиксирована, преподнеси это уверенно.
+- ЗАПРЕЩЕНО писать «обратитесь напрямую», «свяжитесь напрямую», «позвоните сами», «вам нужно позвонить». Это снимает ответственность с нас. Правильно: «Передаю заявку управляющему [имя] — она свяжется с вами в ближайшее время. На случай вопросов её контакт: [телефон].»
+- ЗАПРЕЩЕНО просто сбрасывать клиенту номер управляющего вместо оформления заявки, если уже известны имя и филиал. Сначала вызывай register_client_request, только после этого даёшь номер как backup.
 
 ═══════════════════════════════════════
 ПОЧЕМУ НЕЛЬЗЯ В ШКОЛЬНЫЙ КРУЖОК БЕЗ СТАТУСА УЧЕНИКА
@@ -340,19 +379,26 @@ GM Legends — после уроков или до уроков (2 смена).
 ═══════════════════════════════════════
 МОМЕНТ РЕГИСТРАЦИИ — ДОЖИМАНИЕ
 ═══════════════════════════════════════
-Если клиент проявил интерес (согласился на пробный, спросил о записи, обсудил конкретный филиал):
-→ Спроси имя ребёнка: "Как зовут вашего сына/дочку?"
-→ Как только получил имя — вызови register_client_request, не откладывая.
-→ НЕ спрашивай повторно "Хотите, чтобы я оформила?" — клиент уже проявил интерес.
-→ ЗАПРЕЩЕНО говорить "Передам ваш интерес управляющему" вместо создания заявки через register_client_request.
+ТРИГГЕРЫ, по которым НЕМЕДЛЕННО вызываешь register_client_request (без переспрашиваний):
+- Известно имя ребёнка/клиента + выбран конкретный филиал (Аркада/Камал/онлайн или школа).
+- Клиент написал: «когда можем подойти», «когда можем прийти», «удобно», «записывайте», «оформите», «давайте», «согласны», «хорошо, давайте».
+- Клиент после обсуждения филиала попросил адрес или расписание — отправь адрес И в этом же сообщении вызови register_client_request.
+- Клиент согласился на пробный урок.
 
-Признаки, что пора регистрировать (даже если клиент говорит "спасибо" или "подумаем"):
-- Известны возраст и опыт ребёнка
-- Клиент выбрал или обсудил конкретный филиал
-- Клиент не отказался явно ("нет", "не надо")
+ПРАВИЛА ДОЖИМАНИЯ:
+→ НЕ спрашивай «Хотите, чтобы я оформила?» — клиент уже проявил интерес, просто скажи «Оформляю заявку» и вызывай функцию.
+→ ЗАПРЕЩЕНО говорить «Передам ваш интерес управляющему», «свяжусь с менеджером», «попросите их перезвонить» вместо register_client_request.
+→ ЗАПРЕЩЕНО давать клиенту номер управляющего ДО того, как вызвал register_client_request, если для вызова уже есть данные (имя + филиал).
+→ Никогда не сбрасывай инициативу клиенту фразами «позвоните», «обратитесь», «свяжитесь сами».
+→ Если имя ребёнка не названо, а филиал выбран — спроси имя один раз, не задерживайся: «Как зовут вашего сына/дочку? Сразу оформлю заявку».
+→ Если имя названо, а филиал не выбран — спроси филиал один раз: «GMCA Аркада, GMCA Камал или онлайн — что удобнее?». После ответа сразу register_client_request.
 
-Если клиент говорит "Спасибо, потом решим" и имя ещё не получено:
-→ Скажи: "Конечно. Могу сразу оформить предварительную заявку — так менеджер будет готов к вашему звонку. Как зовут вашего сына/дочку?"
+ЕСЛИ СИСТЕМА ВЕРНУЛА handoff (СИСТЕМНОЕ СООБЩЕНИЕ: ЗАЯВКА ОФОРМЛЕНА/ЗАФИКСИРОВАНА…):
+→ Заявка зафиксирована в любом случае. Передай клиенту уверенно: «Спасибо, заявку оформила. Передаю управляющему [имя] — она свяжется с вами в ближайшее время. Её контакт: [телефон]. Хорошего дня.»
+→ Никогда не упоминай технические проблемы, ошибки, «попробуем позже». Это запрещено.
+
+Если клиент говорит «Спасибо, потом решим» и имя ещё не получено:
+→ Скажи: «Конечно. Могу сразу оформить предварительную заявку — так менеджер будет готов к вашему звонку. Как зовут вашего сына/дочку?»
 → Одна попытка. Если отказывается — прими и попрощайся.
 
 ═══════════════════════════════════════
@@ -391,7 +437,8 @@ GM Legends — школьный кружок (от нуля до 2 разряд�
 НЕ жди дополнительного подтверждения — вызывай сразу.
 НЕ говори "передам ваш интерес" вместо вызова функции.
 preference = КОНКРЕТНЫЙ ФИЛИАЛ: "GMCA Аркада", "GMCA Камал", "онлайн" или название школы (например, "Riviera"). Никогда не передавай просто "GMCA" без уточнения.
-Успешный результат: 1) заявка в CRM, 2) клиент получил контакт управляющего.
+Если каких-то полей не хватает (например, опыт неизвестен) — подставь «не указано»/«нет данных», но всё равно вызови функцию. Лучше зафиксировать лид с пропуском, чем потерять его.
+После вызова функции тебе придёт СИСТЕМНОЕ СООБЩЕНИЕ. Любое сообщение, начинающееся с «ЗАЯВКА ОФОРМЛЕНА» или «ЗАЯВКА ЗАФИКСИРОВАНА», = успех для клиента: подтверди оформление и передай контакт управляющего одной фразой, не упоминай никаких ошибок.
 """
 
 SYSTEM_PROMPT = _SYSTEM_PROMPT_TEMPLATE.replace(
@@ -556,6 +603,33 @@ class MoyKlassCRM:
             return BRANCH_PHONES[filial_id]
         return BRANCH_PHONES["default"]
 
+    def _pick_manager_info(self, filial_id, matched_key: Optional[str]):
+        if matched_key and matched_key in BRANCH_MANAGERS:
+            return BRANCH_MANAGERS[matched_key]
+        if filial_id in BRANCH_MANAGERS:
+            return BRANCH_MANAGERS[filial_id]
+        return BRANCH_MANAGERS["default"]
+
+    @staticmethod
+    def _handoff_message(mgr_name: str, mgr_phone: str, *, success: bool) -> str:
+        """Единое сообщение для модели после попытки оформить заявку.
+
+        success=True — заявка реально в CRM. success=False — мы записали её
+        локально как fallback. В обоих случаях клиент должен услышать одну и ту же
+        уверенную фразу: «Передаю заявку — менеджер свяжется».
+        """
+        status = "ЗАЯВКА ОФОРМЛЕНА В CRM" if success else "ЗАЯВКА ЗАФИКСИРОВАНА И ПЕРЕДАНА УПРАВЛЯЮЩЕМУ ВРУЧНУЮ"
+        return (
+            f"СИСТЕМНОЕ СООБЩЕНИЕ: {status}. "
+            f"ОБЯЗАТЕЛЬНО ответь клиенту на его языке примерно так: "
+            f"«Спасибо, заявку оформила. Передаю её управляющему — {mgr_name}, "
+            f"она свяжется с вами в ближайшее время. На случай вопросов её контакт: {mgr_phone}. "
+            f"Хорошего дня.» "
+            f"КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО: говорить про «техническую ошибку», «технические проблемы», "
+            f"«не получилось оформить», «временно не оформлена», «свяжитесь напрямую», «позвоните сами». "
+            f"Заявка зафиксирована — преподнеси это уверенно и завершай диалог."
+        )
+
     async def _resolve_manager_id(self, client: httpx.AsyncClient, headers: dict, manager_phone: str) -> int:
         manager_phone_digits = self._digits(manager_phone)
         if not manager_phone_digits:
@@ -634,20 +708,11 @@ class MoyKlassCRM:
         return None
 
     async def create_lead(self, name, phone, age, experience, preference):
-        headers = await self._get_headers()
-        if not headers:
-            logger.error("create_lead: не удалось получить токен CRM")
-            return (
-                "СИСТЕМНОЕ СООБЩЕНИЕ: ОШИБКА CRM (авторизация). "
-                "Дай клиенту контакт управляющего напрямую и скажи что заявку оформит менеджер."
-            )
-
         clean_phone = re.sub(r"[^\d]", "", phone)
         wa_link = f"https://wa.me/{clean_phone}"
 
         filial_id = None
         matched_key = None
-        mgr_phone_text = ""
 
         if preference:
             branch_lower = preference.lower()
@@ -655,35 +720,53 @@ class MoyKlassCRM:
                 if key in branch_lower:
                     matched_key = key
                     filial_id = f_id
-                    mgr_phone = self._pick_manager_phone(filial_id, matched_key)
-                    mgr_phone_text = f"Номер управляющего филиалом: {mgr_phone}"
                     break
 
         logger.info(f"Выбран филиал: {preference!r} -> ID {filial_id}, matched_key={matched_key!r}")
 
         if not filial_id:
             return (
-                "СИСТЕМНОЕ СООБЩЕНИЕ: ЗАЯВКУ В CRM НЕ СОЗДАВАЙ. "
+                "СИСТЕМНОЕ СООБЩЕНИЕ: ЗАЯВКУ В CRM ПОКА НЕ СОЗДАВАЙ. "
                 "Причина: не выбран филиал/формат. "
-                "Попроси клиента выбрать конкретно: GMCA Аркада, GMCA Камал или онлайн. "
-                "Только после этого вызывай регистрацию заявки."
+                "Спроси клиента коротко: «Что удобнее — GMCA Аркада, GMCA Камал или онлайн?». "
+                "Как только клиент назовёт филиал — сразу вызови register_client_request без дополнительных вопросов."
             )
 
-        birth_attr = []
         age_num = self._extract_age_number(age)
-        try:
-            if age_num is not None:
-                if age_num < 5:
-                    return (
-                        "СИСТЕМНОЕ СООБЩЕНИЕ: ЗАЯВКУ В CRM НЕ СОЗДАВАЙ. "
-                        "Причина: ребенку меньше 5 лет. "
-                        "Корректно объясни, что сейчас набор с 5 лет, "
-                        "поблагодари и предложи вернуться, когда ребенку исполнится 5."
-                    )
+        if age_num is not None and age_num < 5:
+            return (
+                "СИСТЕМНОЕ СООБЩЕНИЕ: ЗАЯВКУ В CRM НЕ СОЗДАВАЙ. "
+                "Причина: ребенку меньше 5 лет. "
+                "Корректно объясни, что сейчас набор с 5 лет, "
+                "поблагодари и предложи вернуться, когда ребенку исполнится 5."
+            )
+
+        mgr_name, mgr_phone = self._pick_manager_info(filial_id, matched_key)
+        lead_payload = {
+            "name": name,
+            "phone": clean_phone,
+            "age": age,
+            "experience": experience,
+            "preference": preference,
+            "filial_id": filial_id,
+            "manager_name": mgr_name,
+            "manager_phone": mgr_phone,
+            "whatsapp": wa_link,
+        }
+
+        headers = await self._get_headers()
+        if not headers:
+            logger.error("create_lead: не удалось получить токен CRM — записываю лид в fallback-файл")
+            _log_failed_lead(lead_payload, "auth_failed")
+            return self._handoff_message(mgr_name, mgr_phone, success=False)
+
+        birth_attr = []
+        if age_num is not None:
+            try:
                 year = datetime.now().year - age_num
                 birth_attr = [{"attributeId": 1, "value": f"{year}-01-01"}]
-        except Exception:
-            pass
+            except Exception:
+                birth_attr = []
 
         full_text = (
             f"BOT ЗАЯВКА:\n"
@@ -696,9 +779,8 @@ class MoyKlassCRM:
         )
 
         async with httpx.AsyncClient() as client:
-            manager_phone = self._pick_manager_phone(filial_id, matched_key)
-            manager_id = await self._resolve_manager_id(client, headers, manager_phone)
-            logger.info(f"create_lead: manager_id={manager_id}, manager_phone={manager_phone}")
+            manager_id = await self._resolve_manager_id(client, headers, mgr_phone)
+            logger.info(f"create_lead: manager_id={manager_id}, manager_phone={mgr_phone}")
 
             user_id = None
             found_data = await self.find_user_smart(clean_phone)
@@ -706,11 +788,14 @@ class MoyKlassCRM:
             if found_data:
                 user_id = found_data["user"]["id"]
                 logger.info(f"create_lead: найден существующий пользователь id={user_id}")
-                comment_resp = await client.post(
-                    f"{MOYKLASS_BASE_URL}/userComments", headers=headers,
-                    json={"userId": user_id, "comment": full_text}
-                )
-                logger.info(f"create_lead: userComments -> {comment_resp.status_code}")
+                try:
+                    comment_resp = await client.post(
+                        f"{MOYKLASS_BASE_URL}/userComments", headers=headers,
+                        json={"userId": user_id, "comment": full_text}
+                    )
+                    logger.info(f"create_lead: userComments -> {comment_resp.status_code}")
+                except Exception as e:
+                    logger.warning(f"create_lead: userComments исключение: {e}")
             else:
                 payload = {
                     "name": name,
@@ -722,29 +807,42 @@ class MoyKlassCRM:
                     payload["filials"] = [filial_id]
 
                 logger.info(f"create_lead: создаём нового пользователя payload={payload}")
-                create_resp = await client.post(f"{MOYKLASS_BASE_URL}/users", headers=headers, json=payload)
-                logger.info(f"create_lead: POST /users -> {create_resp.status_code} {create_resp.text[:300]}")
+                try:
+                    create_resp = await client.post(f"{MOYKLASS_BASE_URL}/users", headers=headers, json=payload)
+                    logger.info(f"create_lead: POST /users -> {create_resp.status_code} {create_resp.text[:300]}")
+                except Exception as e:
+                    logger.error(f"create_lead: исключение при POST /users: {e}")
+                    _log_failed_lead({**lead_payload, "stage": "users_post_exception", "error": str(e)}, "users_post_exception")
+                    return self._handoff_message(mgr_name, mgr_phone, success=False)
 
                 if create_resp.status_code in [200, 201]:
-                    user_id = create_resp.json()["id"]
-                    comment_resp = await client.post(
-                        f"{MOYKLASS_BASE_URL}/userComments", headers=headers,
-                        json={"userId": user_id, "comment": full_text}
-                    )
-                    logger.info(f"create_lead: userComments -> {comment_resp.status_code}")
+                    try:
+                        user_id = create_resp.json()["id"]
+                    except Exception as e:
+                        logger.error(f"create_lead: не удалось распарсить ответ /users: {e}")
+                        _log_failed_lead({**lead_payload, "stage": "users_post_parse", "body": create_resp.text[:500]}, "users_post_parse")
+                        return self._handoff_message(mgr_name, mgr_phone, success=False)
+
+                    try:
+                        comment_resp = await client.post(
+                            f"{MOYKLASS_BASE_URL}/userComments", headers=headers,
+                            json={"userId": user_id, "comment": full_text}
+                        )
+                        logger.info(f"create_lead: userComments -> {comment_resp.status_code}")
+                    except Exception as e:
+                        logger.warning(f"create_lead: userComments исключение: {e}")
                 else:
                     logger.error(f"create_lead: не удалось создать пользователя: {create_resp.status_code} {create_resp.text}")
-                    return (
-                        f"СИСТЕМНОЕ СООБЩЕНИЕ: ОШИБКА CRM (не удалось создать пользователя, код {create_resp.status_code}). "
-                        "Дай клиенту контакт управляющего напрямую."
+                    _log_failed_lead(
+                        {**lead_payload, "stage": "users_post", "status": create_resp.status_code, "body": create_resp.text[:500]},
+                        "users_post_failed",
                     )
+                    return self._handoff_message(mgr_name, mgr_phone, success=False)
 
             if user_id is None:
                 logger.error("create_lead: user_id не получен, заявка не создана")
-                return (
-                    "СИСТЕМНОЕ СООБЩЕНИЕ: ОШИБКА CRM (user_id не получен). "
-                    "Дай клиенту контакт управляющего напрямую."
-                )
+                _log_failed_lead({**lead_payload, "stage": "no_user_id"}, "no_user_id")
+                return self._handoff_message(mgr_name, mgr_phone, success=False)
 
             join_payload = {
                 "userId": user_id, "statusId": 1, "classId": LEAD_CLASS_ID,
@@ -754,15 +852,17 @@ class MoyKlassCRM:
                 join_payload["filialId"] = filial_id
 
             logger.info(f"create_lead: POST /joins payload={join_payload}")
-            join_resp = await client.post(f"{MOYKLASS_BASE_URL}/joins", headers=headers, json=join_payload)
-            logger.info(f"create_lead: POST /joins -> {join_resp.status_code} {join_resp.text[:300]}")
+            join_resp = await self._post_join_with_retry(client, headers, join_payload)
 
-            if join_resp.status_code not in [200, 201]:
-                logger.error(f"create_lead: ошибка создания заявки joins: {join_resp.status_code} {join_resp.text}")
-                return (
-                    f"СИСТЕМНОЕ СООБЩЕНИЕ: ОШИБКА CRM (заявка не создана, код {join_resp.status_code}). "
-                    "Дай клиенту контакт управляющего напрямую и скажи: 'Менеджер оформит запись лично'."
+            if join_resp is None or join_resp.status_code not in [200, 201]:
+                status_code = getattr(join_resp, "status_code", None)
+                body = getattr(join_resp, "text", "") or ""
+                logger.error(f"create_lead: ошибка создания заявки joins: {status_code} {body[:300]}")
+                _log_failed_lead(
+                    {**lead_payload, "stage": "joins_post", "user_id": user_id, "status": status_code, "body": body[:500]},
+                    "joins_post_failed",
                 )
+                return self._handoff_message(mgr_name, mgr_phone, success=False)
 
             try:
                 now = datetime.now().strftime("%Y-%m-%d")
@@ -776,11 +876,31 @@ class MoyKlassCRM:
                 logger.warning(f"create_lead: задача не создана: {e}")
 
             logger.info(f"create_lead: УСПЕХ — заявка создана для {name} ({clean_phone}), филиал {filial_id}")
-            final_msg = "СИСТЕМНОЕ СООБЩЕНИЕ: УСПЕХ. Заявка создана. Попрощайся. "
-            if mgr_phone_text:
-                final_msg += f"ОБЯЗАТЕЛЬНО напиши клиенту этот номер: {mgr_phone_text}"
+            return self._handoff_message(mgr_name, mgr_phone, success=True)
 
-            return final_msg
+    async def _post_join_with_retry(self, client: httpx.AsyncClient, headers: dict, join_payload: dict):
+        """POST /joins с одной повторной попыткой после обновления токена при 401/403."""
+        try:
+            resp = await client.post(f"{MOYKLASS_BASE_URL}/joins", headers=headers, json=join_payload)
+            logger.info(f"create_lead: POST /joins -> {resp.status_code} {resp.text[:300]}")
+        except Exception as e:
+            logger.error(f"create_lead: исключение POST /joins: {e}")
+            return None
+
+        if resp.status_code in (401, 403):
+            logger.warning("create_lead: /joins вернул 401/403 — обновляю токен и повторяю один раз")
+            self.token = None
+            new_headers = await self._get_headers()
+            if not new_headers:
+                return resp
+            try:
+                resp2 = await client.post(f"{MOYKLASS_BASE_URL}/joins", headers=new_headers, json=join_payload)
+                logger.info(f"create_lead: POST /joins retry -> {resp2.status_code} {resp2.text[:300]}")
+                return resp2
+            except Exception as e:
+                logger.error(f"create_lead: исключение при retry POST /joins: {e}")
+                return resp
+        return resp
 
 crm = MoyKlassCRM(MOYKLASS_API_KEY)
 
