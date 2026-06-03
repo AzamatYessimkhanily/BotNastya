@@ -665,23 +665,113 @@ class MoyKlassCRM:
             f"Заявка зафиксирована — преподнеси это уверенно и завершай диалог."
         )
 
-    async def _resolve_manager_id(self, client: httpx.AsyncClient, headers: dict, manager_phone: str) -> int:
+    async def _resolve_manager_id(
+        self,
+        client: httpx.AsyncClient,
+        headers: dict,
+        manager_phone: str,
+        manager_name: Optional[str] = None,
+    ) -> int:
+        """Ищет managerId сначала по последним 10 цифрам телефона, затем по
+        имени менеджера (первое слово, регистронезависимо). Это нужно потому,
+        что в MoyKlass телефон у менеджера может быть записан в другом формате
+        или вообще отсутствовать — тогда матчим по имени."""
         manager_phone_digits = self._digits(manager_phone)
-        if not manager_phone_digits:
-            return MANAGER_ID
         try:
             resp = await client.get(f"{MOYKLASS_BASE_URL}/managers", headers=headers)
             if resp.status_code != 200:
+                logger.warning(f"_resolve_manager_id: GET /managers -> {resp.status_code}")
                 return MANAGER_ID
             managers = resp.json() or []
-            for manager in managers:
-                for field in ("phone", "mobilePhone", "phoneNumber", "tel"):
-                    candidate = self._digits(str(manager.get(field, "")))
-                    if candidate and (candidate.endswith(manager_phone_digits[-10:]) or manager_phone_digits.endswith(candidate[-10:])):
-                        return manager.get("id", MANAGER_ID)
+
+            if manager_phone_digits:
+                tail = manager_phone_digits[-10:]
+                for manager in managers:
+                    for field in ("phone", "mobilePhone", "phoneNumber", "tel"):
+                        candidate = self._digits(str(manager.get(field, "")))
+                        if candidate and (candidate.endswith(tail) or tail.endswith(candidate[-10:])):
+                            logger.info(
+                                f"_resolve_manager_id: матч по телефону — {manager.get('name')!r} id={manager.get('id')}"
+                            )
+                            return manager.get("id", MANAGER_ID)
+
+            if manager_name:
+                first_word = manager_name.strip().split()[0].lower() if manager_name.strip() else ""
+                if first_word:
+                    for manager in managers:
+                        api_name = (manager.get("name") or "").lower()
+                        if first_word and first_word in api_name:
+                            logger.info(
+                                f"_resolve_manager_id: матч по имени {first_word!r} → {manager.get('name')!r} id={manager.get('id')}"
+                            )
+                            return manager.get("id", MANAGER_ID)
+
+            logger.warning(
+                f"_resolve_manager_id: ни телефон {manager_phone!r}, ни имя {manager_name!r} не нашли в /managers — фоллбэк MANAGER_ID={MANAGER_ID}"
+            )
         except Exception as e:
             logger.warning(f"Не удалось определить managerId по телефону {manager_phone}: {e}")
         return MANAGER_ID
+
+    async def _resolve_initial_status_id(
+        self, client: httpx.AsyncClient, headers: dict
+    ) -> Optional[int]:
+        """Авто-определяет statusId начального лида в MoyKlass. Кэширует.
+
+        MoyKlass требует statusId для POST /joins, но конкретные id зависят от
+        настроек кабинета. Дёргаем /userStatuses, выбираем первый, который НЕ
+        помечен как конечный (isEndStatus). Если ничего не вернулось — возвращаем
+        None, дальнейшая логика попробует /joins без statusId / получит свою ошибку.
+        """
+        cached = getattr(self, "_cached_status_id", "unset")
+        if cached != "unset":
+            return cached
+
+        self._cached_status_id = None  # type: ignore[attr-defined]
+        for path in ("/userStatuses", "/joinStatuses"):
+            try:
+                resp = await client.get(f"{MOYKLASS_BASE_URL}{path}", headers=headers)
+                if resp.status_code != 200:
+                    logger.info(f"_resolve_initial_status_id: GET {path} -> {resp.status_code}")
+                    continue
+                data = resp.json()
+                if isinstance(data, list):
+                    statuses = data
+                elif isinstance(data, dict):
+                    statuses = (
+                        data.get("statuses")
+                        or data.get("userStatuses")
+                        or data.get("joinStatuses")
+                        or data.get("items")
+                        or []
+                    )
+                else:
+                    statuses = []
+                if not statuses:
+                    continue
+                logger.info(
+                    "MoyKlass %s: статусы (id, name, isEnd) = %s",
+                    path,
+                    [(s.get("id"), s.get("name"), s.get("isEndStatus") or s.get("isEnd")) for s in statuses[:20]],
+                )
+                bad_name_markers = ("отказ", "архив", "закрыт", "некачеств", "отмен", "удал")
+                for st in statuses:
+                    if st.get("isEndStatus") or st.get("isEnd"):
+                        continue
+                    name = (st.get("name") or "").lower()
+                    if any(m in name for m in bad_name_markers):
+                        continue
+                    sid = st.get("id")
+                    if sid is not None:
+                        self._cached_status_id = int(sid)  # type: ignore[attr-defined]
+                        logger.info(
+                            f"_resolve_initial_status_id: выбран statusId={sid} ({st.get('name')!r})"
+                        )
+                        return self._cached_status_id
+            except Exception as e:
+                logger.warning(f"_resolve_initial_status_id: исключение на {path}: {e}")
+
+        return None
 
     async def find_user_smart(self, phone):
         headers = await self._get_headers()
@@ -814,10 +904,11 @@ class MoyKlassCRM:
         )
 
         async with httpx.AsyncClient() as client:
-            manager_id = await self._resolve_manager_id(client, headers, mgr_phone)
-            logger.info(f"create_lead: manager_id={manager_id}, manager_phone={mgr_phone}")
+            manager_id = await self._resolve_manager_id(client, headers, mgr_phone, manager_name=mgr_name)
+            logger.info(f"create_lead: manager_id={manager_id}, manager_phone={mgr_phone}, manager_name={mgr_name!r}")
 
             user_id = None
+            user_created_in_this_call = False
             found_data = await self.find_user_smart(clean_phone)
 
             if found_data:
@@ -858,6 +949,13 @@ class MoyKlassCRM:
                         _log_failed_lead({**lead_payload, "stage": "users_post_parse", "body": create_resp.text[:500]}, "users_post_parse")
                         return self._handoff_message(mgr_name, mgr_phone, success=False)
 
+                    user_created_in_this_call = True
+                    logger.info(
+                        "create_lead: POST /users создал клиента id=%s. MoyKlass автоматически "
+                        "ставит начальный clientStateId — лид уже виден в CRM в категории 'Новый лид'.",
+                        user_id,
+                    )
+
                     try:
                         comment_resp = await client.post(
                             f"{MOYKLASS_BASE_URL}/userComments", headers=headers,
@@ -879,6 +977,14 @@ class MoyKlassCRM:
                 _log_failed_lead({**lead_payload, "stage": "no_user_id"}, "no_user_id")
                 return self._handoff_message(mgr_name, mgr_phone, success=False)
 
+            # statusId: 1) если задан LEAD_STATUS_ID — используем его;
+            #           2) иначе авто-детект через /userStatuses;
+            #           3) если не нашли — не отправляем, _post_join_with_retry
+            #              сам разрулит «end statuses» / «required» через retry.
+            resolved_status_id = LEAD_STATUS_ID
+            if resolved_status_id is None:
+                resolved_status_id = await self._resolve_initial_status_id(client, headers)
+
             join_payload = {
                 "userId": user_id,
                 "classId": LEAD_CLASS_ID,
@@ -887,8 +993,8 @@ class MoyKlassCRM:
             }
             if filial_id:
                 join_payload["filialId"] = filial_id
-            if LEAD_STATUS_ID is not None:
-                join_payload["statusId"] = LEAD_STATUS_ID
+            if resolved_status_id is not None:
+                join_payload["statusId"] = resolved_status_id
 
             logger.info(f"create_lead: POST /joins payload={join_payload}")
             join_resp = await self._post_join_with_retry(client, headers, join_payload)
@@ -896,6 +1002,23 @@ class MoyKlassCRM:
             if join_resp is None or join_resp.status_code not in [200, 201]:
                 status_code = getattr(join_resp, "status_code", None)
                 body = getattr(join_resp, "text", "") or ""
+                # Если /users в этом же вызове создал нового клиента — лид уже
+                # есть в CRM (MoyKlass проставил начальный clientStateId, лид
+                # виден в категории «Новый лид»). /joins добавляет привязку к
+                # классу, но это бонус, а не сам факт лида. Не падаем клиенту.
+                if user_created_in_this_call:
+                    logger.warning(
+                        "create_lead: /joins не удался (%s: %s), но клиент уже создан через /users "
+                        "и виден как лид в MoyKlass. Считаю заявку успешной.",
+                        status_code, body[:300],
+                    )
+                    _log_failed_lead(
+                        {**lead_payload, "stage": "joins_post_after_users_ok", "user_id": user_id,
+                         "status": status_code, "body": body[:500]},
+                        "joins_failed_but_lead_created",
+                    )
+                    return self._handoff_message(mgr_name, mgr_phone, success=True)
+
                 logger.error(f"create_lead: ошибка создания заявки joins: {status_code} {body[:300]}")
                 _log_failed_lead(
                     {**lead_payload, "stage": "joins_post", "user_id": user_id, "status": status_code, "body": body[:500]},
