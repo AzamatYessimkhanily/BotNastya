@@ -39,9 +39,16 @@ _QUANTUM_CONTACT_LINE = (
 
 BUFFER_DELAY = 6.0
 MOYKLASS_BASE_URL = "https://api.moyklass.com/v1/company"
-LEAD_CLASS_ID = 341820
-MANAGER_ID = 98753
+LEAD_CLASS_ID = int(os.getenv("LEAD_CLASS_ID", "341820"))
+MANAGER_ID = int(os.getenv("MANAGER_ID", "98753"))
 SESSION_TIMEOUT = 5 * 60 * 60
+
+# Опциональный statusId для POST /joins. Если не задан — поле не отправляем,
+# MoyKlass сам подставит дефолтный начальный статус. Раньше было хардкод 1,
+# но в этом кабинете statusId=1 стал «end status» (Закрыт/Архив),
+# и MoyKlass отвечает 400 "Status cant be in end statuses".
+_LEAD_STATUS_ID_ENV = os.getenv("LEAD_STATUS_ID", "").strip()
+LEAD_STATUS_ID = int(_LEAD_STATUS_ID_ENV) if _LEAD_STATUS_ID_ENV.isdigit() else None
 
 BRANCH_PHONES = {
     37754: "+7 778 104 8197",       # GMCA Аркада (Аяулым Жумажановна)
@@ -873,11 +880,15 @@ class MoyKlassCRM:
                 return self._handoff_message(mgr_name, mgr_phone, success=False)
 
             join_payload = {
-                "userId": user_id, "statusId": 1, "classId": LEAD_CLASS_ID,
-                "comment": full_text, "managerId": manager_id
+                "userId": user_id,
+                "classId": LEAD_CLASS_ID,
+                "comment": full_text,
+                "managerId": manager_id,
             }
             if filial_id:
                 join_payload["filialId"] = filial_id
+            if LEAD_STATUS_ID is not None:
+                join_payload["statusId"] = LEAD_STATUS_ID
 
             logger.info(f"create_lead: POST /joins payload={join_payload}")
             join_resp = await self._post_join_with_retry(client, headers, join_payload)
@@ -907,7 +918,10 @@ class MoyKlassCRM:
             return self._handoff_message(mgr_name, mgr_phone, success=True)
 
     async def _post_join_with_retry(self, client: httpx.AsyncClient, headers: dict, join_payload: dict):
-        """POST /joins с одной повторной попыткой после обновления токена при 401/403."""
+        """POST /joins с авто-повторами:
+        - 401/403 → обновить токен и повторить
+        - 400 «end statuses» → повторить без statusId (MoyKlass подставит дефолтный начальный)
+        """
         try:
             resp = await client.post(f"{MOYKLASS_BASE_URL}/joins", headers=headers, json=join_payload)
             logger.info(f"create_lead: POST /joins -> {resp.status_code} {resp.text[:300]}")
@@ -922,12 +936,32 @@ class MoyKlassCRM:
             if not new_headers:
                 return resp
             try:
-                resp2 = await client.post(f"{MOYKLASS_BASE_URL}/joins", headers=new_headers, json=join_payload)
-                logger.info(f"create_lead: POST /joins retry -> {resp2.status_code} {resp2.text[:300]}")
+                resp = await client.post(f"{MOYKLASS_BASE_URL}/joins", headers=new_headers, json=join_payload)
+                logger.info(f"create_lead: POST /joins retry(auth) -> {resp.status_code} {resp.text[:300]}")
+                headers = new_headers
+            except Exception as e:
+                logger.error(f"create_lead: исключение при retry(auth) POST /joins: {e}")
+                return resp
+
+        body_lower = (getattr(resp, "text", "") or "").lower()
+        if (
+            resp.status_code == 400
+            and "statusId" in join_payload
+            and ("end statuses" in body_lower or "end status" in body_lower)
+        ):
+            logger.warning(
+                "create_lead: statusId=%s — конечный статус в MoyKlass, повторяю POST /joins без statusId",
+                join_payload.get("statusId"),
+            )
+            payload_no_status = {k: v for k, v in join_payload.items() if k != "statusId"}
+            try:
+                resp2 = await client.post(f"{MOYKLASS_BASE_URL}/joins", headers=headers, json=payload_no_status)
+                logger.info(f"create_lead: POST /joins retry(no statusId) -> {resp2.status_code} {resp2.text[:300]}")
                 return resp2
             except Exception as e:
-                logger.error(f"create_lead: исключение при retry POST /joins: {e}")
+                logger.error(f"create_lead: исключение при retry(no statusId) POST /joins: {e}")
                 return resp
+
         return resp
 
 crm = MoyKlassCRM(MOYKLASS_API_KEY)
