@@ -9,7 +9,7 @@ import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
@@ -29,6 +29,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # Модель OpenAI: по умолчанию gpt-4o-mini (дешевле gpt-4-turbo). Переопределение: OPENAI_MODEL в .env
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 MOYKLASS_API_KEY = os.getenv("MOYKLASS_API_KEY")
+MOYKLASS_WEBHOOK_SECRET = os.getenv("MOYKLASS_WEBHOOK_SECRET", "")
 
 # Контакт Quantum STEM: при необходимости переопределить через QUANTUM_MANAGER_PHONE / QUANTUM_MANAGER_NAME в .env
 QUANTUM_MANAGER_NAME = os.getenv("QUANTUM_MANAGER_NAME", "Запись на кружки школы")
@@ -843,6 +844,94 @@ class MoyKlassCRM:
         logger.info(f"Клиент не найден (проверено {len(phones_to_try)} вар).")
         return None
 
+    async def get_user_phone_by_id(self, user_id: int) -> Optional[str]:
+        headers = await self._get_headers()
+        if not headers:
+            return None
+
+        async with httpx.AsyncClient() as client:
+            try:
+                resp = await client.get(f"{MOYKLASS_BASE_URL}/users/{user_id}", headers=headers)
+                if resp.status_code == 200:
+                    phone = resp.json().get("phone")
+                    if phone:
+                        return phone
+            except Exception as e:
+                logger.warning("get_user_phone_by_id: GET /users/%s: %s", user_id, e)
+
+            try:
+                resp = await client.get(
+                    f"{MOYKLASS_BASE_URL}/users", headers=headers, params={"id": user_id}
+                )
+                if resp.status_code == 200:
+                    users = resp.json().get("users", [])
+                    if users:
+                        return users[0].get("phone")
+            except Exception as e:
+                logger.warning("get_user_phone_by_id: GET /users?id=%s: %s", user_id, e)
+
+        return None
+
+    async def _lesson_record_user_ids(self, lesson_id: int, headers: dict) -> List[int]:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{MOYKLASS_BASE_URL}/lessonRecords",
+                headers=headers,
+                params={"lessonId": lesson_id, "limit": 200},
+            )
+            if resp.status_code != 200:
+                logger.warning("lessonRecords lessonId=%s -> %s", lesson_id, resp.status_code)
+                return []
+            return [
+                rec["userId"]
+                for rec in resp.json().get("lessonRecords", [])
+                if rec.get("userId") is not None
+            ]
+
+    async def _class_active_user_ids(self, class_id: int, headers: dict) -> List[int]:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{MOYKLASS_BASE_URL}/joins",
+                headers=headers,
+                params={"classId": class_id, "statusId": 2, "limit": 200},
+            )
+            if resp.status_code != 200:
+                logger.warning("joins classId=%s -> %s", class_id, resp.status_code)
+                return []
+            return [
+                join["userId"]
+                for join in resp.json().get("joins", [])
+                if join.get("userId") is not None
+            ]
+
+    async def resolve_phones_for_webhook(self, obj: dict) -> List[str]:
+        """Телефоны клиентов для CRM-вебхука по правилам из ТЗ."""
+        if obj.get("phone"):
+            return [obj["phone"]]
+
+        headers = await self._get_headers()
+        if not headers:
+            return []
+
+        if obj.get("userId") is not None:
+            phone = await self.get_user_phone_by_id(int(obj["userId"]))
+            return [phone] if phone else []
+
+        user_ids: List[int] = []
+        if obj.get("lessonId") is not None:
+            user_ids = await self._lesson_record_user_ids(int(obj["lessonId"]), headers)
+        elif obj.get("classId") is not None:
+            user_ids = await self._class_active_user_ids(int(obj["classId"]), headers)
+
+        phones: List[str] = []
+        seen = set()
+        for user_id in user_ids:
+            phone = await self.get_user_phone_by_id(user_id)
+            if phone and phone not in seen:
+                seen.add(phone)
+                phones.append(phone)
+        return phones
+
     async def create_lead(self, name, phone, age, experience, preference):
         clean_phone = re.sub(r"[^\d]", "", phone)
         wa_link = f"https://wa.me/{clean_phone}"
@@ -1379,3 +1468,129 @@ async def handle_webhook(request: Request):
 async def wait_user_input(chat_id):
     await asyncio.sleep(BUFFER_DELAY)
     await process_dialog(chat_id)
+
+
+# --- 8. MOYKLASS СЦЕНАРИИ → WHATSAPP ---
+_JOIN_CHANGED_STATE_TEMPLATES = {
+    2: "Здравствуйте. Ваша запись в группу подтверждена. Ждём вас на занятиях.",
+    3: "Здравствуйте. Ваша запись в группу завершена. Если есть вопросы — напишите нам.",
+    4: "Здравствуйте. Ваша запись в группу отменена. Если это ошибка — напишите нам.",
+}
+
+_NOTIFICATION_TEMPLATES = {
+    "payment_new": "Здравствуйте. Оплата получена — спасибо. Если есть вопросы, пишите.",
+    "sub_end_days": "Здравствуйте. Напоминаем: абонемент заканчивается {endDate}. Чтобы продолжить занятия, обратитесь к управляющему вашего филиала.",
+    "sub_days_next_payment": "Здравствуйте. Напоминаем о предстоящем платеже по абонементу. Уточните детали у управляющего вашего филиала.",
+    "sub_lesson_in_debt": "Здравствуйте. Занятие проведено, но баланс недостаточен — оно засчитано в долг. Пожалуйста, пополните баланс.",
+    "sub_lessons_left": "Здравствуйте. В абонементе осталось мало занятий. Свяжитесь с управляющим для продления.",
+    "lesson_start_hours": "Здравствуйте. Напоминаем: сегодня занятие в {beginTime}. Ждём вас.",
+    "lesson_start_days": "Здравствуйте. Напоминаем: занятие {date}. До встречи.",
+    "class_start_hours": "Здравствуйте. Напоминаем: сегодня старт вашей группы. Ждём вас.",
+    "class_start_days": "Здравствуйте. Напоминаем: ваша группа стартует {beginDate}. Если есть вопросы, напишите нам.",
+    "lesson_mark_set": "Здравствуйте. Преподаватель выставил оценку за {type_text}: {value}.",
+    "join_new": "Здравствуйте. Ваша заявка на обучение получена. Управляющий свяжется с вами в ближайшее время.",
+    "user_consecutive_visit_missed_2": "Здравствуйте. Заметили, что занятия пропускаются. Если возникли трудности — напишите, мы готовы помочь.",
+    "user_birthday": "Здравствуйте. Поздравляем с днём рождения! Желаем успехов в шахматах.",
+}
+
+
+def build_notification_message(event: str, obj: dict) -> Optional[str]:
+    """Формирует текст WhatsApp-уведомления. None — событие без шаблона."""
+    if not event:
+        return None
+
+    if event == "join_changed_state":
+        status_id = obj.get("statusId")
+        return _JOIN_CHANGED_STATE_TEMPLATES.get(status_id)
+
+    template = _NOTIFICATION_TEMPLATES.get(event)
+    if not template:
+        return None
+
+    if event == "lesson_mark_set":
+        mark_type = obj.get("type", "")
+        type_text = "домашнее задание" if mark_type == "home" else "занятие"
+        return template.format(type_text=type_text, value=obj.get("value", ""))
+
+    try:
+        return template.format(**obj)
+    except KeyError:
+        return template
+
+
+def phone_to_chat_id(phone: str) -> Optional[str]:
+    clean = re.sub(r"[^\d]", "", phone or "")
+    if len(clean) == 10:
+        clean = "7" + clean
+    elif len(clean) == 11 and clean[0] == "8":
+        clean = "7" + clean[1:]
+    if len(clean) < 11:
+        return None
+    return f"{clean}@c.us"
+
+
+def record_crm_notification_in_history(chat_id: str, message: str) -> None:
+    clean_phone = chat_id.split("@")[0]
+    if chat_id not in chat_history:
+        chat_history[chat_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        chat_history[chat_id].append({
+            "role": "system",
+            "content": (
+                f"[ТЕЛЕФОН КЛИЕНТА]: {clean_phone}. Чат в WhatsApp — номер уже есть. "
+                f"Для заявки в CRM используй этот номер."
+            ),
+        })
+
+    chat_history[chat_id].append({
+        "role": "system",
+        "content": (
+            f"[АВТОУВЕДОМЛЕНИЕ CRM]: Клиенту автоматически отправлено системное сообщение: "
+            f"\"{message}\". "
+            f"Если клиент ответит — это ответ на данное уведомление. "
+            f"Клиент является действующим учеником. "
+            f"Отвечай как при работе с действующим клиентом (ТИП 9 в промпте). "
+            f"НЕ создавай новый лид, НЕ спрашивай имя и телефон заново."
+        ),
+    })
+    chat_history[chat_id].append({"role": "assistant", "content": message})
+    last_activity[chat_id] = time.time()
+
+
+@app.post("/moyklass-webhook/{secret}")
+async def handle_moyklass_webhook(secret: str, request: Request):
+    if not MOYKLASS_WEBHOOK_SECRET or secret != MOYKLASS_WEBHOOK_SECRET:
+        raise HTTPException(status_code=404)
+
+    try:
+        data = await request.json()
+    except Exception:
+        logger.warning("moyklass-webhook: невалидный JSON")
+        return {"status": "ok"}
+
+    event = data.get("event")
+    obj = data.get("object") or {}
+    logger.info("moyklass-webhook: event=%s object_keys=%s", event, list(obj.keys()))
+
+    message = build_notification_message(event, obj)
+    if not message:
+        logger.info("moyklass-webhook: event=%s: нет шаблона, пропускаем", event)
+        return {"status": "ok"}
+
+    phones = await crm.resolve_phones_for_webhook(obj)
+    if not phones:
+        logger.warning("moyklass-webhook: event=%s: телефон не найден", event)
+        return {"status": "ok"}
+
+    for phone in phones:
+        chat_id = phone_to_chat_id(phone)
+        if not chat_id:
+            logger.warning("moyklass-webhook: не удалось нормализовать телефон %r", phone)
+            continue
+        try:
+            await send_whatsapp(chat_id, message)
+            record_crm_notification_in_history(chat_id, message)
+            logger.info("moyklass-webhook: отправлено %s", chat_id)
+        except Exception as e:
+            logger.error("moyklass-webhook: ошибка отправки %s: %s", chat_id, e)
+
+    return {"status": "ok"}
