@@ -30,6 +30,11 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 MOYKLASS_API_KEY = os.getenv("MOYKLASS_API_KEY")
 MOYKLASS_WEBHOOK_SECRET = os.getenv("MOYKLASS_WEBHOOK_SECRET", "")
+# Клиентские CRM→WhatsApp: по умолчанию ВЫКЛ (жалобы на рассылку). Включить: MOYKLASS_CLIENT_WEBHOOKS_ENABLED=1
+_CLIENT_WEBHOOKS_ENV = os.getenv("MOYKLASS_CLIENT_WEBHOOKS_ENABLED", "0").strip().lower()
+MOYKLASS_CLIENT_WEBHOOKS_ENABLED = _CLIENT_WEBHOOKS_ENV in ("1", "true", "yes", "on")
+# Тест CRM: все вебхуки (клиент + сотрудник) уходят только на этот номер. Пусто = выкл.
+MOYKLASS_WEBHOOK_TEST_PHONE = os.getenv("MOYKLASS_WEBHOOK_TEST_PHONE", "").strip()
 
 # Контакт Quantum STEM: при необходимости переопределить через QUANTUM_MANAGER_PHONE / QUANTUM_MANAGER_NAME в .env
 QUANTUM_MANAGER_NAME = os.getenv("QUANTUM_MANAGER_NAME", "Запись на кружки школы")
@@ -932,6 +937,137 @@ class MoyKlassCRM:
                 phones.append(phone)
         return phones
 
+    async def get_user_by_id(self, user_id: int) -> Optional[dict]:
+        headers = await self._get_headers()
+        if not headers:
+            return None
+
+        async with httpx.AsyncClient() as client:
+            try:
+                resp = await client.get(f"{MOYKLASS_BASE_URL}/users/{user_id}", headers=headers)
+                if resp.status_code == 200:
+                    return resp.json()
+            except Exception as e:
+                logger.warning("get_user_by_id: GET /users/%s: %s", user_id, e)
+
+            try:
+                resp = await client.get(
+                    f"{MOYKLASS_BASE_URL}/users", headers=headers, params={"id": user_id}
+                )
+                if resp.status_code == 200:
+                    users = resp.json().get("users", [])
+                    if users:
+                        return users[0]
+            except Exception as e:
+                logger.warning("get_user_by_id: GET /users?id=%s: %s", user_id, e)
+
+        return None
+
+    async def get_manager_phone_by_id(self, manager_id: int) -> Optional[str]:
+        headers = await self._get_headers()
+        if not headers:
+            return None
+
+        async with httpx.AsyncClient() as client:
+            try:
+                resp = await client.get(
+                    f"{MOYKLASS_BASE_URL}/managers/{manager_id}", headers=headers
+                )
+                if resp.status_code == 200:
+                    phone = resp.json().get("phone")
+                    if phone:
+                        return phone
+            except Exception as e:
+                logger.warning("get_manager_phone_by_id: GET /managers/%s: %s", manager_id, e)
+
+            try:
+                resp = await client.get(f"{MOYKLASS_BASE_URL}/managers", headers=headers)
+                if resp.status_code == 200:
+                    for manager in resp.json() or []:
+                        if manager.get("id") == manager_id:
+                            return manager.get("phone")
+            except Exception as e:
+                logger.warning("get_manager_phone_by_id: GET /managers: %s", e)
+
+        return None
+
+    async def _append_manager_phone(
+        self, manager_id: Optional[int], phones: List[str], seen: set
+    ) -> None:
+        if manager_id is None:
+            return
+        phone = await self.get_manager_phone_by_id(int(manager_id))
+        if phone and phone not in seen:
+            seen.add(phone)
+            phones.append(phone)
+
+    async def resolve_staff_phones_for_webhook(self, obj: dict, init: Optional[dict] = None) -> List[str]:
+        """Телефоны сотрудников (преподаватель занятия / ответственный менеджер)."""
+        init = init or {}
+        headers = await self._get_headers()
+        if not headers:
+            return []
+
+        phones: List[str] = []
+        seen = set()
+
+        if obj.get("lessonId") is not None:
+            async with httpx.AsyncClient() as client:
+                try:
+                    resp = await client.get(
+                        f"{MOYKLASS_BASE_URL}/lessons/{int(obj['lessonId'])}",
+                        headers=headers,
+                    )
+                    if resp.status_code == 200:
+                        for teacher_id in resp.json().get("teacherIds") or []:
+                            await self._append_manager_phone(teacher_id, phones, seen)
+                except Exception as e:
+                    logger.warning(
+                        "resolve_staff_phones: GET /lessons/%s: %s", obj.get("lessonId"), e
+                    )
+            if phones:
+                return phones
+
+        if obj.get("userId") is not None:
+            user = await self.get_user_by_id(int(obj["userId"]))
+            if user:
+                for manager_id in user.get("responsibles") or []:
+                    await self._append_manager_phone(manager_id, phones, seen)
+                await self._append_manager_phone(user.get("responsibleId"), phones, seen)
+
+        await self._append_manager_phone(init.get("managerId"), phones, seen)
+
+        return phones
+
+    async def enrich_webhook_object_context(self, obj: dict) -> dict:
+        enriched = dict(obj)
+        if obj.get("userId") is not None:
+            user = await self.get_user_by_id(int(obj["userId"]))
+            if user and user.get("name"):
+                enriched["userName"] = user["name"]
+
+        if obj.get("lessonId") is not None:
+            headers = await self._get_headers()
+            if headers:
+                async with httpx.AsyncClient() as client:
+                    try:
+                        resp = await client.get(
+                            f"{MOYKLASS_BASE_URL}/lessons/{int(obj['lessonId'])}",
+                            headers=headers,
+                        )
+                        if resp.status_code == 200:
+                            lesson = resp.json()
+                            enriched.setdefault("date", lesson.get("date", ""))
+                            enriched.setdefault("beginTime", lesson.get("beginTime", ""))
+                    except Exception as e:
+                        logger.warning(
+                            "enrich_webhook_object_context: lesson %s: %s",
+                            obj.get("lessonId"),
+                            e,
+                        )
+
+        return enriched
+
     async def create_lead(self, name, phone, age, experience, preference):
         clean_phone = re.sub(r"[^\d]", "", phone)
         wa_link = f"https://wa.me/{clean_phone}"
@@ -1518,6 +1654,75 @@ def build_notification_message(event: str, obj: dict) -> Optional[str]:
         return template
 
 
+_EMPLOYEE_NOTIFICATION_TEMPLATES = {
+    "lesson_changed": (
+        "Уведомление для сотрудника: изменилась информация о занятии "
+        "{date} в {beginTime}. Проверьте расписание в MoyKlass."
+    ),
+    "lesson_record_new": (
+        "Уведомление для сотрудника: создана новая запись на занятие"
+        "{user_suffix}. Проверьте журнал в MoyKlass."
+    ),
+    "lesson_record_changed": (
+        "Уведомление для сотрудника: изменился статус записи на занятие"
+        "{user_suffix}. Проверьте журнал в MoyKlass."
+    ),
+    "lesson_record_deleted": (
+        "Уведомление для сотрудника: запись на занятие удалена"
+        "{user_suffix}. Проверьте расписание в MoyKlass."
+    ),
+    "sub_lesson_in_debt": (
+        "Уведомление для сотрудника: ученик{user_suffix} провёл занятие в долг. "
+        "Свяжитесь с клиентом и проверьте баланс."
+    ),
+    "sub_end_days": (
+        "Уведомление для сотрудника: у ученика{user_suffix} заканчивается абонемент "
+        "{endDate}. Свяжитесь для продления."
+    ),
+    "sub_days_next_payment": (
+        "Уведомление для сотрудника: у ученика{user_suffix} приближается платёж "
+        "или просрочка по абонементу. Проверьте CRM."
+    ),
+    "lesson_task_changed": (
+        "Уведомление для сотрудника: ученик{user_suffix} отправил ответ на задание. "
+        "Проверьте в MoyKlass."
+    ),
+    "lesson_task_new": (
+        "Уведомление для сотрудника: создано новое задание для ученика"
+        "{user_suffix}. Проверьте в MoyKlass."
+    ),
+    "payment_new": (
+        "Уведомление для сотрудника: ученик{user_suffix} внёс оплату "
+        "{summa} тг. Проверьте CRM."
+    ),
+}
+
+
+def build_employee_notification_message(event: str, obj: dict) -> Optional[str]:
+    """Текст WhatsApp-уведомления для сотрудника. None — событие без шаблона."""
+    if not event:
+        return None
+
+    template = _EMPLOYEE_NOTIFICATION_TEMPLATES.get(event)
+    if not template:
+        return None
+
+    user_name = (obj.get("userName") or "").strip()
+    user_suffix = f" ({user_name})" if user_name else ""
+    fmt_obj = {**obj, "user_suffix": user_suffix}
+
+    try:
+        return template.format(**fmt_obj)
+    except KeyError:
+        return template.format(
+            user_suffix=user_suffix,
+            date=obj.get("date", ""),
+            beginTime=obj.get("beginTime", ""),
+            endDate=obj.get("endDate", ""),
+            summa=obj.get("summa", ""),
+        )
+
+
 def phone_to_chat_id(phone: str) -> Optional[str]:
     clean = re.sub(r"[^\d]", "", phone or "")
     if len(clean) == 10:
@@ -1556,41 +1761,119 @@ def record_crm_notification_in_history(chat_id: str, message: str) -> None:
     last_activity[chat_id] = time.time()
 
 
-@app.post("/moyklass-webhook/{secret}")
-async def handle_moyklass_webhook(secret: str, request: Request):
+def _webhook_test_mode_active() -> bool:
+    return bool(MOYKLASS_WEBHOOK_TEST_PHONE)
+
+
+def _apply_webhook_test_phone_override(phones: List[str], log_prefix: str) -> List[str]:
+    if not _webhook_test_mode_active():
+        return phones
+    logger.warning(
+        "%s: ТЕСТОВЫЙ РЕЖИМ — вместо %s отправляем только на %s",
+        log_prefix,
+        phones,
+        MOYKLASS_WEBHOOK_TEST_PHONE,
+    )
+    return [MOYKLASS_WEBHOOK_TEST_PHONE]
+
+
+async def _dispatch_moyklass_webhook(
+    log_prefix: str,
+    event: Optional[str],
+    obj: dict,
+    message: Optional[str],
+    phones: List[str],
+    record_history: bool,
+) -> dict:
+    if not message:
+        logger.info("%s: event=%s: нет шаблона, пропускаем", log_prefix, event)
+        return {"status": "ok"}
+
+    if not phones:
+        logger.warning("%s: event=%s: телефон не найден", log_prefix, event)
+        return {"status": "ok"}
+
+    test_mode = _webhook_test_mode_active()
+    phones = _apply_webhook_test_phone_override(phones, log_prefix)
+    if test_mode:
+        message = f"[ТЕСТ CRM] {message}"
+        record_history = False
+
+    for phone in phones:
+        chat_id = phone_to_chat_id(phone)
+        if not chat_id:
+            logger.warning("%s: не удалось нормализовать телефон %r", log_prefix, phone)
+            continue
+        try:
+            await send_whatsapp(chat_id, message)
+            if record_history:
+                record_crm_notification_in_history(chat_id, message)
+            logger.info("%s: отправлено %s", log_prefix, chat_id)
+        except Exception as e:
+            logger.error("%s: ошибка отправки %s: %s", log_prefix, chat_id, e)
+
+    return {"status": "ok"}
+
+
+async def _parse_moyklass_webhook_request(request: Request, log_prefix: str) -> Optional[dict]:
+    try:
+        return await request.json()
+    except Exception:
+        logger.warning("%s: невалидный JSON", log_prefix)
+        return None
+
+
+def _check_moyklass_webhook_secret(secret: str) -> None:
     if not MOYKLASS_WEBHOOK_SECRET or secret != MOYKLASS_WEBHOOK_SECRET:
         raise HTTPException(status_code=404)
 
-    try:
-        data = await request.json()
-    except Exception:
-        logger.warning("moyklass-webhook: невалидный JSON")
+
+@app.post("/moyklass-webhook/{secret}")
+async def handle_moyklass_webhook(secret: str, request: Request):
+    _check_moyklass_webhook_secret(secret)
+
+    data = await _parse_moyklass_webhook_request(request, "moyklass-webhook")
+    if data is None:
         return {"status": "ok"}
 
     event = data.get("event")
     obj = data.get("object") or {}
     logger.info("moyklass-webhook: event=%s object_keys=%s", event, list(obj.keys()))
 
+    if not MOYKLASS_CLIENT_WEBHOOKS_ENABLED and not _webhook_test_mode_active():
+        logger.info(
+            "moyklass-webhook: клиентские уведомления отключены, пропускаем event=%s",
+            event,
+        )
+        return {"status": "ok"}
+
     message = build_notification_message(event, obj)
-    if not message:
-        logger.info("moyklass-webhook: event=%s: нет шаблона, пропускаем", event)
-        return {"status": "ok"}
-
     phones = await crm.resolve_phones_for_webhook(obj)
-    if not phones:
-        logger.warning("moyklass-webhook: event=%s: телефон не найден", event)
+    return await _dispatch_moyklass_webhook(
+        "moyklass-webhook", event, obj, message, phones, record_history=True
+    )
+
+
+@app.post("/moyklass-webhook-employee/{secret}")
+async def handle_moyklass_webhook_employee(secret: str, request: Request):
+    _check_moyklass_webhook_secret(secret)
+
+    data = await _parse_moyklass_webhook_request(request, "moyklass-webhook-employee")
+    if data is None:
         return {"status": "ok"}
 
-    for phone in phones:
-        chat_id = phone_to_chat_id(phone)
-        if not chat_id:
-            logger.warning("moyklass-webhook: не удалось нормализовать телефон %r", phone)
-            continue
-        try:
-            await send_whatsapp(chat_id, message)
-            record_crm_notification_in_history(chat_id, message)
-            logger.info("moyklass-webhook: отправлено %s", chat_id)
-        except Exception as e:
-            logger.error("moyklass-webhook: ошибка отправки %s: %s", chat_id, e)
+    event = data.get("event")
+    obj = await crm.enrich_webhook_object_context(data.get("object") or {})
+    init = data.get("init") or {}
+    logger.info(
+        "moyklass-webhook-employee: event=%s object_keys=%s init_keys=%s",
+        event,
+        list(obj.keys()),
+        list(init.keys()),
+    )
 
-    return {"status": "ok"}
+    message = build_employee_notification_message(event, obj)
+    phones = await crm.resolve_staff_phones_for_webhook(obj, init)
+    return await _dispatch_moyklass_webhook(
+        "moyklass-webhook-employee", event, obj, message, phones, record_history=False
+    )
