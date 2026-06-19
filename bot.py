@@ -1058,6 +1058,25 @@ class MoyKlassCRM:
                             e,
                         )
 
+        if obj.get("classId") is not None and not enriched.get("beginTime"):
+            headers = await self._get_headers()
+            if headers:
+                async with httpx.AsyncClient(timeout=MOYKLASS_HTTP_TIMEOUT) as client:
+                    try:
+                        resp = await client.get(
+                            f"{MOYKLASS_BASE_URL}/classes/{int(obj['classId'])}",
+                            headers=headers,
+                        )
+                        if resp.status_code == 200:
+                            cls_data = resp.json()
+                            enriched.setdefault("beginTime", cls_data.get("beginTime", ""))
+                    except Exception as e:
+                        logger.warning(
+                            "enrich_webhook_object_context: class %s: %s",
+                            obj.get("classId"),
+                            e,
+                        )
+
         return enriched
 
     async def create_lead(self, name, phone, age, experience, preference):
@@ -1804,7 +1823,19 @@ def _scheduled_event_is_past(obj: dict, event: Optional[str] = None) -> bool:
     now_local = datetime.now(_SCHOOL_TZ).replace(tzinfo=None)
 
     if not date_str:
-        # Без даты массовое напоминание не отправляем — типичный payload только с lessonId.
+        if event == "class_start_hours":
+            # Это событие по определению «сегодня» — даты в payload нет.
+            # Берём beginTime из enrich (GET /classes/{id}); без него — fail-closed.
+            if not time_str:
+                return True
+            try:
+                scheduled = datetime.strptime(
+                    f"{today.isoformat()} {time_str}", "%Y-%m-%d %H:%M"
+                )
+                return scheduled < now_local
+            except ValueError:
+                return True
+        # lesson_start / lesson_start_hours без даты — не отправляем (fail-closed).
         return event in _TODAY_LESSON_EVENTS
 
     parsed_date = _parse_schedule_date(date_str)
