@@ -7,7 +7,8 @@ import io
 import logging
 import time
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Request
 from openai import AsyncOpenAI
@@ -35,6 +36,10 @@ _CLIENT_WEBHOOKS_ENV = os.getenv("MOYKLASS_CLIENT_WEBHOOKS_ENABLED", "0").strip(
 MOYKLASS_CLIENT_WEBHOOKS_ENABLED = _CLIENT_WEBHOOKS_ENV in ("1", "true", "yes", "on")
 # Тест CRM: все вебхуки (клиент + сотрудник) уходят только на этот номер. Пусто = выкл.
 MOYKLASS_WEBHOOK_TEST_PHONE = os.getenv("MOYKLASS_WEBHOOK_TEST_PHONE", "").strip()
+# Клиентские вебхуки: игнорировать события старше этого Unix-времени (защита от массовой рассылки при деплое).
+_ENABLED_SINCE_ENV = os.getenv("MOYKLASS_WEBHOOK_ENABLED_SINCE", "").strip()
+MOYKLASS_WEBHOOK_ENABLED_SINCE = int(_ENABLED_SINCE_ENV) if _ENABLED_SINCE_ENV.isdigit() else None
+_SCHOOL_TZ = ZoneInfo("Asia/Almaty")
 
 # Контакт Quantum STEM: при необходимости переопределить через QUANTUM_MANAGER_PHONE / QUANTUM_MANAGER_NAME в .env
 QUANTUM_MANAGER_NAME = os.getenv("QUANTUM_MANAGER_NAME", "Запись на кружки школы")
@@ -45,6 +50,7 @@ _QUANTUM_CONTACT_LINE = (
 
 BUFFER_DELAY = 1.0
 MOYKLASS_BASE_URL = "https://api.moyklass.com/v1/company"
+MOYKLASS_HTTP_TIMEOUT = 30.0
 LEAD_CLASS_ID = int(os.getenv("LEAD_CLASS_ID", "341820"))
 MANAGER_ID = int(os.getenv("MANAGER_ID", "98753"))
 SESSION_TIMEOUT = 5 * 60 * 60
@@ -850,64 +856,76 @@ class MoyKlassCRM:
         return None
 
     async def get_user_phone_by_id(self, user_id: int) -> Optional[str]:
+        user = await self.get_user_by_id(user_id)
+        if user and user.get("id") == user_id:
+            return user.get("phone")
+        return None
+
+    async def get_user_by_id(self, user_id: int) -> Optional[dict]:
         headers = await self._get_headers()
         if not headers:
             return None
 
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=MOYKLASS_HTTP_TIMEOUT) as client:
             try:
                 resp = await client.get(f"{MOYKLASS_BASE_URL}/users/{user_id}", headers=headers)
                 if resp.status_code == 200:
-                    phone = resp.json().get("phone")
-                    if phone:
-                        return phone
+                    return resp.json()
             except Exception as e:
-                logger.warning("get_user_phone_by_id: GET /users/%s: %s", user_id, e)
+                logger.warning("get_user_by_id: GET /users/%s: %s", user_id, e)
 
             try:
                 resp = await client.get(
                     f"{MOYKLASS_BASE_URL}/users", headers=headers, params={"id": user_id}
                 )
                 if resp.status_code == 200:
-                    users = resp.json().get("users", [])
-                    if users:
-                        return users[0].get("phone")
+                    for user in resp.json().get("users", []):
+                        if user.get("id") == user_id:
+                            return user
             except Exception as e:
-                logger.warning("get_user_phone_by_id: GET /users?id=%s: %s", user_id, e)
+                logger.warning("get_user_by_id: GET /users?id=%s: %s", user_id, e)
 
         return None
 
     async def _lesson_record_user_ids(self, lesson_id: int, headers: dict) -> List[int]:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                f"{MOYKLASS_BASE_URL}/lessonRecords",
-                headers=headers,
-                params={"lessonId": lesson_id, "limit": 200},
-            )
-            if resp.status_code != 200:
-                logger.warning("lessonRecords lessonId=%s -> %s", lesson_id, resp.status_code)
-                return []
-            return [
-                rec["userId"]
-                for rec in resp.json().get("lessonRecords", [])
-                if rec.get("userId") is not None
-            ]
+        try:
+            async with httpx.AsyncClient(timeout=MOYKLASS_HTTP_TIMEOUT) as client:
+                resp = await client.get(
+                    f"{MOYKLASS_BASE_URL}/lessonRecords",
+                    headers=headers,
+                    params={"lessonId": lesson_id, "limit": 200},
+                )
+                if resp.status_code != 200:
+                    logger.warning("lessonRecords lessonId=%s -> %s", lesson_id, resp.status_code)
+                    return []
+                return [
+                    rec["userId"]
+                    for rec in resp.json().get("lessonRecords", [])
+                    if rec.get("userId") is not None
+                ]
+        except Exception as e:
+            logger.warning("lessonRecords lessonId=%s: %s", lesson_id, e)
+            return []
 
     async def _class_active_user_ids(self, class_id: int, headers: dict) -> List[int]:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                f"{MOYKLASS_BASE_URL}/joins",
-                headers=headers,
-                params={"classId": class_id, "statusId": 2, "limit": 200},
-            )
-            if resp.status_code != 200:
-                logger.warning("joins classId=%s -> %s", class_id, resp.status_code)
-                return []
-            return [
-                join["userId"]
-                for join in resp.json().get("joins", [])
-                if join.get("userId") is not None
-            ]
+        try:
+            async with httpx.AsyncClient(timeout=MOYKLASS_HTTP_TIMEOUT) as client:
+                resp = await client.get(
+                    f"{MOYKLASS_BASE_URL}/joins",
+                    headers=headers,
+                    params={"classId": class_id, "statusId": 2, "limit": 200},
+                )
+                if resp.status_code != 200:
+                    logger.warning("joins classId=%s -> %s", class_id, resp.status_code)
+                    return []
+                return [
+                    join["userId"]
+                    for join in resp.json().get("joins", [])
+                    if join.get("userId") is not None
+                ]
+        except Exception as e:
+            logger.warning("joins classId=%s: %s", class_id, e)
+            return []
 
     async def resolve_phones_for_webhook(self, obj: dict) -> List[str]:
         """Телефоны клиентов для CRM-вебхука по правилам из ТЗ."""
@@ -937,38 +955,12 @@ class MoyKlassCRM:
                 phones.append(phone)
         return phones
 
-    async def get_user_by_id(self, user_id: int) -> Optional[dict]:
-        headers = await self._get_headers()
-        if not headers:
-            return None
-
-        async with httpx.AsyncClient() as client:
-            try:
-                resp = await client.get(f"{MOYKLASS_BASE_URL}/users/{user_id}", headers=headers)
-                if resp.status_code == 200:
-                    return resp.json()
-            except Exception as e:
-                logger.warning("get_user_by_id: GET /users/%s: %s", user_id, e)
-
-            try:
-                resp = await client.get(
-                    f"{MOYKLASS_BASE_URL}/users", headers=headers, params={"id": user_id}
-                )
-                if resp.status_code == 200:
-                    users = resp.json().get("users", [])
-                    if users:
-                        return users[0]
-            except Exception as e:
-                logger.warning("get_user_by_id: GET /users?id=%s: %s", user_id, e)
-
-        return None
-
     async def get_manager_phone_by_id(self, manager_id: int) -> Optional[str]:
         headers = await self._get_headers()
         if not headers:
             return None
 
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=MOYKLASS_HTTP_TIMEOUT) as client:
             try:
                 resp = await client.get(
                     f"{MOYKLASS_BASE_URL}/managers/{manager_id}", headers=headers
@@ -1012,7 +1004,7 @@ class MoyKlassCRM:
         seen = set()
 
         if obj.get("lessonId") is not None:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=MOYKLASS_HTTP_TIMEOUT) as client:
                 try:
                     resp = await client.get(
                         f"{MOYKLASS_BASE_URL}/lessons/{int(obj['lessonId'])}",
@@ -1049,7 +1041,7 @@ class MoyKlassCRM:
         if obj.get("lessonId") is not None:
             headers = await self._get_headers()
             if headers:
-                async with httpx.AsyncClient() as client:
+                async with httpx.AsyncClient(timeout=MOYKLASS_HTTP_TIMEOUT) as client:
                     try:
                         resp = await client.get(
                             f"{MOYKLASS_BASE_URL}/lessons/{int(obj['lessonId'])}",
@@ -1619,6 +1611,7 @@ _NOTIFICATION_TEMPLATES = {
     "sub_days_next_payment": "Здравствуйте. Напоминаем о предстоящем платеже по абонементу. Уточните детали у управляющего вашего филиала.",
     "sub_lesson_in_debt": "Здравствуйте. Занятие проведено, но баланс недостаточен — оно засчитано в долг. Пожалуйста, пополните баланс.",
     "sub_lessons_left": "Здравствуйте. В абонементе осталось мало занятий. Свяжитесь с управляющим для продления.",
+    "lesson_start": "Здравствуйте. Напоминаем: сегодня занятие в {beginTime}. Ждём вас.",
     "lesson_start_hours": "Здравствуйте. Напоминаем: сегодня занятие в {beginTime}. Ждём вас.",
     "lesson_start_days": "Здравствуйте. Напоминаем: занятие {date}. До встречи.",
     "class_start_hours": "Здравствуйте. Напоминаем: сегодня старт вашей группы. Ждём вас.",
@@ -1643,13 +1636,17 @@ def build_notification_message(event: str, obj: dict) -> Optional[str]:
     if not template:
         return None
 
+    fmt_obj = dict(obj)
+    if event in ("lesson_start", "lesson_start_hours", "class_start_hours"):
+        fmt_obj["beginTime"] = _normalize_begin_time(fmt_obj.get("beginTime", ""))
+
     if event == "lesson_mark_set":
         mark_type = obj.get("type", "")
         type_text = "домашнее задание" if mark_type == "home" else "занятие"
         return template.format(type_text=type_text, value=obj.get("value", ""))
 
     try:
-        return template.format(**obj)
+        return template.format(**fmt_obj)
     except KeyError:
         return template
 
@@ -1765,6 +1762,92 @@ def _webhook_test_mode_active() -> bool:
     return bool(MOYKLASS_WEBHOOK_TEST_PHONE)
 
 
+_SCHEDULED_REMINDER_EVENTS = frozenset({
+    "lesson_start",
+    "lesson_start_hours",
+    "lesson_start_days",
+    "class_start_hours",
+    "class_start_days",
+})
+
+_TODAY_LESSON_EVENTS = frozenset({"lesson_start", "lesson_start_hours", "class_start_hours"})
+
+
+def _normalize_begin_time(time_str: str) -> str:
+    """10:00:00 → 10:00; пустое → пустое."""
+    time_str = (time_str or "").strip()
+    if not time_str:
+        return ""
+    match = re.match(r"^(\d{1,2}):(\d{2})", time_str)
+    if match:
+        return f"{int(match.group(1)):02d}:{match.group(2)}"
+    return time_str
+
+
+def _parse_schedule_date(date_str: str) -> Optional[date]:
+    date_str = (date_str or "").strip()
+    if not date_str:
+        return None
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(date_str, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _scheduled_event_is_past(obj: dict, event: Optional[str] = None) -> bool:
+    """True — напоминание уже в прошлом или время не удалось определить (fail-closed)."""
+    date_str = (obj.get("date") or obj.get("beginDate") or "").strip()
+    time_str = _normalize_begin_time(obj.get("beginTime") or "")
+    today = datetime.now(_SCHOOL_TZ).date()
+    now_local = datetime.now(_SCHOOL_TZ).replace(tzinfo=None)
+
+    if not date_str:
+        # Без даты массовое напоминание не отправляем — типичный payload только с lessonId.
+        return event in _TODAY_LESSON_EVENTS
+
+    parsed_date = _parse_schedule_date(date_str)
+    if parsed_date is None:
+        return True
+
+    if parsed_date < today:
+        return True
+    if parsed_date > today:
+        return False
+
+    # Дата — сегодня
+    if event in {"lesson_start_days", "class_start_days"}:
+        return False
+
+    if not time_str:
+        # Раньше подставляли 23:59 → пропускали весь день; для «сегодня в 10:00» это опасно.
+        return event in _TODAY_LESSON_EVENTS
+
+    try:
+        scheduled = datetime.strptime(f"{parsed_date.isoformat()} {time_str}", "%Y-%m-%d %H:%M")
+        return scheduled < now_local
+    except ValueError:
+        return True
+
+
+def _should_skip_stale_client_webhook(data: dict, event: str, obj: dict) -> bool:
+    """Пропустить старые/ретраи вебхуков — только события с момента деплоя и будущие напоминания."""
+    if MOYKLASS_WEBHOOK_ENABLED_SINCE is not None:
+        event_time = data.get("time")
+        if event_time is not None:
+            try:
+                if int(event_time) < MOYKLASS_WEBHOOK_ENABLED_SINCE:
+                    return True
+            except (TypeError, ValueError):
+                pass
+
+    if event in _SCHEDULED_REMINDER_EVENTS and _scheduled_event_is_past(obj, event):
+        return True
+
+    return False
+
+
 def _apply_webhook_test_phone_override(phones: List[str], log_prefix: str) -> List[str]:
     if not _webhook_test_mode_active():
         return phones
@@ -1799,6 +1882,8 @@ async def _dispatch_moyklass_webhook(
         message = f"[ТЕСТ CRM] {message}"
         record_history = False
 
+    logger.info("%s: event=%s получатели=%s", log_prefix, event, phones)
+
     for phone in phones:
         chat_id = phone_to_chat_id(phone)
         if not chat_id:
@@ -1832,48 +1917,103 @@ def _check_moyklass_webhook_secret(secret: str) -> None:
 async def handle_moyklass_webhook(secret: str, request: Request):
     _check_moyklass_webhook_secret(secret)
 
-    data = await _parse_moyklass_webhook_request(request, "moyklass-webhook")
-    if data is None:
-        return {"status": "ok"}
+    try:
+        data = await _parse_moyklass_webhook_request(request, "moyklass-webhook")
+        if data is None:
+            return {"status": "ok"}
 
-    event = data.get("event")
-    obj = data.get("object") or {}
-    logger.info("moyklass-webhook: event=%s object_keys=%s", event, list(obj.keys()))
-
-    if not MOYKLASS_CLIENT_WEBHOOKS_ENABLED and not _webhook_test_mode_active():
+        event = data.get("event")
+        obj = data.get("object") or {}
         logger.info(
-            "moyklass-webhook: клиентские уведомления отключены, пропускаем event=%s",
+            "moyklass-webhook: event=%s object_keys=%s time=%s",
             event,
+            list(obj.keys()),
+            data.get("time"),
         )
-        return {"status": "ok"}
 
-    message = build_notification_message(event, obj)
-    phones = await crm.resolve_phones_for_webhook(obj)
-    return await _dispatch_moyklass_webhook(
-        "moyklass-webhook", event, obj, message, phones, record_history=True
-    )
+        if event in _SCHEDULED_REMINDER_EVENTS or obj.get("lessonId") is not None:
+            obj = await crm.enrich_webhook_object_context(obj)
+            logger.info(
+                "moyklass-webhook: enriched event=%s date=%s beginTime=%s lessonId=%s",
+                event,
+                obj.get("date") or obj.get("beginDate"),
+                obj.get("beginTime"),
+                obj.get("lessonId"),
+            )
+
+        if not MOYKLASS_CLIENT_WEBHOOKS_ENABLED and not _webhook_test_mode_active():
+            logger.info(
+                "moyklass-webhook: клиентские уведомления отключены, пропускаем event=%s",
+                event,
+            )
+            return {"status": "ok"}
+
+        if _should_skip_stale_client_webhook(data, event, obj):
+            logger.info(
+                "moyklass-webhook: event=%s пропущен (старое/ретрай или занятие в прошлом), "
+                "time=%s date=%s beginTime=%s lessonId=%s",
+                event,
+                data.get("time"),
+                obj.get("date") or obj.get("beginDate"),
+                obj.get("beginTime"),
+                obj.get("lessonId"),
+            )
+            return {"status": "ok"}
+
+        message = build_notification_message(event, obj)
+        if not message:
+            logger.info("moyklass-webhook: event=%s: нет шаблона, пропускаем", event)
+            return {"status": "ok"}
+
+        phones = await crm.resolve_phones_for_webhook(obj)
+        logger.info(
+            "moyklass-webhook: event=%s userId=%s phones=%s",
+            event,
+            obj.get("userId"),
+            phones,
+        )
+        return await _dispatch_moyklass_webhook(
+            "moyklass-webhook", event, obj, message, phones, record_history=True
+        )
+    except Exception as e:
+        logger.error("moyklass-webhook: необработанная ошибка: %s", e, exc_info=True)
+        return {"status": "ok"}
 
 
 @app.post("/moyklass-webhook-employee/{secret}")
 async def handle_moyklass_webhook_employee(secret: str, request: Request):
     _check_moyklass_webhook_secret(secret)
 
-    data = await _parse_moyklass_webhook_request(request, "moyklass-webhook-employee")
-    if data is None:
+    try:
+        data = await _parse_moyklass_webhook_request(request, "moyklass-webhook-employee")
+        if data is None:
+            return {"status": "ok"}
+
+        event = data.get("event")
+        obj = await crm.enrich_webhook_object_context(data.get("object") or {})
+        init = data.get("init") or {}
+        logger.info(
+            "moyklass-webhook-employee: event=%s object_keys=%s init_keys=%s",
+            event,
+            list(obj.keys()),
+            list(init.keys()),
+        )
+
+        message = build_employee_notification_message(event, obj)
+        if not message:
+            logger.info("moyklass-webhook-employee: event=%s: нет шаблона, пропускаем", event)
+            return {"status": "ok"}
+
+        phones = await crm.resolve_staff_phones_for_webhook(obj, init)
+        logger.info(
+            "moyklass-webhook-employee: event=%s userId=%s phones=%s",
+            event,
+            obj.get("userId"),
+            phones,
+        )
+        return await _dispatch_moyklass_webhook(
+            "moyklass-webhook-employee", event, obj, message, phones, record_history=False
+        )
+    except Exception as e:
+        logger.error("moyklass-webhook-employee: необработанная ошибка: %s", e, exc_info=True)
         return {"status": "ok"}
-
-    event = data.get("event")
-    obj = await crm.enrich_webhook_object_context(data.get("object") or {})
-    init = data.get("init") or {}
-    logger.info(
-        "moyklass-webhook-employee: event=%s object_keys=%s init_keys=%s",
-        event,
-        list(obj.keys()),
-        list(init.keys()),
-    )
-
-    message = build_employee_notification_message(event, obj)
-    phones = await crm.resolve_staff_phones_for_webhook(obj, init)
-    return await _dispatch_moyklass_webhook(
-        "moyklass-webhook-employee", event, obj, message, phones, record_history=False
-    )
