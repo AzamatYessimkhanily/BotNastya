@@ -11,7 +11,7 @@
 
 SERVER="http://82.115.48.37:8000"
 SECRET="1c110b8a-6020-4e31-8eff-3612aa0c55ef"
-USER_ID=10461950        # Шера — тестовый аккаунт заказчика
+USER_ID=10466998        # Азамат Тест — реальный клиент в MoyKlass (userId Шеры=10461950 — это менеджер, без профиля клиента)
 TODAY=$(date +%Y-%m-%d)
 TOMORROW=$(date -d "tomorrow" +%Y-%m-%d 2>/dev/null || date -v+1d +%Y-%m-%d)
 FUTURE_TIME="23:30"     # Время в будущем — чтобы stale-check не пропустил
