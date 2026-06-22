@@ -502,6 +502,8 @@ chat_history: Dict[str, List[Dict]] = {}
 message_buffers: Dict[str, Dict] = {}
 known_users: Dict[str, dict] = {}
 last_activity: Dict[str, float] = {}
+# Чат, где заявка уже передана управляющему — не повторять handoff на «хорошо/спасибо»
+handoff_completed: Dict[str, float] = {}
 # Защита от повторной доставки одного и того же входящего (Green API) и гонок при обработке
 seen_incoming_ids: Dict[str, deque] = defaultdict(lambda: deque(maxlen=400))
 _dialog_locks: Dict[str, asyncio.Lock] = {}
@@ -1375,9 +1377,90 @@ _FORBIDDEN_SENTENCE_PATTERNS = [
 _GENERIC_HANDOFF_FALLBACK = (
     "Спасибо. Передаю вашу заявку нашему управляющему — она свяжется с вами в ближайшее время. Хорошего дня."
 )
+_SHORT_SANITIZE_FALLBACK = "Пожалуйста. Управляющий свяжется с вами в ближайшее время."
+
+_KAZAKH_CHAR_RE = re.compile(r"[әіңғүұқөһ]", re.IGNORECASE)
+
+_HANDOFF_MARKERS = (
+    "передаю вашу заявку",
+    "передаю её управляющему",
+    "передаю управляющему",
+    "заявку оформила",
+    "заявку оформили",
+)
+
+_SUBSTANTIVE_FOLLOWUP_HINTS = (
+    "когда", "где", "сколько", "можно", "подскаж", "адрес", "цена", "стоим",
+    "запиш", "запис", "онлайн", "филиал", "возраст", "ребён", "ребен", "разряд",
+    "?", "қашан", "қайда", "қанша",
+)
+
+_PURE_ACK_PHRASES = frozenset({
+    "хорошо", "ок", "okay", "ok", "ладно", "понятно", "ясно",
+    "спасибо", "благодарю", "thanks", "thank you",
+    "до свидания", "всего доброго", "пока", "досвидания",
+    "жарайды", "рахмет", "рақмет", "окей",
+    "хорошо спасибо", "ок спасибо", "ладно спасибо",
+    "спасибо вам", "большое спасибо", "хорошо благодарю",
+})
 
 
-def sanitize_bot_outgoing(text: Optional[str]) -> str:
+def _bare_client_text(text: str) -> str:
+    """Текст клиента без служебных обёрток webhook/буфера."""
+    t = (text or "").strip()
+    if "[CLIENT_MESSAGE]:" in t:
+        t = t.split("[CLIENT_MESSAGE]:", 1)[-1].strip()
+    if t.lower().startswith("[голосовое]:"):
+        t = t.split(":", 1)[-1].strip()
+    return t.strip()
+
+
+def _normalize_ack_phrase(text: str) -> str:
+    return re.sub(r"[^\w\s]", " ", text.lower(), flags=re.UNICODE).strip()
+
+
+def _is_pure_acknowledgment(text: str) -> bool:
+    """Короткое согласие/благодарность после закрытия диалога — не новый вопрос."""
+    bare = _bare_client_text(text)
+    if not bare:
+        return False
+    low = bare.lower()
+    if any(hint in low for hint in _SUBSTANTIVE_FOLLOWUP_HINTS):
+        return False
+    normalized = _normalize_ack_phrase(bare)
+    return normalized in _PURE_ACK_PHRASES
+
+
+def _is_handoff_message(text: str) -> bool:
+    low = (text or "").lower()
+    return any(marker in low for marker in _HANDOFF_MARKERS)
+
+
+def _post_handoff_ack_reply(user_text: str) -> str:
+    if _KAZAKH_CHAR_RE.search(_bare_client_text(user_text)):
+        return "Рақмет. Басқарушы жақын арада сізбен хабарласады."
+    return _SHORT_SANITIZE_FALLBACK
+
+
+def _mark_handoff_completed(chat_id: str) -> None:
+    handoff_completed[chat_id] = time.time()
+    if chat_id not in chat_history:
+        return
+    recent = chat_history[chat_id][-4:]
+    if any("ЗАЯВКА УЖЕ ПЕРЕДАНА" in (m.get("content") or "") for m in recent):
+        return
+    chat_history[chat_id].append({
+        "role": "system",
+        "content": (
+            "[ЗАЯВКА УЖЕ ПЕРЕДАНА]: Управляющему уже передали заявку этого клиента. "
+            "На короткие реакции (хорошо, ок, спасибо, до свидания) ответь одной короткой "
+            "фразой благодарности — НЕ повторяй передачу заявки и не вызывай register_client_request снова. "
+            "Если клиент задаёт новый вопрос — отвечай по существу."
+        ),
+    })
+
+
+def sanitize_bot_outgoing(text: Optional[str], *, fallback: str = "handoff") -> str:
     """Убираем запрещённые формулировки и восклицательные знаки — модель иногда их игнорирует."""
     if not text:
         return ""
@@ -1394,17 +1477,20 @@ def sanitize_bot_outgoing(text: Optional[str]) -> str:
     t = re.sub(r"\.{3,}", ".", t)
     t = re.sub(r"\s+", " ", t).strip()
 
-    # Если после фильтрации осталась пустая/обрезанная заглушка — даём безопасный fallback.
     if not t or len(t) < 15:
-        logger.warning("sanitize: после фильтрации текст слишком короткий, отдаю generic handoff")
-        t = _GENERIC_HANDOFF_FALLBACK
+        if fallback == "short":
+            logger.warning("sanitize: короткий ответ после handoff, отдаю short fallback")
+            t = _SHORT_SANITIZE_FALLBACK
+        else:
+            logger.warning("sanitize: после фильтрации текст слишком короткий, отдаю generic handoff")
+            t = _GENERIC_HANDOFF_FALLBACK
 
     return t
 
 
-async def send_whatsapp(chat_id, text):
+async def send_whatsapp(chat_id, text, *, sanitize_fallback: str = "handoff"):
     # Доп. нормализация на случай прямых вызовов (голосовые ошибки и т.д.)
-    text = sanitize_bot_outgoing(text)
+    text = sanitize_bot_outgoing(text, fallback=sanitize_fallback)
     url = f"https://api.green-api.com/waInstance{GREEN_API_ID}/sendMessage/{GREEN_API_TOKEN}"
     async with httpx.AsyncClient() as client:
         await client.post(url, json={"chatId": chat_id, "message": text})
@@ -1424,6 +1510,7 @@ async def process_dialog(chat_id):
                 logger.info(f"Сброс памяти для {chat_id}")
                 chat_history.pop(chat_id, None)
                 known_users.pop(chat_id, None)
+                handoff_completed.pop(chat_id, None)
         last_activity[chat_id] = current_time
 
         if chat_id not in chat_history:
@@ -1475,6 +1562,17 @@ async def process_dialog(chat_id):
             f"{user_text}"
         )
 
+        if chat_id in handoff_completed:
+            if _is_pure_acknowledgment(user_text):
+                logger.info(f"post-handoff ack для {chat_id}: {user_text!r}")
+                chat_history[chat_id].append({"role": "user", "content": user_payload})
+                ack_reply = _post_handoff_ack_reply(user_text)
+                chat_history[chat_id].append({"role": "assistant", "content": ack_reply})
+                await send_whatsapp(chat_id, ack_reply, sanitize_fallback="short")
+                return
+            logger.info(f"post-handoff: новый вопрос от {chat_id}, снимаем флаг handoff")
+            handoff_completed.pop(chat_id, None)
+
         chat_history[chat_id].append({"role": "user", "content": user_payload})
 
         try:
@@ -1486,12 +1584,16 @@ async def process_dialog(chat_id):
                 temperature=0.5
             )
             msg = response.choices[0].message
+            lead_registered_this_turn = False
 
             if msg.tool_calls:
                 chat_history[chat_id].append(msg)
                 for tool in msg.tool_calls:
                     args = json.loads(tool.function.arguments)
                     logger.info(f"CRM вызов: {args}")
+
+                    if tool.function.name == "register_client_request":
+                        lead_registered_this_turn = True
 
                     phone_to_save = args.get("client_phone")
                     if not phone_to_save or "не указа" in phone_to_save.lower():
@@ -1520,6 +1622,8 @@ async def process_dialog(chat_id):
                 bot_answer = msg.content
 
             sanitized_answer = sanitize_bot_outgoing(bot_answer)
+            if lead_registered_this_turn or _is_handoff_message(sanitized_answer):
+                _mark_handoff_completed(chat_id)
             chat_history[chat_id].append({"role": "assistant", "content": sanitized_answer})
             await send_whatsapp(chat_id, sanitized_answer)
 
