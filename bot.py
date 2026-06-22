@@ -1033,6 +1033,28 @@ class MoyKlassCRM:
 
         return phones
 
+    @staticmethod
+    def _apply_class_enrichment(enriched: dict, cls_data: dict) -> None:
+        """Дополняет контекст вебхука данными группы (время, ссылка на онлайн-урок)."""
+        if cls_data.get("beginTime"):
+            enriched.setdefault("beginTime", cls_data.get("beginTime", ""))
+        online_link = _extract_online_link_from_comment(cls_data.get("comment"))
+        if online_link:
+            enriched["onlineLink"] = online_link
+
+    async def _get_class_data(self, class_id: int, headers: dict, client: httpx.AsyncClient) -> Optional[dict]:
+        try:
+            resp = await client.get(
+                f"{MOYKLASS_BASE_URL}/classes/{class_id}",
+                headers=headers,
+            )
+            if resp.status_code == 200:
+                return resp.json()
+            logger.warning("GET /classes/%s -> %s", class_id, resp.status_code)
+        except Exception as e:
+            logger.warning("GET /classes/%s: %s", class_id, e)
+        return None
+
     async def enrich_webhook_object_context(self, obj: dict) -> dict:
         enriched = dict(obj)
         if obj.get("userId") is not None:
@@ -1040,44 +1062,47 @@ class MoyKlassCRM:
             if user and user.get("name"):
                 enriched["userName"] = user["name"]
 
-        if obj.get("lessonId") is not None:
-            headers = await self._get_headers()
-            if headers:
-                async with httpx.AsyncClient(timeout=MOYKLASS_HTTP_TIMEOUT) as client:
-                    try:
-                        resp = await client.get(
-                            f"{MOYKLASS_BASE_URL}/lessons/{int(obj['lessonId'])}",
-                            headers=headers,
-                        )
-                        if resp.status_code == 200:
-                            lesson = resp.json()
-                            enriched.setdefault("date", lesson.get("date", ""))
-                            enriched.setdefault("beginTime", lesson.get("beginTime", ""))
-                    except Exception as e:
-                        logger.warning(
-                            "enrich_webhook_object_context: lesson %s: %s",
-                            obj.get("lessonId"),
-                            e,
-                        )
+        headers = await self._get_headers()
+        if not headers:
+            return enriched
 
-        if obj.get("classId") is not None and not enriched.get("beginTime"):
-            headers = await self._get_headers()
-            if headers:
-                async with httpx.AsyncClient(timeout=MOYKLASS_HTTP_TIMEOUT) as client:
-                    try:
-                        resp = await client.get(
-                            f"{MOYKLASS_BASE_URL}/classes/{int(obj['classId'])}",
-                            headers=headers,
-                        )
-                        if resp.status_code == 200:
-                            cls_data = resp.json()
-                            enriched.setdefault("beginTime", cls_data.get("beginTime", ""))
-                    except Exception as e:
+        class_id = obj.get("classId")
+
+        async with httpx.AsyncClient(timeout=MOYKLASS_HTTP_TIMEOUT) as client:
+            if obj.get("lessonId") is not None:
+                try:
+                    resp = await client.get(
+                        f"{MOYKLASS_BASE_URL}/lessons/{int(obj['lessonId'])}",
+                        headers=headers,
+                    )
+                    if resp.status_code == 200:
+                        lesson = resp.json()
+                        enriched.setdefault("date", lesson.get("date", ""))
+                        enriched.setdefault("beginTime", lesson.get("beginTime", ""))
+                        if class_id is None and lesson.get("classId") is not None:
+                            class_id = lesson.get("classId")
+                    else:
                         logger.warning(
-                            "enrich_webhook_object_context: class %s: %s",
-                            obj.get("classId"),
-                            e,
+                            "enrich_webhook_object_context: lesson %s -> %s",
+                            obj.get("lessonId"),
+                            resp.status_code,
                         )
+                except Exception as e:
+                    logger.warning(
+                        "enrich_webhook_object_context: lesson %s: %s",
+                        obj.get("lessonId"),
+                        e,
+                    )
+
+            if class_id is not None:
+                cls_data = await self._get_class_data(int(class_id), headers, client)
+                if cls_data:
+                    self._apply_class_enrichment(enriched, cls_data)
+                    logger.info(
+                        "enrich_webhook_object_context: class %s onlineLink=%s",
+                        class_id,
+                        bool(enriched.get("onlineLink")),
+                    )
 
         return enriched
 
@@ -1722,6 +1747,40 @@ async def wait_user_input(chat_id):
 
 
 # --- 8. MOYKLASS СЦЕНАРИИ → WHATSAPP ---
+_URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+
+# События, где уместна ссылка на онлайн-урок из комментария группы MoyKlass.
+_CLIENT_ONLINE_LINK_EVENTS = frozenset({
+    "lesson_start",
+    "lesson_start_hours",
+    "lesson_start_days",
+    "class_start_hours",
+    "class_start_days",
+})
+_EMPLOYEE_ONLINE_LINK_EVENTS = frozenset({"lesson_changed"})
+
+
+def _extract_online_link_from_comment(comment: Optional[str]) -> Optional[str]:
+    """Ссылка на онлайн-урок из поля comment группы в MoyKlass."""
+    if not comment:
+        return None
+    text = str(comment).strip()
+    if not text:
+        return None
+    match = _URL_IN_TEXT_RE.search(text)
+    if match:
+        return match.group(0).rstrip(".,;)")
+    if text.lower().startswith("www."):
+        return "https://" + text.split()[0].rstrip(".,;)")
+    return None
+
+
+def _append_online_link(message: str, online_link: Optional[str]) -> str:
+    if not online_link or online_link in message:
+        return message
+    return f"{message.rstrip()} Ссылка на урок: {online_link}"
+
+
 _JOIN_CHANGED_STATE_TEMPLATES = {
     2: "Здравствуйте. Ваша запись в группу подтверждена. Ждём вас на занятиях.",
     3: "Здравствуйте. Ваша запись в группу завершена. Если есть вопросы — напишите нам.",
@@ -1769,9 +1828,13 @@ def build_notification_message(event: str, obj: dict) -> Optional[str]:
         return template.format(type_text=type_text, value=obj.get("value", ""))
 
     try:
-        return template.format(**fmt_obj)
+        message = template.format(**fmt_obj)
     except KeyError:
-        return template
+        message = template
+
+    if event in _CLIENT_ONLINE_LINK_EVENTS:
+        message = _append_online_link(message, obj.get("onlineLink"))
+    return message
 
 
 _EMPLOYEE_NOTIFICATION_TEMPLATES = {
@@ -1830,17 +1893,23 @@ def build_employee_notification_message(event: str, obj: dict) -> Optional[str]:
     user_name = (obj.get("userName") or "").strip()
     user_suffix = f" ({user_name})" if user_name else ""
     fmt_obj = {**obj, "user_suffix": user_suffix}
+    if event == "lesson_changed":
+        fmt_obj["beginTime"] = _normalize_begin_time(fmt_obj.get("beginTime", ""))
 
     try:
-        return template.format(**fmt_obj)
+        message = template.format(**fmt_obj)
     except KeyError:
-        return template.format(
+        message = template.format(
             user_suffix=user_suffix,
             date=obj.get("date", ""),
             beginTime=obj.get("beginTime", ""),
             endDate=obj.get("endDate", ""),
             summa=obj.get("summa", ""),
         )
+
+    if event in _EMPLOYEE_ONLINE_LINK_EVENTS:
+        message = _append_online_link(message, obj.get("onlineLink"))
+    return message
 
 
 def phone_to_chat_id(phone: str) -> Optional[str]:
@@ -2069,11 +2138,12 @@ async def handle_moyklass_webhook(secret: str, request: Request):
         if event in _SCHEDULED_REMINDER_EVENTS or obj.get("lessonId") is not None:
             obj = await crm.enrich_webhook_object_context(obj)
             logger.info(
-                "moyklass-webhook: enriched event=%s date=%s beginTime=%s lessonId=%s",
+                "moyklass-webhook: enriched event=%s date=%s beginTime=%s lessonId=%s onlineLink=%s",
                 event,
                 obj.get("date") or obj.get("beginDate"),
                 obj.get("beginTime"),
                 obj.get("lessonId"),
+                bool(obj.get("onlineLink")),
             )
 
         if not MOYKLASS_CLIENT_WEBHOOKS_ENABLED and not _webhook_test_mode_active():
