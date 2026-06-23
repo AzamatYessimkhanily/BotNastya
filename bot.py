@@ -1757,7 +1757,11 @@ _CLIENT_ONLINE_LINK_EVENTS = frozenset({
     "class_start_hours",
     "class_start_days",
 })
-_EMPLOYEE_ONLINE_LINK_EVENTS = frozenset({"lesson_changed"})
+_EMPLOYEE_ONLINE_LINK_EVENTS = frozenset({
+    "lesson_start",
+    "lesson_start_hours",
+    "lesson_changed",
+})
 
 
 def _extract_online_link_from_comment(comment: Optional[str]) -> Optional[str]:
@@ -1839,9 +1843,10 @@ def build_notification_message(event: str, obj: dict) -> Optional[str]:
 
 _EMPLOYEE_NOTIFICATION_TEMPLATES = {
     "lesson_changed": (
-        "Уведомление для сотрудника: изменилась информация о занятии "
-        "{date} в {beginTime}. Проверьте расписание в MoyKlass."
+        "Уведомляем об изменении (изменения, удаления и новые занятия) "
+        "в графике занятий на дату: {date}. Проверьте расписание в приложении."
     ),
+    "user_birthday": "Сегодня день рождения вашего ученика {userName}.",
     "lesson_record_new": (
         "Уведомление для сотрудника: создана новая запись на занятие"
         "{user_suffix}. Проверьте журнал в MoyKlass."
@@ -1886,14 +1891,26 @@ def build_employee_notification_message(event: str, obj: dict) -> Optional[str]:
     if not event:
         return None
 
+    lesson_reminder = _employee_lesson_start_reminder_text(event, obj)
+    if lesson_reminder is not None:
+        message = lesson_reminder
+        if event in _EMPLOYEE_ONLINE_LINK_EVENTS:
+            message = _append_online_link(message, obj.get("onlineLink"))
+        return message
+
     template = _EMPLOYEE_NOTIFICATION_TEMPLATES.get(event)
     if not template:
         return None
 
     user_name = (obj.get("userName") or "").strip()
     user_suffix = f" ({user_name})" if user_name else ""
-    fmt_obj = {**obj, "user_suffix": user_suffix}
-    if event == "lesson_changed":
+    fmt_obj = {
+        **obj,
+        "user_suffix": user_suffix,
+        "userName": user_name,
+        "date": _format_schedule_date(obj.get("date") or obj.get("beginDate") or ""),
+    }
+    if event in ("lesson_changed", "lesson_start", "lesson_start_hours"):
         fmt_obj["beginTime"] = _normalize_begin_time(fmt_obj.get("beginTime", ""))
 
     try:
@@ -1901,11 +1918,15 @@ def build_employee_notification_message(event: str, obj: dict) -> Optional[str]:
     except KeyError:
         message = template.format(
             user_suffix=user_suffix,
-            date=obj.get("date", ""),
-            beginTime=obj.get("beginTime", ""),
+            userName=user_name,
+            date=fmt_obj["date"],
+            beginTime=fmt_obj.get("beginTime", ""),
             endDate=obj.get("endDate", ""),
             summa=obj.get("summa", ""),
         )
+
+    if event == "user_birthday" and not user_name:
+        message = "Сегодня день рождения вашего ученика."
 
     if event in _EMPLOYEE_ONLINE_LINK_EVENTS:
         message = _append_online_link(message, obj.get("onlineLink"))
@@ -1986,6 +2007,44 @@ def _parse_schedule_date(date_str: str) -> Optional[date]:
         except ValueError:
             continue
     return None
+
+
+def _format_schedule_date(date_str: str) -> str:
+    """2026-06-22 → 22.06.2026; нераспознанное — как есть."""
+    parsed = _parse_schedule_date(date_str)
+    if parsed:
+        return parsed.strftime("%d.%m.%Y")
+    return (date_str or "").strip()
+
+
+def _minutes_until_lesson(obj: dict) -> Optional[int]:
+    """Минуты до начала занятия по date+beginTime в школьном TZ; None — не удалось вычислить."""
+    date_str = (obj.get("date") or obj.get("beginDate") or "").strip()
+    time_str = _normalize_begin_time(obj.get("beginTime") or "")
+    parsed_date = _parse_schedule_date(date_str)
+    if parsed_date is None or not time_str:
+        return None
+    try:
+        scheduled = datetime.strptime(
+            f"{parsed_date.isoformat()} {time_str}", "%Y-%m-%d %H:%M"
+        )
+        now_local = datetime.now(_SCHOOL_TZ).replace(tzinfo=None)
+        return int((scheduled - now_local).total_seconds() // 60)
+    except ValueError:
+        return None
+
+
+def _employee_lesson_start_reminder_text(event: str, obj: dict) -> Optional[str]:
+    """Текст напоминания преподавателю: за 1 час или за 5 минут (+ ссылка отдельно)."""
+    if event == "lesson_start":
+        return "Напоминаем о начале урока через 5 минут."
+    if event != "lesson_start_hours":
+        return None
+
+    minutes_left = _minutes_until_lesson(obj)
+    if minutes_left is not None and minutes_left <= 20:
+        return "Напоминаем о начале урока через 5 минут."
+    return "Напоминаем о начале урока через 1 час."
 
 
 def _scheduled_event_is_past(obj: dict, event: Optional[str] = None) -> bool:
@@ -2203,6 +2262,13 @@ async def handle_moyklass_webhook_employee(secret: str, request: Request):
             list(obj.keys()),
             list(init.keys()),
         )
+
+        if _should_skip_stale_client_webhook(data, event, obj):
+            logger.info(
+                "moyklass-webhook-employee: event=%s пропущен (старое/ретрай или занятие в прошлом)",
+                event,
+            )
+            return {"status": "ok"}
 
         message = build_employee_notification_message(event, obj)
         if not message:

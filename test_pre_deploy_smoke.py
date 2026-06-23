@@ -69,6 +69,21 @@ def main() -> int:
         {"date": "2026-06-22", "beginTime": "19:00:00", "onlineLink": "https://zoom.us/j/emp"},
     )
     check("employee lesson_changed link", emp and "https://zoom.us/j/emp" in emp)
+    check("employee lesson_changed text", emp and "графике занятий" in emp and "22.06.2026" in emp)
+
+    emp_1h = bot.build_employee_notification_message(
+        "lesson_start_hours",
+        {"onlineLink": "https://zoom.us/j/t"},
+    )
+    check("employee 1h reminder", emp_1h and "через 1 час" in emp_1h and "zoom.us" in emp_1h)
+
+    emp_5m = bot.build_employee_notification_message("lesson_start", {})
+    check("employee 5m reminder", emp_5m and "через 5 минут" in emp_5m)
+
+    bday = bot.build_employee_notification_message(
+        "user_birthday", {"userName": "Азамат Тест"},
+    )
+    check("employee birthday", bday and "Азамат Тест" in bday)
 
     debt = bot.build_employee_notification_message("sub_lesson_in_debt", {"userName": "Тест"})
     check("employee debt no link", debt and "Ссылка на урок" not in debt)
