@@ -6,7 +6,7 @@ source .env
 set +a
 SECRET="${MOYKLASS_WEBHOOK_SECRET:?no secret}"
 TS=$(date +%s)
-TODAY=$(date +%Y-%m-%d)
+TODAY=$(TZ=Asia/Almaty date +%Y-%m-%d)
 CLIENT_URL="http://127.0.0.1:8000/moyklass-webhook/${SECRET}"
 EMP_URL="http://127.0.0.1:8000/moyklass-webhook-employee/${SECRET}"
 
@@ -26,7 +26,9 @@ curl -s -X POST "$EMP_URL" -H 'Content-Type: application/json' \
 echo
 
 echo "=== employee lesson_start (5 min) ==="
-IN5=$(date -d '+5 minutes' '+%Y-%m-%d %H:%M')
+# Время урока MoyKlass передаёт в TZ школы (Asia/Almaty), бот так же его и трактует.
+# Сервер живёт в UTC, поэтому генерируем время явно в Asia/Almaty, иначе урок «уедет» в прошлое.
+IN5=$(TZ=Asia/Almaty date -d '+5 minutes' '+%Y-%m-%d %H:%M')
 D5=$(echo $IN5 | cut -d' ' -f1)
 T5=$(echo $IN5 | cut -d' ' -f2)
 curl -s -X POST "$EMP_URL" -H 'Content-Type: application/json' \

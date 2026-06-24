@@ -7,7 +7,8 @@ set +a
 SECRET="${MOYKLASS_WEBHOOK_SECRET:?no secret}"
 TS=$(date +%s)
 URL="http://127.0.0.1:8000/moyklass-webhook-employee/${SECRET}"
-TODAY=$(date +%Y-%m-%d)
+# TZ школы — Asia/Almaty; сервер в UTC. Берём дату/время в Almaty, как трактует их бот.
+TODAY=$(TZ=Asia/Almaty date +%Y-%m-%d)
 
 echo "=== user_birthday ==="
 curl -s -X POST "$URL" -H 'Content-Type: application/json' \

@@ -64,6 +64,16 @@ def main() -> int:
     pay = bot.build_notification_message("payment_new", {"userId": 1})
     check("payment unchanged", pay and "Ссылка на урок" not in pay)
 
+    # Регресс: отсутствующее поле не должно протекать сырым {плейсхолдером} клиенту.
+    sub_missing = bot.build_notification_message("sub_end_days", {"userId": 1})
+    check("no raw placeholder when endDate missing", sub_missing and "{" not in sub_missing and "}" not in sub_missing)
+    sub_ok = bot.build_notification_message("sub_end_days", {"endDate": "2026-07-01"})
+    check("endDate inserted", sub_ok and "2026-07-01" in sub_ok and "{" not in sub_ok)
+    class_missing = bot.build_notification_message("class_start_days", {"userId": 1})
+    check("class_start_days no raw placeholder", class_missing and "{" not in class_missing)
+    emp_missing = bot.build_employee_notification_message("sub_end_days", {"userName": "Тест"})
+    check("employee no raw placeholder", emp_missing and "{" not in emp_missing and "}" not in emp_missing)
+
     emp = bot.build_employee_notification_message(
         "lesson_changed",
         {"date": "2026-06-22", "beginTime": "19:00:00", "onlineLink": "https://zoom.us/j/emp"},
@@ -106,8 +116,8 @@ def main() -> int:
     debt = bot.build_employee_notification_message("sub_lesson_in_debt", {"userName": "Тест"})
     check("employee debt no link", debt and "Ссылка на урок" not in debt)
 
-    check("birthday requires active filter", "user_birthday" in bot._EVENTS_REQUIRE_ACTIVE_CLIENT)
-    check("join_new exempt from active filter", "join_new" not in bot._EVENTS_REQUIRE_ACTIVE_CLIENT)
+    check("birthday requires client filter", "user_birthday" in bot._EVENTS_REQUIRE_ACTIVE_CLIENT)
+    check("join_new exempt from client filter", "join_new" not in bot._EVENTS_REQUIRE_ACTIVE_CLIENT)
 
     print("=== smoke: enrich class helper ===")
     enriched = {}

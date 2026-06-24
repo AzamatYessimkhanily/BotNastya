@@ -51,8 +51,10 @@ _QUANTUM_CONTACT_LINE = (
 BUFFER_DELAY = 1.0
 MOYKLASS_BASE_URL = "https://api.moyklass.com/v1/company"
 MOYKLASS_HTTP_TIMEOUT = 30.0
-# Запись в группу «Учится» (подтверждённый активный ученик) — MoyKlass join statusId.
+# Запись в группу «Учится» — MoyKlass join statusId (для отображения в досье, не для рассылок).
 ACTIVE_JOIN_STATUS_ID = 2
+_CLIENT_STATE_ID_ENV = os.getenv("MOYKLASS_CLIENT_STATE_ID", "").strip()
+MOYKLASS_CLIENT_STATE_ID = int(_CLIENT_STATE_ID_ENV) if _CLIENT_STATE_ID_ENV.isdigit() else None
 LEAD_CLASS_ID = int(os.getenv("LEAD_CLASS_ID", "341820"))
 MANAGER_ID = int(os.getenv("MANAGER_ID", "98753"))
 SESSION_TIMEOUT = 5 * 60 * 60
@@ -872,13 +874,6 @@ class MoyKlassCRM:
 
         async with httpx.AsyncClient(timeout=MOYKLASS_HTTP_TIMEOUT) as client:
             try:
-                resp = await client.get(f"{MOYKLASS_BASE_URL}/users/{user_id}", headers=headers)
-                if resp.status_code == 200:
-                    return resp.json()
-            except Exception as e:
-                logger.warning("get_user_by_id: GET /users/%s: %s", user_id, e)
-
-            try:
                 resp = await client.get(
                     f"{MOYKLASS_BASE_URL}/users", headers=headers, params={"id": user_id}
                 )
@@ -888,6 +883,13 @@ class MoyKlassCRM:
                             return user
             except Exception as e:
                 logger.warning("get_user_by_id: GET /users?id=%s: %s", user_id, e)
+
+            try:
+                resp = await client.get(f"{MOYKLASS_BASE_URL}/users/{user_id}", headers=headers)
+                if resp.status_code == 200:
+                    return resp.json()
+            except Exception as e:
+                logger.warning("get_user_by_id: GET /users/%s: %s", user_id, e)
 
         return None
 
@@ -911,87 +913,102 @@ class MoyKlassCRM:
             logger.warning("lessonRecords lessonId=%s: %s", lesson_id, e)
             return []
 
-    async def _class_active_user_ids(self, class_id: int, headers: dict) -> List[int]:
+    async def _get_client_state_id(self) -> Optional[int]:
+        """ID статуса «Клиент» в MoyKlass (clientStateId / GET /clientStatuses)."""
+        if MOYKLASS_CLIENT_STATE_ID is not None:
+            return MOYKLASS_CLIENT_STATE_ID
+
+        # Кэшируем ТОЛЬКО успешный результат. Транзиентную ошибку не запоминаем,
+        # иначе единичный сбой /clientStatuses навсегда отключил бы фильтр «Клиент»
+        # (user_is_mailing_client → fail-open → риск массовой рассылки).
+        cached = getattr(self, "_cached_client_state_id", None)
+        if cached is not None:
+            return cached
+
+        headers = await self._get_headers()
+        if not headers:
+            return None
+
+        try:
+            async with httpx.AsyncClient(timeout=MOYKLASS_HTTP_TIMEOUT) as client:
+                resp = await client.get(f"{MOYKLASS_BASE_URL}/clientStatuses", headers=headers)
+                if resp.status_code != 200:
+                    logger.warning("_get_client_state_id: GET /clientStatuses -> %s", resp.status_code)
+                    return None
+                data = resp.json()
+                statuses = data if isinstance(data, list) else data.get("statuses") or []
+                for st in statuses:
+                    if st.get("systemCode") == "client" or (st.get("name") or "").strip().lower() == "клиент":
+                        self._cached_client_state_id = int(st["id"])  # type: ignore[attr-defined]
+                        logger.info(
+                            "_get_client_state_id: clientStateId=%s (%r)",
+                            self._cached_client_state_id,
+                            st.get("name"),
+                        )
+                        return self._cached_client_state_id
+        except Exception as e:
+            logger.warning("_get_client_state_id: %s", e)
+        return None
+
+    async def user_is_mailing_client(self, user_id: int) -> bool:
+        """Статус ученика в CRM — «Клиент» (зелёный), не лид и не неактивный."""
+        client_state_id = await self._get_client_state_id()
+        if client_state_id is None:
+            logger.warning(
+                "user_is_mailing_client: clientStateId не определён, пропускаем проверку userId=%s",
+                user_id,
+            )
+            return True
+
+        user = await self.get_user_by_id(user_id)
+        if not user:
+            return False
+        user_state = user.get("clientStateId")
+        if user_state is None:
+            return False
+        return user_state == client_state_id
+
+    async def _class_mailing_client_user_ids(self, class_id: int, headers: dict) -> List[int]:
+        """userId в группе со статусом ученика «Клиент»."""
         try:
             async with httpx.AsyncClient(timeout=MOYKLASS_HTTP_TIMEOUT) as client:
                 resp = await client.get(
                     f"{MOYKLASS_BASE_URL}/joins",
                     headers=headers,
-                    params={"classId": class_id, "statusId": 2, "limit": 200},
+                    params={"classId": class_id, "limit": 200},
                 )
                 if resp.status_code != 200:
                     logger.warning("joins classId=%s -> %s", class_id, resp.status_code)
                     return []
-                return [
-                    join["userId"]
-                    for join in resp.json().get("joins", [])
-                    if join.get("userId") is not None
-                ]
+                seen = set()
+                result: List[int] = []
+                for join in resp.json().get("joins", []):
+                    user_id = join.get("userId")
+                    if user_id is None or user_id in seen:
+                        continue
+                    seen.add(user_id)
+                    if await self.user_is_mailing_client(int(user_id)):
+                        result.append(int(user_id))
+                return result
         except Exception as e:
             logger.warning("joins classId=%s: %s", class_id, e)
             return []
 
-    async def user_has_active_enrollment(self, user_id: int) -> bool:
-        """Есть ли у ученика хотя бы одна активная запись в группу (statusId=Учится)."""
-        headers = await self._get_headers()
-        if not headers:
-            logger.warning("user_has_active_enrollment: нет токена, пропускаем проверку userId=%s", user_id)
-            return True
-        try:
-            async with httpx.AsyncClient(timeout=MOYKLASS_HTTP_TIMEOUT) as client:
-                resp = await client.get(
-                    f"{MOYKLASS_BASE_URL}/joins",
-                    headers=headers,
-                    params={"userId": user_id, "statusId": ACTIVE_JOIN_STATUS_ID, "limit": 1},
-                )
-                if resp.status_code != 200:
-                    logger.warning(
-                        "user_has_active_enrollment: joins userId=%s -> %s",
-                        user_id,
-                        resp.status_code,
-                    )
-                    return True
-                return bool(resp.json().get("joins"))
-        except Exception as e:
-            logger.warning("user_has_active_enrollment userId=%s: %s", user_id, e)
-            return True
-
-    async def _lesson_active_record_user_ids(self, lesson_id: int, headers: dict) -> List[int]:
-        """userId с занятия, у которых активная запись в группе этого урока."""
+    async def _lesson_mailing_client_user_ids(self, lesson_id: int, headers: dict) -> List[int]:
+        """userId с занятия, у которых статус ученика «Клиент»."""
         record_ids = await self._lesson_record_user_ids(lesson_id, headers)
-        if not record_ids:
-            return []
-
-        class_id = None
-        try:
-            async with httpx.AsyncClient(timeout=MOYKLASS_HTTP_TIMEOUT) as client:
-                resp = await client.get(
-                    f"{MOYKLASS_BASE_URL}/lessons/{lesson_id}",
-                    headers=headers,
-                )
-                if resp.status_code == 200:
-                    class_id = resp.json().get("classId")
-        except Exception as e:
-            logger.warning("_lesson_active_record_user_ids lesson %s: %s", lesson_id, e)
-
-        if class_id is not None:
-            active_ids = set(await self._class_active_user_ids(int(class_id), headers))
-            filtered = [uid for uid in record_ids if uid in active_ids]
-            skipped = len(record_ids) - len(filtered)
-            if skipped:
-                logger.info(
-                    "lesson %s class %s: пропущено %d неактивных записей из %d",
-                    lesson_id,
-                    class_id,
-                    skipped,
-                    len(record_ids),
-                )
-            return filtered
-
         filtered: List[int] = []
         for user_id in record_ids:
-            if await self.user_has_active_enrollment(user_id):
+            if await self.user_is_mailing_client(user_id):
                 filtered.append(user_id)
+        skipped = len(record_ids) - len(filtered)
+        if skipped:
+            logger.info(
+                "lesson %s: пропущено %d не-клиентов из %d записей",
+                lesson_id,
+                skipped,
+                len(record_ids),
+            )
         return filtered
 
     async def resolve_phones_for_webhook(self, obj: dict, event: Optional[str] = None) -> List[str]:
@@ -1000,9 +1017,9 @@ class MoyKlassCRM:
 
         if obj.get("phone"):
             if require_active and obj.get("userId") is not None:
-                if not await self.user_has_active_enrollment(int(obj["userId"])):
+                if not await self.user_is_mailing_client(int(obj["userId"])):
                     logger.info(
-                        "resolve_phones: event=%s userId=%s неактивен (нет записи «Учится»), пропуск",
+                        "resolve_phones: event=%s userId=%s не «Клиент», пропуск",
                         event,
                         obj.get("userId"),
                     )
@@ -1015,9 +1032,9 @@ class MoyKlassCRM:
 
         if obj.get("userId") is not None:
             user_id = int(obj["userId"])
-            if require_active and not await self.user_has_active_enrollment(user_id):
+            if require_active and not await self.user_is_mailing_client(user_id):
                 logger.info(
-                    "resolve_phones: event=%s userId=%s неактивен (нет записи «Учится»), пропуск",
+                    "resolve_phones: event=%s userId=%s не «Клиент», пропуск",
                     event,
                     user_id,
                 )
@@ -1028,11 +1045,11 @@ class MoyKlassCRM:
         user_ids: List[int] = []
         if obj.get("lessonId") is not None:
             if require_active:
-                user_ids = await self._lesson_active_record_user_ids(int(obj["lessonId"]), headers)
+                user_ids = await self._lesson_mailing_client_user_ids(int(obj["lessonId"]), headers)
             else:
                 user_ids = await self._lesson_record_user_ids(int(obj["lessonId"]), headers)
         elif obj.get("classId") is not None:
-            user_ids = await self._class_active_user_ids(int(obj["classId"]), headers)
+            user_ids = await self._class_mailing_client_user_ids(int(obj["classId"]), headers)
 
         phones: List[str] = []
         seen = set()
@@ -1871,6 +1888,25 @@ def _append_online_link(message: str, online_link: Optional[str]) -> str:
     return f"{message.rstrip()} Ссылка на урок: {online_link}"
 
 
+class _SafeFormatDict(dict):
+    """Подстановка для str.format_map: отсутствующий ключ → пустая строка (без KeyError и без сырых {плейсхолдеров})."""
+
+    def __missing__(self, key):  # noqa: D401
+        return ""
+
+
+def _safe_format(template: str, mapping: dict) -> str:
+    """Форматирует шаблон, безопасно опуская отсутствующие поля и схлопывая лишние пробелы."""
+    try:
+        text = template.format_map(_SafeFormatDict(mapping))
+    except (IndexError, ValueError):
+        text = template
+    # Подчищаем артефакты вида "заканчивается ." когда поле было пустым.
+    text = re.sub(r"\s+([.,;:])", r"\1", text)
+    text = re.sub(r"\s{2,}", " ", text)
+    return text.strip()
+
+
 _JOIN_CHANGED_STATE_TEMPLATES = {
     2: "Здравствуйте. Ваша запись в группу подтверждена. Ждём вас на занятиях.",
     3: "Здравствуйте. Ваша запись в группу завершена. Если есть вопросы — напишите нам.",
@@ -1917,10 +1953,7 @@ def build_notification_message(event: str, obj: dict) -> Optional[str]:
         type_text = "домашнее задание" if mark_type == "home" else "занятие"
         return template.format(type_text=type_text, value=obj.get("value", ""))
 
-    try:
-        message = template.format(**fmt_obj)
-    except KeyError:
-        message = template
+    message = _safe_format(template, fmt_obj)
 
     if event in _CLIENT_ONLINE_LINK_EVENTS:
         message = _append_online_link(message, obj.get("onlineLink"))
@@ -1999,17 +2032,7 @@ def build_employee_notification_message(event: str, obj: dict) -> Optional[str]:
     if event in ("lesson_changed", "lesson_start", "lesson_start_hours"):
         fmt_obj["beginTime"] = _normalize_begin_time(fmt_obj.get("beginTime", ""))
 
-    try:
-        message = template.format(**fmt_obj)
-    except KeyError:
-        message = template.format(
-            user_suffix=user_suffix,
-            userName=user_name,
-            date=fmt_obj["date"],
-            beginTime=fmt_obj.get("beginTime", ""),
-            endDate=obj.get("endDate", ""),
-            summa=obj.get("summa", ""),
-        )
+    message = _safe_format(template, fmt_obj)
 
     if event == "user_birthday" and not user_name:
         message = "Сегодня день рождения вашего ученика."
@@ -2071,7 +2094,7 @@ _SCHEDULED_REMINDER_EVENTS = frozenset({
 
 _TODAY_LESSON_EVENTS = frozenset({"lesson_start", "lesson_start_hours", "class_start_hours"})
 
-# Клиентские рассылки только действующим ученикам (есть запись «Учится»).
+# Клиентские рассылки только ученикам со статусом «Клиент» (clientStateId, зелёный в CRM).
 # join_new / join_changed_state — не фильтруем: лид или смена статуса по событию.
 _EVENTS_REQUIRE_ACTIVE_CLIENT = frozenset({
     "payment_new",
