@@ -78,7 +78,25 @@ def main() -> int:
     check("employee 1h reminder", emp_1h and "через 1 час" in emp_1h and "zoom.us" in emp_1h)
 
     emp_5m = bot.build_employee_notification_message("lesson_start", {})
-    check("employee 5m reminder", emp_5m and "через 5 минут" in emp_5m)
+    check("employee 5m fallback no time", emp_5m and "через 5 минут" in emp_5m)
+
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo("Asia/Almaty")
+    in_5m = datetime.now(tz) + timedelta(minutes=5)
+    emp_5m_timed = bot.build_employee_notification_message(
+        "lesson_start",
+        {"date": in_5m.strftime("%Y-%m-%d"), "beginTime": in_5m.strftime("%H:%M")},
+    )
+    check("employee 5m by time lesson_start", emp_5m_timed and "через 5 минут" in emp_5m_timed)
+
+    in_1h = datetime.now(tz) + timedelta(hours=1)
+    emp_1h_ls = bot.build_employee_notification_message(
+        "lesson_start",
+        {"date": in_1h.strftime("%Y-%m-%d"), "beginTime": in_1h.strftime("%H:%M")},
+    )
+    check("employee 1h by time lesson_start", emp_1h_ls and "через 1 час" in emp_1h_ls)
 
     bday = bot.build_employee_notification_message(
         "user_birthday", {"userName": "Азамат Тест"},
@@ -87,6 +105,9 @@ def main() -> int:
 
     debt = bot.build_employee_notification_message("sub_lesson_in_debt", {"userName": "Тест"})
     check("employee debt no link", debt and "Ссылка на урок" not in debt)
+
+    check("birthday requires active filter", "user_birthday" in bot._EVENTS_REQUIRE_ACTIVE_CLIENT)
+    check("join_new exempt from active filter", "join_new" not in bot._EVENTS_REQUIRE_ACTIVE_CLIENT)
 
     print("=== smoke: enrich class helper ===")
     enriched = {}

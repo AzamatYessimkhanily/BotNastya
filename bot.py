@@ -51,6 +51,8 @@ _QUANTUM_CONTACT_LINE = (
 BUFFER_DELAY = 1.0
 MOYKLASS_BASE_URL = "https://api.moyklass.com/v1/company"
 MOYKLASS_HTTP_TIMEOUT = 30.0
+# Запись в группу «Учится» (подтверждённый активный ученик) — MoyKlass join statusId.
+ACTIVE_JOIN_STATUS_ID = 2
 LEAD_CLASS_ID = int(os.getenv("LEAD_CLASS_ID", "341820"))
 MANAGER_ID = int(os.getenv("MANAGER_ID", "98753"))
 SESSION_TIMEOUT = 5 * 60 * 60
@@ -929,9 +931,82 @@ class MoyKlassCRM:
             logger.warning("joins classId=%s: %s", class_id, e)
             return []
 
-    async def resolve_phones_for_webhook(self, obj: dict) -> List[str]:
+    async def user_has_active_enrollment(self, user_id: int) -> bool:
+        """Есть ли у ученика хотя бы одна активная запись в группу (statusId=Учится)."""
+        headers = await self._get_headers()
+        if not headers:
+            logger.warning("user_has_active_enrollment: нет токена, пропускаем проверку userId=%s", user_id)
+            return True
+        try:
+            async with httpx.AsyncClient(timeout=MOYKLASS_HTTP_TIMEOUT) as client:
+                resp = await client.get(
+                    f"{MOYKLASS_BASE_URL}/joins",
+                    headers=headers,
+                    params={"userId": user_id, "statusId": ACTIVE_JOIN_STATUS_ID, "limit": 1},
+                )
+                if resp.status_code != 200:
+                    logger.warning(
+                        "user_has_active_enrollment: joins userId=%s -> %s",
+                        user_id,
+                        resp.status_code,
+                    )
+                    return True
+                return bool(resp.json().get("joins"))
+        except Exception as e:
+            logger.warning("user_has_active_enrollment userId=%s: %s", user_id, e)
+            return True
+
+    async def _lesson_active_record_user_ids(self, lesson_id: int, headers: dict) -> List[int]:
+        """userId с занятия, у которых активная запись в группе этого урока."""
+        record_ids = await self._lesson_record_user_ids(lesson_id, headers)
+        if not record_ids:
+            return []
+
+        class_id = None
+        try:
+            async with httpx.AsyncClient(timeout=MOYKLASS_HTTP_TIMEOUT) as client:
+                resp = await client.get(
+                    f"{MOYKLASS_BASE_URL}/lessons/{lesson_id}",
+                    headers=headers,
+                )
+                if resp.status_code == 200:
+                    class_id = resp.json().get("classId")
+        except Exception as e:
+            logger.warning("_lesson_active_record_user_ids lesson %s: %s", lesson_id, e)
+
+        if class_id is not None:
+            active_ids = set(await self._class_active_user_ids(int(class_id), headers))
+            filtered = [uid for uid in record_ids if uid in active_ids]
+            skipped = len(record_ids) - len(filtered)
+            if skipped:
+                logger.info(
+                    "lesson %s class %s: пропущено %d неактивных записей из %d",
+                    lesson_id,
+                    class_id,
+                    skipped,
+                    len(record_ids),
+                )
+            return filtered
+
+        filtered: List[int] = []
+        for user_id in record_ids:
+            if await self.user_has_active_enrollment(user_id):
+                filtered.append(user_id)
+        return filtered
+
+    async def resolve_phones_for_webhook(self, obj: dict, event: Optional[str] = None) -> List[str]:
         """Телефоны клиентов для CRM-вебхука по правилам из ТЗ."""
+        require_active = event in _EVENTS_REQUIRE_ACTIVE_CLIENT
+
         if obj.get("phone"):
+            if require_active and obj.get("userId") is not None:
+                if not await self.user_has_active_enrollment(int(obj["userId"])):
+                    logger.info(
+                        "resolve_phones: event=%s userId=%s неактивен (нет записи «Учится»), пропуск",
+                        event,
+                        obj.get("userId"),
+                    )
+                    return []
             return [obj["phone"]]
 
         headers = await self._get_headers()
@@ -939,12 +1014,23 @@ class MoyKlassCRM:
             return []
 
         if obj.get("userId") is not None:
-            phone = await self.get_user_phone_by_id(int(obj["userId"]))
+            user_id = int(obj["userId"])
+            if require_active and not await self.user_has_active_enrollment(user_id):
+                logger.info(
+                    "resolve_phones: event=%s userId=%s неактивен (нет записи «Учится»), пропуск",
+                    event,
+                    user_id,
+                )
+                return []
+            phone = await self.get_user_phone_by_id(user_id)
             return [phone] if phone else []
 
         user_ids: List[int] = []
         if obj.get("lessonId") is not None:
-            user_ids = await self._lesson_record_user_ids(int(obj["lessonId"]), headers)
+            if require_active:
+                user_ids = await self._lesson_active_record_user_ids(int(obj["lessonId"]), headers)
+            else:
+                user_ids = await self._lesson_record_user_ids(int(obj["lessonId"]), headers)
         elif obj.get("classId") is not None:
             user_ids = await self._class_active_user_ids(int(obj["classId"]), headers)
 
@@ -1985,6 +2071,24 @@ _SCHEDULED_REMINDER_EVENTS = frozenset({
 
 _TODAY_LESSON_EVENTS = frozenset({"lesson_start", "lesson_start_hours", "class_start_hours"})
 
+# Клиентские рассылки только действующим ученикам (есть запись «Учится»).
+# join_new / join_changed_state — не фильтруем: лид или смена статуса по событию.
+_EVENTS_REQUIRE_ACTIVE_CLIENT = frozenset({
+    "payment_new",
+    "sub_end_days",
+    "sub_days_next_payment",
+    "sub_lesson_in_debt",
+    "sub_lessons_left",
+    "lesson_start",
+    "lesson_start_hours",
+    "lesson_start_days",
+    "class_start_hours",
+    "class_start_days",
+    "lesson_mark_set",
+    "user_consecutive_visit_missed_2",
+    "user_birthday",
+})
+
 
 def _normalize_begin_time(time_str: str) -> str:
     """10:00:00 → 10:00; пустое → пустое."""
@@ -2034,17 +2138,28 @@ def _minutes_until_lesson(obj: dict) -> Optional[int]:
         return None
 
 
+_EMPLOYEE_FIVE_MIN_THRESHOLD = 20  # ≤20 мин до урока → «через 5 минут», иначе «через 1 час»
+
+
 def _employee_lesson_start_reminder_text(event: str, obj: dict) -> Optional[str]:
-    """Текст напоминания преподавателю: за 1 час или за 5 минут (+ ссылка отдельно)."""
-    if event == "lesson_start":
-        return "Напоминаем о начале урока через 5 минут."
-    if event != "lesson_start_hours":
+    """Текст напоминания преподавателю: за 1 час или за 5 минут (+ ссылка отдельно).
+
+    MoyKlass часто шлёт одно и то же событие lesson_start и за час, и за 5 минут —
+    выбираем шаблон по фактическому времени до beginTime, а не только по event.
+    """
+    if event not in ("lesson_start", "lesson_start_hours"):
         return None
 
     minutes_left = _minutes_until_lesson(obj)
-    if minutes_left is not None and minutes_left <= 20:
-        return "Напоминаем о начале урока через 5 минут."
-    return "Напоминаем о начале урока через 1 час."
+    if minutes_left is not None:
+        if minutes_left <= _EMPLOYEE_FIVE_MIN_THRESHOLD:
+            return "Напоминаем о начале урока через 5 минут."
+        return "Напоминаем о начале урока через 1 час."
+
+    # Нет date/beginTime — fallback по типу события (редко, после enrich).
+    if event == "lesson_start_hours":
+        return "Напоминаем о начале урока через 1 час."
+    return "Напоминаем о начале урока через 5 минут."
 
 
 def _scheduled_event_is_past(obj: dict, event: Optional[str] = None) -> bool:
@@ -2229,7 +2344,7 @@ async def handle_moyklass_webhook(secret: str, request: Request):
             logger.info("moyklass-webhook: event=%s: нет шаблона, пропускаем", event)
             return {"status": "ok"}
 
-        phones = await crm.resolve_phones_for_webhook(obj)
+        phones = await crm.resolve_phones_for_webhook(obj, event)
         logger.info(
             "moyklass-webhook: event=%s userId=%s phones=%s",
             event,
