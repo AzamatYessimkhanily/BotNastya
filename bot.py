@@ -1394,6 +1394,10 @@ class MoyKlassCRM:
                          "status": status_code, "body": body[:500]},
                         "joins_failed_but_lead_created",
                     )
+                    await self.notify_branch_manager_new_lead(
+                        mgr_phone, mgr_name, name=name, phone=clean_phone,
+                        age=age, experience=experience, preference=preference, wa_link=wa_link,
+                    )
                     return self._handoff_message(mgr_name, mgr_phone, success=True)
 
                 logger.error(f"create_lead: ошибка создания заявки joins: {status_code} {body[:300]}")
@@ -1414,8 +1418,57 @@ class MoyKlassCRM:
             except Exception as e:
                 logger.warning(f"create_lead: задача не создана: {e}")
 
+            await self.notify_branch_manager_new_lead(
+                mgr_phone, mgr_name, name=name, phone=clean_phone,
+                age=age, experience=experience, preference=preference, wa_link=wa_link,
+            )
             logger.info(f"create_lead: УСПЕХ — заявка создана для {name} ({clean_phone}), филиал {filial_id}")
             return self._handoff_message(mgr_name, mgr_phone, success=True)
+
+    async def notify_branch_manager_new_lead(
+        self,
+        mgr_phone: str,
+        mgr_name: str,
+        *,
+        name: str,
+        phone: str,
+        age: str,
+        experience: str,
+        preference: str,
+        wa_link: str,
+    ) -> None:
+        """Служебное WhatsApp-уведомление управляющему филиала о новом лиде от бота.
+
+        Не клиентское сообщение. В тест-режиме (MOYKLASS_WEBHOOK_TEST_PHONE)
+        уходит на тест-номер с префиксом [ТЕСТ CRM], а не реальному менеджеру.
+        Любая ошибка отправки гасится — она НЕ должна ломать создание лида.
+        """
+        target_phone = mgr_phone
+        prefix = ""
+        if _webhook_test_mode_active():
+            target_phone = MOYKLASS_WEBHOOK_TEST_PHONE
+            prefix = "[ТЕСТ CRM] "
+
+        chat_id = phone_to_chat_id(target_phone)
+        if not chat_id:
+            logger.warning(
+                "notify_branch_manager_new_lead: не удалось нормализовать номер %r (mgr=%r)",
+                target_phone, mgr_name,
+            )
+            return
+
+        message = prefix + build_new_lead_admin_message(
+            name=name, phone=phone, age=age,
+            experience=experience, preference=preference, wa_link=wa_link,
+        )
+        try:
+            await send_whatsapp(chat_id, message, sanitize=False)
+            logger.info(
+                "notify_branch_manager_new_lead: отправлено %s (mgr=%r, лид=%r)",
+                chat_id, mgr_name, name,
+            )
+        except Exception as e:
+            logger.error("notify_branch_manager_new_lead: ошибка отправки %s: %s", chat_id, e)
 
     async def _post_join_with_retry(self, client: httpx.AsyncClient, headers: dict, join_payload: dict):
         """POST /joins с авто-повторами:
@@ -1570,12 +1623,21 @@ def _post_handoff_ack_reply(user_text: str) -> str:
     return _SHORT_SANITIZE_FALLBACK
 
 
+def _history_message_content(message) -> str:
+    """Текст элемента истории. Элемент может быть dict ИЛИ объектом OpenAI
+    (ChatCompletionMessage кладётся в историю при tool-call) — у объекта нет
+    .get(), поэтому достаём content универсально, чтобы не падать с AttributeError."""
+    if isinstance(message, dict):
+        return message.get("content") or ""
+    return getattr(message, "content", None) or ""
+
+
 def _mark_handoff_completed(chat_id: str) -> None:
     handoff_completed[chat_id] = time.time()
     if chat_id not in chat_history:
         return
     recent = chat_history[chat_id][-4:]
-    if any("ЗАЯВКА УЖЕ ПЕРЕДАНА" in (m.get("content") or "") for m in recent):
+    if any("ЗАЯВКА УЖЕ ПЕРЕДАНА" in _history_message_content(m) for m in recent):
         return
     chat_history[chat_id].append({
         "role": "system",
@@ -1616,9 +1678,11 @@ def sanitize_bot_outgoing(text: Optional[str], *, fallback: str = "handoff") -> 
     return t
 
 
-async def send_whatsapp(chat_id, text, *, sanitize_fallback: str = "handoff"):
-    # Доп. нормализация на случай прямых вызовов (голосовые ошибки и т.д.)
-    text = sanitize_bot_outgoing(text, fallback=sanitize_fallback)
+async def send_whatsapp(chat_id, text, *, sanitize_fallback: str = "handoff", sanitize: bool = True):
+    # Доп. нормализация на случай прямых вызовов (голосовые ошибки и т.д.).
+    # sanitize=False — для служебных сообщений сотрудникам (сохраняем формат/переносы).
+    if sanitize:
+        text = sanitize_bot_outgoing(text, fallback=sanitize_fallback)
     url = f"https://api.green-api.com/waInstance{GREEN_API_ID}/sendMessage/{GREEN_API_TOKEN}"
     async with httpx.AsyncClient() as client:
         await client.post(url, json={"chatId": chat_id, "message": text})
@@ -1929,6 +1993,27 @@ _NOTIFICATION_TEMPLATES = {
     "user_consecutive_visit_missed_2": "Здравствуйте. Заметили, что занятия пропускаются. Если возникли трудности — напишите, мы готовы помочь.",
     "user_birthday": "Здравствуйте. Поздравляем с днём рождения! Желаем успехов в шахматах.",
 }
+
+
+def build_new_lead_admin_message(
+    *,
+    name: str,
+    phone: str,
+    age: str,
+    experience: str,
+    preference: str,
+    wa_link: str,
+) -> str:
+    """Текст служебного уведомления управляющему о новом лиде от бота."""
+    return (
+        "[НОВЫЙ ЛИД] Бот оформил заявку.\n"
+        f"Имя: {name or '-'}\n"
+        f"Телефон: {phone or '-'}\n"
+        f"Возраст: {age or '-'}\n"
+        f"Опыт: {experience or '-'}\n"
+        f"Филиал/формат: {preference or '-'}\n"
+        f"WhatsApp: {wa_link or '-'}"
+    )
 
 
 def build_notification_message(event: str, obj: dict) -> Optional[str]:

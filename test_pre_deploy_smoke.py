@@ -39,6 +39,49 @@ def main() -> int:
         "Ок", fallback="short"
     ))
 
+    print("=== smoke: handoff with tool-call object in history (regression) ===")
+
+    class _FakeChatCompletionMessage:
+        """Имитирует объект OpenAI без .get() — как реальный ChatCompletionMessage."""
+
+        def __init__(self, content=None):
+            self.role = "assistant"
+            self.content = content
+            self.tool_calls = []
+
+    reg_chat_id = "70000000000@c.us"
+    bot.chat_history[reg_chat_id] = [
+        {"role": "system", "content": "prompt"},
+        {"role": "user", "content": "Онлайн"},
+        _FakeChatCompletionMessage(content=None),
+        {"role": "tool", "name": "register_client_request", "content": "OK"},
+    ]
+    # До фикса здесь падало: 'ChatCompletionMessage' object has no attribute 'get'
+    bot._mark_handoff_completed(reg_chat_id)
+    check("mark_handoff не падает на объекте в истории", reg_chat_id in bot.handoff_completed)
+    check("content из объекта истории безопасен",
+          bot._history_message_content(_FakeChatCompletionMessage(content=None)) == "")
+    check("content из dict истории безопасен",
+          bot._history_message_content({"content": "abc"}) == "abc")
+    bot.chat_history.pop(reg_chat_id, None)
+    bot.handoff_completed.pop(reg_chat_id, None)
+
+    print("=== smoke: new-lead admin notification ===")
+    admin_msg = bot.build_new_lead_admin_message(
+        name="Жасмин", phone="77001234567", age="10",
+        experience="1 год", preference="онлайн",
+        wa_link="https://wa.me/77001234567",
+    )
+    check("admin msg header", admin_msg.startswith("[НОВЫЙ ЛИД]"))
+    check("admin msg has name", "Жасмин" in admin_msg)
+    check("admin msg has phone", "77001234567" in admin_msg)
+    check("admin msg has branch", "онлайн" in admin_msg)
+    check("admin msg no raw placeholder", "{" not in admin_msg and "}" not in admin_msg)
+    admin_msg_empty = bot.build_new_lead_admin_message(
+        name="", phone="", age="", experience="", preference="", wa_link="",
+    )
+    check("admin msg empty -> dashes", admin_msg_empty.count("-") >= 5)
+
     print("=== smoke: online link ===")
     check("url from comment", bot._extract_online_link_from_comment(
         "Zoom: https://zoom.us/j/123456789 pass"
