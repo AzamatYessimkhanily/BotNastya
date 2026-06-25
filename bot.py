@@ -44,6 +44,12 @@ MOYKLASS_WEBHOOK_ENABLED_SINCE = int(_ENABLED_SINCE_ENV) if _ENABLED_SINCE_ENV.i
 # не разослал сотням. Группы шахмат маленькие; при необходимости поднять через env.
 _MAX_BROADCAST_ENV = os.getenv("MAX_BROADCAST_RECIPIENTS", "").strip()
 MAX_BROADCAST_RECIPIENTS = int(_MAX_BROADCAST_ENV) if _MAX_BROADCAST_ENV.isdigit() else 25
+# События MoyKlass-сценария «новый лид в системе» (employee-вебхук) → уведомить
+# управляющего филиала. По умолчанию join_new; переопределить списком через env.
+_NEW_LEAD_EVENTS_ENV = os.getenv("MOYKLASS_NEW_LEAD_EVENTS", "join_new").strip()
+_NEW_LEAD_ADMIN_EVENTS = frozenset(
+    e.strip() for e in _NEW_LEAD_EVENTS_ENV.split(",") if e.strip()
+)
 _SCHOOL_TZ = ZoneInfo("Asia/Almaty")
 
 # Контакт Quantum STEM: при необходимости переопределить через QUANTUM_MANAGER_PHONE / QUANTUM_MANAGER_NAME в .env
@@ -517,11 +523,41 @@ handoff_completed: Dict[str, float] = {}
 seen_incoming_ids: Dict[str, deque] = defaultdict(lambda: deque(maxlen=400))
 _dialog_locks: Dict[str, asyncio.Lock] = {}
 
+# Дедуп уведомлений управляющему о новом лиде: userId лидов, по которым бот уже
+# уведомил напрямую (из create_lead). Если MoyKlass-сценарий «новый лид» прилетит
+# вебхуком на тот же лид — не шлём второй раз. TTL — короткое окно (лиды-вебхуки
+# приходят за секунды; держать дольше незачем).
+_NOTIFIED_LEAD_TTL = 1800.0  # 30 минут
+_notified_lead_users: Dict[int, float] = {}
+
 
 def _dialog_lock(chat_id: str) -> asyncio.Lock:
     if chat_id not in _dialog_locks:
         _dialog_locks[chat_id] = asyncio.Lock()
     return _dialog_locks[chat_id]
+
+
+def _mark_lead_notified(user_id) -> None:
+    if user_id is None:
+        return
+    now = time.time()
+    _notified_lead_users[int(user_id)] = now
+    # лёгкая чистка протухших, чтобы dict не рос бесконечно
+    for uid, ts in list(_notified_lead_users.items()):
+        if now - ts > _NOTIFIED_LEAD_TTL:
+            _notified_lead_users.pop(uid, None)
+
+
+def _lead_already_notified(user_id) -> bool:
+    if user_id is None:
+        return False
+    ts = _notified_lead_users.get(int(user_id))
+    if ts is None:
+        return False
+    if time.time() - ts > _NOTIFIED_LEAD_TTL:
+        _notified_lead_users.pop(int(user_id), None)
+        return False
+    return True
 
 
 def _voice_download_url(msg_data: dict) -> Optional[str]:
@@ -1452,6 +1488,7 @@ class MoyKlassCRM:
                         mgr_phone, mgr_name, name=name, phone=clean_phone,
                         age=age, experience=experience, preference=preference, wa_link=wa_link,
                     )
+                    _mark_lead_notified(user_id)
                     return self._handoff_message(mgr_name, mgr_phone, success=True)
 
                 logger.error(f"create_lead: ошибка создания заявки joins: {status_code} {body[:300]}")
@@ -1476,6 +1513,7 @@ class MoyKlassCRM:
                 mgr_phone, mgr_name, name=name, phone=clean_phone,
                 age=age, experience=experience, preference=preference, wa_link=wa_link,
             )
+            _mark_lead_notified(user_id)
             logger.info(f"create_lead: УСПЕХ — заявка создана для {name} ({clean_phone}), филиал {filial_id}")
             return self._handoff_message(mgr_name, mgr_phone, success=True)
 
@@ -1490,8 +1528,9 @@ class MoyKlassCRM:
         experience: str,
         preference: str,
         wa_link: str,
+        source: str = "Бот оформил заявку.",
     ) -> None:
-        """Служебное WhatsApp-уведомление управляющему филиала о новом лиде от бота.
+        """Служебное WhatsApp-уведомление управляющему филиала о новом лиде.
 
         Не клиентское сообщение. В тест-режиме (MOYKLASS_WEBHOOK_TEST_PHONE)
         уходит на тест-номер с префиксом [ТЕСТ CRM], а не реальному менеджеру.
@@ -1514,6 +1553,7 @@ class MoyKlassCRM:
         message = prefix + build_new_lead_admin_message(
             name=name, phone=phone, age=age,
             experience=experience, preference=preference, wa_link=wa_link,
+            source=source,
         )
         try:
             await send_whatsapp(chat_id, message, sanitize=False)
@@ -2169,10 +2209,11 @@ def build_new_lead_admin_message(
     experience: str,
     preference: str,
     wa_link: str,
+    source: str = "Бот оформил заявку.",
 ) -> str:
-    """Текст служебного уведомления управляющему о новом лиде от бота."""
+    """Текст служебного уведомления управляющему о новом лиде."""
     return (
-        "[НОВЫЙ ЛИД] Бот оформил заявку.\n"
+        f"[НОВЫЙ ЛИД] {source}\n"
         f"Имя: {name or '-'}\n"
         f"Телефон: {phone or '-'}\n"
         f"Возраст: {age or '-'}\n"
@@ -2636,6 +2677,51 @@ async def handle_moyklass_webhook(secret: str, request: Request):
         return {"status": "ok"}
 
 
+async def _handle_new_lead_admin_notification(event: str, obj: dict) -> dict:
+    """Уведомление управляющему филиала о новом лиде В СИСТЕМЕ (MoyKlass-сценарий).
+
+    Покрывает лиды из любого источника (менеджер вручную, сайт, бот). Получатель —
+    управляющий филиала лида (BRANCH_MANAGERS), не один центральный человек.
+    Дедуп по userId: если этот лид только что создал бот и уже уведомил управляющего
+    напрямую из create_lead — повторно не шлём (защита от двойного уведомления).
+    """
+    user_id = obj.get("userId")
+    if user_id is not None and _lead_already_notified(int(user_id)):
+        logger.info(
+            "moyklass-webhook-employee: new-lead userId=%s уже уведомлён ботом — пропуск (dedup)",
+            user_id,
+        )
+        return {"status": "ok"}
+
+    user = await crm.get_user_by_id(int(user_id)) if user_id is not None else None
+    name = (user or {}).get("name") or obj.get("userName") or obj.get("name") or "-"
+    phone = (user or {}).get("phone") or obj.get("phone") or ""
+
+    filial_id = obj.get("filialId")
+    if filial_id is None and user:
+        filials = user.get("filials") or []
+        if filials:
+            filial_id = filials[0]
+
+    mgr_name, mgr_phone = crm._pick_manager_info(filial_id, None)
+    wa_link = f"https://wa.me/{re.sub(r'[^0-9]', '', phone)}" if phone else "-"
+
+    logger.info(
+        "moyklass-webhook-employee: new-lead userId=%s filial=%s -> управляющий %r (%s)",
+        user_id, filial_id, mgr_name, mgr_phone,
+    )
+    await crm.notify_branch_manager_new_lead(
+        mgr_phone, mgr_name,
+        name=name, phone=phone or "-", age="-", experience="-",
+        preference=str(filial_id) if filial_id is not None else "-",
+        wa_link=wa_link,
+        source="Новый лид в CRM.",
+    )
+    if user_id is not None:
+        _mark_lead_notified(int(user_id))
+    return {"status": "ok"}
+
+
 @app.post("/moyklass-webhook-employee/{secret}")
 async def handle_moyklass_webhook_employee(secret: str, request: Request):
     _check_moyklass_webhook_secret(secret)
@@ -2661,6 +2747,12 @@ async def handle_moyklass_webhook_employee(secret: str, request: Request):
                 event,
             )
             return {"status": "ok"}
+
+        # Новый лид в системе → уведомить управляющего филиала (с дедупом против
+        # прямого уведомления бота). Отдельная ветка: получатель определяется по
+        # филиалу лида, а не по преподавателю/ответственному, как обычные staff-события.
+        if event in _NEW_LEAD_ADMIN_EVENTS:
+            return await _handle_new_lead_admin_notification(event, obj)
 
         message = build_employee_notification_message(event, obj)
         if not message:

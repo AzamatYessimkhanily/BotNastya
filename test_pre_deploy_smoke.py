@@ -328,6 +328,54 @@ def main() -> int:
     finally:
         bot.httpx.AsyncClient = orig_httpx_client
 
+    print("=== smoke: new-lead admin notify (any source, dedup) ===")
+
+    # source-параметр меняет заголовок-источник
+    bot_src = bot.build_new_lead_admin_message(
+        name="A", phone="7700", age="-", experience="-", preference="онлайн", wa_link="-")
+    check("source по умолчанию = бот", "Бот оформил заявку." in bot_src)
+    crm_src = bot.build_new_lead_admin_message(
+        name="A", phone="7700", age="-", experience="-", preference="онлайн",
+        wa_link="-", source="Новый лид в CRM.")
+    check("source переопределяется", "Новый лид в CRM." in crm_src)
+
+    # dedup-хелперы
+    bot._notified_lead_users.clear()
+    check("неизвестный лид не уведомлён", not bot._lead_already_notified(555))
+    bot._mark_lead_notified(555)
+    check("после пометки — уведомлён", bot._lead_already_notified(555))
+    check("None безопасен", not bot._lead_already_notified(None))
+
+    crm = bot.crm
+    orig_notify = crm.notify_branch_manager_new_lead
+    orig_get_user = crm.get_user_by_id
+    try:
+        calls = []
+        async def _spy_notify(mgr_phone, mgr_name, **kw):
+            calls.append(kw)
+        async def _fake_user(uid):
+            return {"id": uid, "name": "Иван", "phone": "77011112233", "filials": [37754]}
+        crm.notify_branch_manager_new_lead = _spy_notify
+        crm.get_user_by_id = _fake_user
+
+        # Уже уведомлён ботом → вебхук пропускает (нет двойного уведомления)
+        bot._notified_lead_users.clear()
+        bot._mark_lead_notified(999)
+        asyncio.run(bot._handle_new_lead_admin_notification("join_new", {"userId": 999}))
+        check("dedup: повторно НЕ уведомляем", len(calls) == 0)
+
+        # Лид не от бота → уведомляем управляющего, source = CRM
+        bot._notified_lead_users.clear()
+        asyncio.run(bot._handle_new_lead_admin_notification("join_new", {"userId": 1001}))
+        check("новый лид -> 1 уведомление", len(calls) == 1)
+        check("source = Новый лид в CRM", calls[0].get("source") == "Новый лид в CRM.")
+        check("имя из CRM", calls[0].get("name") == "Иван")
+        check("после вебхука лид помечен", bot._lead_already_notified(1001))
+    finally:
+        crm.notify_branch_manager_new_lead = orig_notify
+        crm.get_user_by_id = orig_get_user
+        bot._notified_lead_users.clear()
+
     print("=== smoke: enrich class helper ===")
     enriched = {}
     bot.MoyKlassCRM._apply_class_enrichment(enriched, {
