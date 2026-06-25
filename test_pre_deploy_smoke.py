@@ -380,6 +380,76 @@ def main() -> int:
         crm.get_user_by_id = orig_get_user
         bot._notified_lead_users.clear()
 
+    print("=== smoke: lead polling (без сценариев MoyKlass) ===")
+    crm = bot.crm
+    orig_notify2 = crm.notify_new_lead_admin
+    orig_fetch = bot._fetch_recent_lead_users
+    orig_save = bot._save_lead_poll_state
+    try:
+        poll_calls = []
+        async def _spy_notify2(admin_phone, admin_name, **kw):
+            poll_calls.append({"admin_phone": admin_phone, **kw})
+        bot._save_lead_poll_state = lambda: None  # не писать файл в тесте
+        crm.notify_new_lead_admin = _spy_notify2
+
+        def _users(*ids):
+            return [{"id": i, "name": f"Лид{i}", "phone": f"7700000{i:04d}",
+                     "clientStateId": 1, "filials": [37754]} for i in ids]
+
+        # 1) Первый тик инициализирует watermark, никого не уведомляет
+        bot._lead_poll_watermark = None
+        bot._notified_lead_users.clear()
+        async def _f_init():
+            return _users(100, 101, 102)
+        bot._fetch_recent_lead_users = _f_init
+        asyncio.run(bot._poll_new_leads_once())
+        check("poll: первый тик не рассылает", len(poll_calls) == 0)
+        check("poll: watermark = макс id", bot._lead_poll_watermark == 102)
+
+        # 2) Появился новый лид с большим id → уведомление админу
+        async def _f_new():
+            return _users(102, 103)
+        bot._fetch_recent_lead_users = _f_new
+        asyncio.run(bot._poll_new_leads_once())
+        check("poll: новый лид -> 1 уведомление", len(poll_calls) == 1)
+        check("poll: получатель = центральный админ",
+              poll_calls[0].get("admin_phone") == bot.NEW_LEAD_ADMIN_PHONE)
+        check("poll: watermark сдвинут", bot._lead_poll_watermark == 103)
+
+        # 3) Лид, созданный ботом (уже помечен), не дублируется
+        poll_calls.clear()
+        bot._mark_lead_notified(104)
+        async def _f_bot():
+            return _users(104)
+        bot._fetch_recent_lead_users = _f_bot
+        asyncio.run(bot._poll_new_leads_once())
+        check("poll: бот-лид не дублируется", len(poll_calls) == 0)
+        check("poll: watermark всё равно сдвинут", bot._lead_poll_watermark == 104)
+
+        # 4) Всплеск выше лимита → safety-skip, без рассылки
+        poll_calls.clear()
+        burst = list(range(200, 200 + bot.LEAD_POLL_MAX_PER_TICK + 3))
+        async def _f_burst():
+            return _users(*burst)
+        bot._fetch_recent_lead_users = _f_burst
+        asyncio.run(bot._poll_new_leads_once())
+        check("poll: всплеск -> не рассылаем (safety)", len(poll_calls) == 0)
+        check("poll: при всплеске watermark сдвинут", bot._lead_poll_watermark == max(burst))
+
+        # 5) Записи без clientStateId (сотрудники) игнорируются
+        poll_calls.clear()
+        async def _f_staff():
+            return [{"id": 999, "name": "Сотрудник", "phone": "7700", "clientStateId": None}]
+        bot._fetch_recent_lead_users = _f_staff
+        asyncio.run(bot._poll_new_leads_once())
+        check("poll: без clientStateId игнор", len(poll_calls) == 0)
+    finally:
+        crm.notify_new_lead_admin = orig_notify2
+        bot._fetch_recent_lead_users = orig_fetch
+        bot._save_lead_poll_state = orig_save
+        bot._lead_poll_watermark = None
+        bot._notified_lead_users.clear()
+
     print("=== smoke: enrich class helper ===")
     enriched = {}
     bot.MoyKlassCRM._apply_class_enrichment(enriched, {

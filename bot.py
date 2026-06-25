@@ -54,6 +54,17 @@ _NEW_LEAD_ADMIN_EVENTS = frozenset(
 # (а не управляющий филиала). По умолчанию Данияр Омаров; меняется через env.
 NEW_LEAD_ADMIN_PHONE = os.getenv("NEW_LEAD_ADMIN_PHONE", "+7 702 728 3711").strip()
 NEW_LEAD_ADMIN_NAME = os.getenv("NEW_LEAD_ADMIN_NAME", "Данияр Биржанович Омаров").strip()
+
+# Фоновый опрос новых лидов в MoyKlass БЕЗ сценариев/вебхуков (бот сам периодически
+# смотрит GET /users). По умолчанию ВЫКЛ — включить LEAD_POLL_ENABLED=1.
+_LEAD_POLL_ENABLED_ENV = os.getenv("LEAD_POLL_ENABLED", "0").strip().lower()
+LEAD_POLL_ENABLED = _LEAD_POLL_ENABLED_ENV in ("1", "true", "yes", "on")
+LEAD_POLL_INTERVAL = int(os.getenv("LEAD_POLL_INTERVAL", "120") or "120")  # секунд между опросами
+LEAD_POLL_PAGE = int(os.getenv("LEAD_POLL_PAGE", "100") or "100")          # сколько свежих юзеров тянуть
+LEAD_POLL_MAX_PER_TICK = int(os.getenv("LEAD_POLL_MAX_PER_TICK", "15") or "15")  # потолок уведомлений за тик
+LEAD_POLL_STATE_FILE = os.getenv("LEAD_POLL_STATE_FILE", "lead_poll_state.json")
+# watermark: максимальный id лида, который уже обработан опросом (None = ещё не инициализирован)
+_lead_poll_watermark: Optional[int] = None
 _SCHOOL_TZ = ZoneInfo("Asia/Almaty")
 
 # Контакт Quantum STEM: при необходимости переопределить через QUANTUM_MANAGER_PHONE / QUANTUM_MANAGER_NAME в .env
@@ -2776,3 +2787,138 @@ async def handle_moyklass_webhook_employee(secret: str, request: Request):
     except Exception as e:
         logger.error("moyklass-webhook-employee: необработанная ошибка: %s", e, exc_info=True)
         return {"status": "ok"}
+
+
+# --- 9. ФОНОВЫЙ ОПРОС НОВЫХ ЛИДОВ (без сценариев MoyKlass) ---
+# Бот сам периодически смотрит GET /users и уведомляет центрального админа о
+# новых лидах. Это альтернатива MoyKlass-сценарию: ничего в CRM настраивать не
+# нужно. Минусы против вебхука: задержка до LEAD_POLL_INTERVAL и нагрузка на API.
+
+
+def _load_lead_poll_state() -> None:
+    global _lead_poll_watermark
+    try:
+        with open(LEAD_POLL_STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        wm = data.get("watermark_id")
+        _lead_poll_watermark = int(wm) if wm is not None else None
+        logger.info("lead-poll: загружен watermark_id=%s", _lead_poll_watermark)
+    except FileNotFoundError:
+        _lead_poll_watermark = None
+        logger.info("lead-poll: state-файл отсутствует — watermark будет инициализирован при первом опросе")
+    except Exception as e:
+        logger.warning("lead-poll: не удалось загрузить state: %s", e)
+        _lead_poll_watermark = None
+
+
+def _save_lead_poll_state() -> None:
+    try:
+        with open(LEAD_POLL_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"watermark_id": _lead_poll_watermark}, f)
+    except Exception as e:
+        logger.warning("lead-poll: не удалось сохранить state: %s", e)
+
+
+async def _fetch_recent_lead_users() -> Optional[List[dict]]:
+    """Свежие пользователи MoyKlass за последние ~сутки. None — опрос не удался
+    (тогда watermark не двигаем, чтобы не пропустить лиды)."""
+    headers = await crm._get_headers()
+    if not headers:
+        logger.warning("lead-poll: нет токена CRM — пропуск тика")
+        return None
+    today = datetime.now(_SCHOOL_TZ).date()
+    since = (today - timedelta(days=1)).isoformat()
+    until = today.isoformat()
+    try:
+        async with httpx.AsyncClient(timeout=MOYKLASS_HTTP_TIMEOUT) as client:
+            resp = await client.get(
+                f"{MOYKLASS_BASE_URL}/users",
+                headers=headers,
+                params={"createdAt": [since, until], "limit": LEAD_POLL_PAGE, "sort": "id"},
+            )
+            if resp.status_code != 200:
+                logger.warning("lead-poll: GET /users -> %s", resp.status_code)
+                return None
+            return resp.json().get("users", [])
+    except Exception as e:
+        logger.warning("lead-poll: GET /users исключение: %s", e)
+        return None
+
+
+async def _poll_new_leads_once() -> None:
+    global _lead_poll_watermark
+    users = await _fetch_recent_lead_users()
+    if users is None:
+        return
+    # Лиды/клиенты имеют clientStateId; записи без него (сотрудники и пр.) пропускаем.
+    candidates = [
+        u for u in users
+        if u.get("id") is not None and u.get("clientStateId") is not None
+    ]
+    ids = [int(u["id"]) for u in candidates]
+    if not ids:
+        return
+
+    if _lead_poll_watermark is None:
+        # Первый запуск: фиксируем текущий максимум, исторические лиды НЕ рассылаем.
+        _lead_poll_watermark = max(ids)
+        _save_lead_poll_state()
+        logger.info(
+            "lead-poll: инициализация watermark_id=%s (существующие лиды не уведомляем)",
+            _lead_poll_watermark,
+        )
+        return
+
+    new_users = [u for u in candidates if int(u["id"]) > _lead_poll_watermark]
+    if not new_users:
+        return
+
+    if len(new_users) > LEAD_POLL_MAX_PER_TICK:
+        logger.error(
+            "lead-poll: %d новых лидов > лимита %d за тик — НЕ рассылаю (safety), "
+            "сдвигаю watermark. Поднять: env LEAD_POLL_MAX_PER_TICK",
+            len(new_users), LEAD_POLL_MAX_PER_TICK,
+        )
+        _lead_poll_watermark = max(ids)
+        _save_lead_poll_state()
+        return
+
+    for u in sorted(new_users, key=lambda x: int(x["id"])):
+        uid = int(u["id"])
+        if _lead_already_notified(uid):
+            logger.info("lead-poll: userId=%s уже уведомлён ботом напрямую — пропуск (dedup)", uid)
+        else:
+            phone = u.get("phone") or ""
+            filials = u.get("filials") or []
+            filial_id = filials[0] if filials else None
+            wa_link = f"https://wa.me/{re.sub(r'[^0-9]', '', phone)}" if phone else "-"
+            logger.info("lead-poll: новый лид userId=%s name=%r -> админ", uid, u.get("name"))
+            await crm.notify_new_lead_admin(
+                NEW_LEAD_ADMIN_PHONE, NEW_LEAD_ADMIN_NAME,
+                name=u.get("name") or "-", phone=phone or "-", age="-", experience="-",
+                preference=str(filial_id) if filial_id is not None else "-",
+                wa_link=wa_link, source="Новый лид в CRM.",
+            )
+            _mark_lead_notified(uid)
+        _lead_poll_watermark = max(_lead_poll_watermark, uid)
+
+    _save_lead_poll_state()
+
+
+async def _lead_poll_loop() -> None:
+    logger.info("lead-poll: фоновый опрос новых лидов запущен (interval=%ss)", LEAD_POLL_INTERVAL)
+    while True:
+        try:
+            await _poll_new_leads_once()
+        except Exception as e:
+            logger.error("lead-poll: ошибка тика: %s", e, exc_info=True)
+        await asyncio.sleep(LEAD_POLL_INTERVAL)
+
+
+@app.on_event("startup")
+async def _start_lead_poller() -> None:
+    if not LEAD_POLL_ENABLED:
+        logger.info("lead-poll: отключён (LEAD_POLL_ENABLED=0)")
+        return
+    _load_lead_poll_state()
+    asyncio.create_task(_lead_poll_loop())
