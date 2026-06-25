@@ -2820,26 +2820,32 @@ def _save_lead_poll_state() -> None:
 
 
 async def _fetch_recent_lead_users() -> Optional[List[dict]]:
-    """Свежие пользователи MoyKlass за последние ~сутки. None — опрос не удался
-    (тогда watermark не двигаем, чтобы не пропустить лиды)."""
+    """Новейшие пользователи MoyKlass (sort=id desc, limit=LEAD_POLL_PAGE).
+    None — опрос не удался (тогда watermark не двигаем, чтобы не пропустить лиды).
+
+    Сознательно НЕ используем фильтр createdAt: MoyKlass /users понимает диапазон
+    дат как массив, а httpx сериализует его повторяющимися ключами, поэтому фильтр
+    может молча игнорироваться — и при сортировке по возрастанию вернулись бы
+    СТАРЕЙШИЕ записи, а новые лиды (с большими id) вообще не попали бы в выборку.
+    Сортировка по id desc гарантированно отдаёт самые свежие записи; отсев новых
+    делаем локально по id-watermark (надёжнее даты)."""
     headers = await crm._get_headers()
     if not headers:
         logger.warning("lead-poll: нет токена CRM — пропуск тика")
         return None
-    today = datetime.now(_SCHOOL_TZ).date()
-    since = (today - timedelta(days=1)).isoformat()
-    until = today.isoformat()
     try:
         async with httpx.AsyncClient(timeout=MOYKLASS_HTTP_TIMEOUT) as client:
             resp = await client.get(
                 f"{MOYKLASS_BASE_URL}/users",
                 headers=headers,
-                params={"createdAt": [since, until], "limit": LEAD_POLL_PAGE, "sort": "id"},
+                params={"sort": "id", "sortDirection": "desc", "limit": LEAD_POLL_PAGE},
             )
             if resp.status_code != 200:
-                logger.warning("lead-poll: GET /users -> %s", resp.status_code)
+                logger.warning("lead-poll: GET /users -> %s %s", resp.status_code, resp.text[:200])
                 return None
-            return resp.json().get("users", [])
+            users = resp.json().get("users", [])
+            logger.info("lead-poll: GET /users -> 200 (%d записей)", len(users))
+            return users
     except Exception as e:
         logger.warning("lead-poll: GET /users исключение: %s", e)
         return None
