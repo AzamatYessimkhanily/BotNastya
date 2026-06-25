@@ -50,6 +50,10 @@ _NEW_LEAD_EVENTS_ENV = os.getenv("MOYKLASS_NEW_LEAD_EVENTS", "join_new").strip()
 _NEW_LEAD_ADMIN_EVENTS = frozenset(
     e.strip() for e in _NEW_LEAD_EVENTS_ENV.split(",") if e.strip()
 )
+# Получатель уведомлений о новом лиде — ОДИН центральный администратор/владелец
+# (а не управляющий филиала). По умолчанию Данияр Омаров; меняется через env.
+NEW_LEAD_ADMIN_PHONE = os.getenv("NEW_LEAD_ADMIN_PHONE", "+7 702 728 3711").strip()
+NEW_LEAD_ADMIN_NAME = os.getenv("NEW_LEAD_ADMIN_NAME", "Данияр Биржанович Омаров").strip()
 _SCHOOL_TZ = ZoneInfo("Asia/Almaty")
 
 # Контакт Quantum STEM: при необходимости переопределить через QUANTUM_MANAGER_PHONE / QUANTUM_MANAGER_NAME в .env
@@ -1484,8 +1488,8 @@ class MoyKlassCRM:
                          "status": status_code, "body": body[:500]},
                         "joins_failed_but_lead_created",
                     )
-                    await self.notify_branch_manager_new_lead(
-                        mgr_phone, mgr_name, name=name, phone=clean_phone,
+                    await self.notify_new_lead_admin(
+                        NEW_LEAD_ADMIN_PHONE, NEW_LEAD_ADMIN_NAME, name=name, phone=clean_phone,
                         age=age, experience=experience, preference=preference, wa_link=wa_link,
                     )
                     _mark_lead_notified(user_id)
@@ -1509,18 +1513,18 @@ class MoyKlassCRM:
             except Exception as e:
                 logger.warning(f"create_lead: задача не создана: {e}")
 
-            await self.notify_branch_manager_new_lead(
-                mgr_phone, mgr_name, name=name, phone=clean_phone,
+            await self.notify_new_lead_admin(
+                NEW_LEAD_ADMIN_PHONE, NEW_LEAD_ADMIN_NAME, name=name, phone=clean_phone,
                 age=age, experience=experience, preference=preference, wa_link=wa_link,
             )
             _mark_lead_notified(user_id)
             logger.info(f"create_lead: УСПЕХ — заявка создана для {name} ({clean_phone}), филиал {filial_id}")
             return self._handoff_message(mgr_name, mgr_phone, success=True)
 
-    async def notify_branch_manager_new_lead(
+    async def notify_new_lead_admin(
         self,
-        mgr_phone: str,
-        mgr_name: str,
+        admin_phone: str,
+        admin_name: str,
         *,
         name: str,
         phone: str,
@@ -1530,13 +1534,13 @@ class MoyKlassCRM:
         wa_link: str,
         source: str = "Бот оформил заявку.",
     ) -> None:
-        """Служебное WhatsApp-уведомление управляющему филиала о новом лиде.
+        """Служебное WhatsApp-уведомление центральному администратору о новом лиде.
 
         Не клиентское сообщение. В тест-режиме (MOYKLASS_WEBHOOK_TEST_PHONE)
-        уходит на тест-номер с префиксом [ТЕСТ CRM], а не реальному менеджеру.
+        уходит на тест-номер с префиксом [ТЕСТ CRM], а не реальному администратору.
         Любая ошибка отправки гасится — она НЕ должна ломать создание лида.
         """
-        target_phone = mgr_phone
+        target_phone = admin_phone
         prefix = ""
         if _webhook_test_mode_active():
             target_phone = MOYKLASS_WEBHOOK_TEST_PHONE
@@ -1545,8 +1549,8 @@ class MoyKlassCRM:
         chat_id = phone_to_chat_id(target_phone)
         if not chat_id:
             logger.warning(
-                "notify_branch_manager_new_lead: не удалось нормализовать номер %r (mgr=%r)",
-                target_phone, mgr_name,
+                "notify_new_lead_admin: не удалось нормализовать номер %r (admin=%r)",
+                target_phone, admin_name,
             )
             return
 
@@ -1558,11 +1562,11 @@ class MoyKlassCRM:
         try:
             await send_whatsapp(chat_id, message, sanitize=False)
             logger.info(
-                "notify_branch_manager_new_lead: отправлено %s (mgr=%r, лид=%r)",
-                chat_id, mgr_name, name,
+                "notify_new_lead_admin: отправлено %s (admin=%r, лид=%r)",
+                chat_id, admin_name, name,
             )
         except Exception as e:
-            logger.error("notify_branch_manager_new_lead: ошибка отправки %s: %s", chat_id, e)
+            logger.error("notify_new_lead_admin: ошибка отправки %s: %s", chat_id, e)
 
     async def _post_join_with_retry(self, client: httpx.AsyncClient, headers: dict, join_payload: dict):
         """POST /joins с авто-повторами:
@@ -2678,11 +2682,11 @@ async def handle_moyklass_webhook(secret: str, request: Request):
 
 
 async def _handle_new_lead_admin_notification(event: str, obj: dict) -> dict:
-    """Уведомление управляющему филиала о новом лиде В СИСТЕМЕ (MoyKlass-сценарий).
+    """Уведомление ЦЕНТРАЛЬНОМУ администратору о новом лиде В СИСТЕМЕ (MoyKlass-сценарий).
 
     Покрывает лиды из любого источника (менеджер вручную, сайт, бот). Получатель —
-    управляющий филиала лида (BRANCH_MANAGERS), не один центральный человек.
-    Дедуп по userId: если этот лид только что создал бот и уже уведомил управляющего
+    один центральный администратор (NEW_LEAD_ADMIN_PHONE), не управляющий филиала.
+    Дедуп по userId: если этот лид только что создал бот и уже уведомил администратора
     напрямую из create_lead — повторно не шлём (защита от двойного уведомления).
     """
     user_id = obj.get("userId")
@@ -2697,21 +2701,21 @@ async def _handle_new_lead_admin_notification(event: str, obj: dict) -> dict:
     name = (user or {}).get("name") or obj.get("userName") or obj.get("name") or "-"
     phone = (user or {}).get("phone") or obj.get("phone") or ""
 
+    # Филиал нужен только для текста сообщения (получатель — центральный админ).
     filial_id = obj.get("filialId")
     if filial_id is None and user:
         filials = user.get("filials") or []
         if filials:
             filial_id = filials[0]
 
-    mgr_name, mgr_phone = crm._pick_manager_info(filial_id, None)
     wa_link = f"https://wa.me/{re.sub(r'[^0-9]', '', phone)}" if phone else "-"
 
     logger.info(
-        "moyklass-webhook-employee: new-lead userId=%s filial=%s -> управляющий %r (%s)",
-        user_id, filial_id, mgr_name, mgr_phone,
+        "moyklass-webhook-employee: new-lead userId=%s filial=%s -> админ %r",
+        user_id, filial_id, NEW_LEAD_ADMIN_NAME,
     )
-    await crm.notify_branch_manager_new_lead(
-        mgr_phone, mgr_name,
+    await crm.notify_new_lead_admin(
+        NEW_LEAD_ADMIN_PHONE, NEW_LEAD_ADMIN_NAME,
         name=name, phone=phone or "-", age="-", experience="-",
         preference=str(filial_id) if filial_id is not None else "-",
         wa_link=wa_link,

@@ -347,15 +347,15 @@ def main() -> int:
     check("None безопасен", not bot._lead_already_notified(None))
 
     crm = bot.crm
-    orig_notify = crm.notify_branch_manager_new_lead
+    orig_notify = crm.notify_new_lead_admin
     orig_get_user = crm.get_user_by_id
     try:
         calls = []
-        async def _spy_notify(mgr_phone, mgr_name, **kw):
-            calls.append(kw)
+        async def _spy_notify(admin_phone, admin_name, **kw):
+            calls.append({"admin_phone": admin_phone, "admin_name": admin_name, **kw})
         async def _fake_user(uid):
             return {"id": uid, "name": "Иван", "phone": "77011112233", "filials": [37754]}
-        crm.notify_branch_manager_new_lead = _spy_notify
+        crm.notify_new_lead_admin = _spy_notify
         crm.get_user_by_id = _fake_user
 
         # Уже уведомлён ботом → вебхук пропускает (нет двойного уведомления)
@@ -364,15 +364,19 @@ def main() -> int:
         asyncio.run(bot._handle_new_lead_admin_notification("join_new", {"userId": 999}))
         check("dedup: повторно НЕ уведомляем", len(calls) == 0)
 
-        # Лид не от бота → уведомляем управляющего, source = CRM
+        # Лид не от бота → уведомляем ЦЕНТРАЛЬНОГО админа, source = CRM
         bot._notified_lead_users.clear()
         asyncio.run(bot._handle_new_lead_admin_notification("join_new", {"userId": 1001}))
         check("новый лид -> 1 уведомление", len(calls) == 1)
+        check("получатель = центральный админ (phone)",
+              calls[0].get("admin_phone") == bot.NEW_LEAD_ADMIN_PHONE)
+        check("получатель = центральный админ (name)",
+              calls[0].get("admin_name") == bot.NEW_LEAD_ADMIN_NAME)
         check("source = Новый лид в CRM", calls[0].get("source") == "Новый лид в CRM.")
         check("имя из CRM", calls[0].get("name") == "Иван")
         check("после вебхука лид помечен", bot._lead_already_notified(1001))
     finally:
-        crm.notify_branch_manager_new_lead = orig_notify
+        crm.notify_new_lead_admin = orig_notify
         crm.get_user_by_id = orig_get_user
         bot._notified_lead_users.clear()
 
