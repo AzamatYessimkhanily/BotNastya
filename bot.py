@@ -39,6 +39,11 @@ MOYKLASS_WEBHOOK_TEST_PHONE = os.getenv("MOYKLASS_WEBHOOK_TEST_PHONE", "").strip
 # Клиентские вебхуки: игнорировать события старше этого Unix-времени (защита от массовой рассылки при деплое).
 _ENABLED_SINCE_ENV = os.getenv("MOYKLASS_WEBHOOK_ENABLED_SINCE", "").strip()
 MOYKLASS_WEBHOOK_ENABLED_SINCE = int(_ENABLED_SINCE_ENV) if _ENABLED_SINCE_ENV.isdigit() else None
+# Потолок получателей на одно broadcast-событие (classId/lessonId без userId).
+# Превышение → рассылку НЕ делаем (skip + ERROR), чтобы misconfigured-сценарий
+# не разослал сотням. Группы шахмат маленькие; при необходимости поднять через env.
+_MAX_BROADCAST_ENV = os.getenv("MAX_BROADCAST_RECIPIENTS", "").strip()
+MAX_BROADCAST_RECIPIENTS = int(_MAX_BROADCAST_ENV) if _MAX_BROADCAST_ENV.isdigit() else 25
 _SCHOOL_TZ = ZoneInfo("Asia/Almaty")
 
 # Контакт Quantum STEM: при необходимости переопределить через QUANTUM_MANAGER_PHONE / QUANTUM_MANAGER_NAME в .env
@@ -114,7 +119,7 @@ def _log_failed_lead(payload: dict, reason: str) -> None:
     """Сохраняем неоформленный лид локально, чтобы вручную восстановить позже."""
     try:
         record = {
-            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "timestamp": datetime.now(_SCHOOL_TZ).isoformat(timespec="seconds"),
             "reason": reason,
             **payload,
         }
@@ -603,8 +608,8 @@ class MoyKlassCRM:
                 except Exception:
                     pass
 
-                today = datetime.now().strftime("%Y-%m-%d")
-                future = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+                today = datetime.now(_SCHOOL_TZ).strftime("%Y-%m-%d")
+                future = (datetime.now(_SCHOOL_TZ) + timedelta(days=7)).strftime("%Y-%m-%d")
                 params = {
                     "userId": user_id, "date": [today, future],
                     "includeLessons": "true", "limit": 3, "sort": "date"
@@ -641,6 +646,16 @@ class MoyKlassCRM:
     @staticmethod
     def _digits(value: str) -> str:
         return re.sub(r"[^\d]", "", value or "")
+
+    @staticmethod
+    def _phone_tail_matches(user_phone, target_tail: str) -> bool:
+        """True — телефон пользователя совпадает с искомым по последним 10 цифрам
+        (или сверить нечем: пустой target/телефон → доверяем). Нужно, чтобы не
+        привязать лид/досье к чужому пользователю при нечётком поиске MoyKlass."""
+        user_digits = re.sub(r"[^\d]", "", str(user_phone or ""))
+        if not target_tail or not user_digits:
+            return True
+        return user_digits.endswith(target_tail) or target_tail.endswith(user_digits[-10:])
 
     @staticmethod
     def _extract_age_number(age_value: str) -> Optional[int]:
@@ -808,6 +823,7 @@ class MoyKlassCRM:
             return None
 
         clean = re.sub(r"[^\d]", "", phone)
+        target_tail = clean[-10:] if len(clean) >= 10 else clean
         phones_to_try = []
         if len(clean) == 11:
             base = clean[1:]
@@ -826,6 +842,16 @@ class MoyKlassCRM:
                         users = data.get("users", [])
                         if users:
                             user = users[0]
+                            # MoyKlass может вернуть пользователя по нечёткому
+                            # совпадению — нельзя привязывать лид/досье к чужому
+                            # номеру. Сверяем по последним 10 цифрам.
+                            if not self._phone_tail_matches(user.get("phone"), target_tail):
+                                logger.warning(
+                                    "find_user_smart: телефон найденного %s (%s) не совпал с "
+                                    "запрошенным %s — пропуск",
+                                    user.get("id"), user.get("phone"), target_tail,
+                                )
+                                continue
                             user_id = user['id']
                             logger.info(f"НАЙДЕН КЛИЕНТ: {user['name']} (ID {user_id})")
 
@@ -970,6 +996,15 @@ class MoyKlassCRM:
 
     async def _class_mailing_client_user_ids(self, class_id: int, headers: dict) -> List[int]:
         """userId в группе со статусом ученика «Клиент»."""
+        # fail-closed: без статуса «Клиент» массовую рассылку по группе НЕ делаем,
+        # иначе единичный сбой /clientStatuses снимет фильтр и разошлёт всем подряд.
+        if await self._get_client_state_id() is None:
+            logger.error(
+                "_class_mailing_client_user_ids: clientStateId не определён — "
+                "рассылка по classId=%s ОТМЕНЕНА (fail-closed)",
+                class_id,
+            )
+            return []
         try:
             async with httpx.AsyncClient(timeout=MOYKLASS_HTTP_TIMEOUT) as client:
                 resp = await client.get(
@@ -996,6 +1031,14 @@ class MoyKlassCRM:
 
     async def _lesson_mailing_client_user_ids(self, lesson_id: int, headers: dict) -> List[int]:
         """userId с занятия, у которых статус ученика «Клиент»."""
+        # fail-closed: без статуса «Клиент» массовую рассылку по занятию НЕ делаем.
+        if await self._get_client_state_id() is None:
+            logger.error(
+                "_lesson_mailing_client_user_ids: clientStateId не определён — "
+                "рассылка по lessonId=%s ОТМЕНЕНА (fail-closed)",
+                lesson_id,
+            )
+            return []
         record_ids = await self._lesson_record_user_ids(lesson_id, headers)
         filtered: List[int] = []
         for user_id in record_ids:
@@ -1050,6 +1093,17 @@ class MoyKlassCRM:
                 user_ids = await self._lesson_record_user_ids(int(obj["lessonId"]), headers)
         elif obj.get("classId") is not None:
             user_ids = await self._class_mailing_client_user_ids(int(obj["classId"]), headers)
+
+        # Жёсткий потолок: misconfigured-сценарий не должен разослать сотням.
+        # Превышение лимита → НЕ рассылаем вовсе (safe-skip + ERROR-алерт в лог).
+        if len(user_ids) > MAX_BROADCAST_RECIPIENTS:
+            logger.error(
+                "resolve_phones: broadcast event=%s lessonId=%s classId=%s даёт %d получателей "
+                "> лимита %d — рассылка ОТМЕНЕНА (fail-safe). Поднять: env MAX_BROADCAST_RECIPIENTS",
+                event, obj.get("lessonId"), obj.get("classId"),
+                len(user_ids), MAX_BROADCAST_RECIPIENTS,
+            )
+            return []
 
         phones: List[str] = []
         seen = set()
@@ -1265,7 +1319,7 @@ class MoyKlassCRM:
         birth_attr = []
         if age_num is not None:
             try:
-                year = datetime.now().year - age_num
+                year = datetime.now(_SCHOOL_TZ).year - age_num
                 birth_attr = [{"attributeId": 1, "value": f"{year}-01-01"}]
             except Exception:
                 birth_attr = []
@@ -1408,7 +1462,7 @@ class MoyKlassCRM:
                 return self._handoff_message(mgr_name, mgr_phone, success=False)
 
             try:
-                now = datetime.now().strftime("%Y-%m-%d")
+                now = datetime.now(_SCHOOL_TZ).strftime("%Y-%m-%d")
                 task_resp = await client.post(f"{MOYKLASS_BASE_URL}/tasks", headers=headers, json={
                     "userId": user_id, "body": full_text,
                     "beginDate": now, "endDate": now,
@@ -1550,7 +1604,7 @@ _FORBIDDEN_SENTENCE_PATTERNS = [
     re.compile(r"[^.!?]*техническ\w*\s+(?:ошибк\w*|проблем\w*|сбо\w*)[^.!?]*[.!?]", re.IGNORECASE),
     re.compile(r"[^.!?]*временно\s+не\s+оформ\w*[^.!?]*[.!?]", re.IGNORECASE),
     re.compile(r"[^.!?]*не\s+(?:получилось|удалось|получается)\s+оформ\w*[^.!?]*[.!?]", re.IGNORECASE),
-    re.compile(r"[^.!?]*(?:обратитесь|свяжитесь|позвоните)\s+(?:на)?прямую[^.!?]*[.!?]", re.IGNORECASE),
+    re.compile(r"[^.!?]*(?:обратитесь|свяжитесь|позвоните)\s+[^.!?]*?(?:напрямую|прямую)[^.!?]*[.!?]", re.IGNORECASE),
     re.compile(r"[^.!?]*заявк\w*\s+(?:не\s+)?(?:оформлен\w*|обработан\w*)[^.!?]*[.!?]", re.IGNORECASE),
     re.compile(r"[^.!?]*ошибк\w*\s+при\s+регистрац\w*[^.!?]*[.!?]", re.IGNORECASE),
 ]
@@ -1559,6 +1613,11 @@ _GENERIC_HANDOFF_FALLBACK = (
     "Спасибо. Передаю вашу заявку нашему управляющему — она свяжется с вами в ближайшее время. Хорошего дня."
 )
 _SHORT_SANITIZE_FALLBACK = "Пожалуйста. Управляющий свяжется с вами в ближайшее время."
+# Аварийный ответ, когда обработка диалога упала (нельзя упоминать «техническую
+# ошибку» и «обратитесь напрямую» — это запрещено промптом и звучит как «бот сломан»).
+_DIALOG_ERROR_FALLBACK = (
+    "Секунду, пожалуйста. Напишите, пожалуйста, ваш вопрос ещё раз — я обязательно помогу."
+)
 
 _KAZAKH_CHAR_RE = re.compile(r"[әіңғүұқөһ]", re.IGNORECASE)
 
@@ -1632,6 +1691,63 @@ def _history_message_content(message) -> str:
     return getattr(message, "content", None) or ""
 
 
+def _message_tool_call_ids(message) -> List[str]:
+    """tool_call id из элемента истории (dict или объект OpenAI)."""
+    if isinstance(message, dict):
+        tool_calls = message.get("tool_calls") or []
+    else:
+        tool_calls = getattr(message, "tool_calls", None) or []
+    ids: List[str] = []
+    for tc in tool_calls:
+        tid = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+        if tid:
+            ids.append(tid)
+    return ids
+
+
+def _repair_dangling_tool_calls(chat_id: str) -> None:
+    """Снимает «осиротевший» assistant-tool_call из истории.
+
+    Если в истории остался assistant с tool_calls, на которые НЕ записаны парные
+    ответы role:"tool", OpenAI отвечает 400 на КАЖДЫЙ следующий запрос — диалог
+    клиента залипает на аварийном fallback до сброса сессии. Эта функция удаляет
+    такой висячий хвост, восстанавливая валидность истории.
+    """
+    history = chat_history.get(chat_id)
+    if not history:
+        return
+    while history:
+        idx = next(
+            (i for i in range(len(history) - 1, -1, -1) if _message_tool_call_ids(history[i])),
+            None,
+        )
+        if idx is None:
+            return
+        expected = set(_message_tool_call_ids(history[idx]))
+        answered = {
+            m.get("tool_call_id")
+            for m in history[idx + 1:]
+            if isinstance(m, dict) and m.get("role") == "tool" and m.get("tool_call_id")
+        }
+        if expected <= answered:
+            return  # все tool_calls закрыты — история валидна
+        # Удаляем только сломанную группу: assistant с tool_calls и идущие
+        # сразу за ним частичные ответы role:"tool". Хвост после группы (например,
+        # свежее сообщение клиента текущего хода) сохраняем.
+        end = idx + 1
+        while (
+            end < len(history)
+            and isinstance(history[end], dict)
+            and history[end].get("role") == "tool"
+        ):
+            end += 1
+        logger.warning(
+            "repair: удаляю висячий tool_call в истории %s (ожидалось %s, отвечено %s)",
+            chat_id, expected, answered,
+        )
+        del history[idx:end]
+
+
 def _mark_handoff_completed(chat_id: str) -> None:
     handoff_completed[chat_id] = time.time()
     if chat_id not in chat_history:
@@ -1678,14 +1794,39 @@ def sanitize_bot_outgoing(text: Optional[str], *, fallback: str = "handoff") -> 
     return t
 
 
-async def send_whatsapp(chat_id, text, *, sanitize_fallback: str = "handoff", sanitize: bool = True):
+async def send_whatsapp(chat_id, text, *, sanitize_fallback: str = "handoff", sanitize: bool = True) -> bool:
     # Доп. нормализация на случай прямых вызовов (голосовые ошибки и т.д.).
     # sanitize=False — для служебных сообщений сотрудникам (сохраняем формат/переносы).
+    # Возвращает True только при подтверждённой отправке (Green API отдал idMessage).
     if sanitize:
         text = sanitize_bot_outgoing(text, fallback=sanitize_fallback)
     url = f"https://api.green-api.com/waInstance{GREEN_API_ID}/sendMessage/{GREEN_API_TOKEN}"
-    async with httpx.AsyncClient() as client:
-        await client.post(url, json={"chatId": chat_id, "message": text})
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, json={"chatId": chat_id, "message": text})
+    except Exception as e:
+        logger.error("send_whatsapp: сетевая ошибка при отправке %s: %s", chat_id, e)
+        return False
+
+    if resp.status_code != 200:
+        logger.error(
+            "send_whatsapp: Green API %s -> %s %s",
+            chat_id, resp.status_code, (resp.text or "")[:300],
+        )
+        return False
+
+    # При успехе Green API возвращает {"idMessage": "..."}; его отсутствие = не доставлено.
+    try:
+        body = resp.json()
+    except Exception:
+        body = None
+    if not (isinstance(body, dict) and body.get("idMessage")):
+        logger.warning(
+            "send_whatsapp: ответ без idMessage %s -> %s",
+            chat_id, (resp.text or "")[:200],
+        )
+        return False
+    return True
 
 # --- 6. ЛОГИКА ДИАЛОГА ---
 async def process_dialog(chat_id):
@@ -1780,24 +1921,49 @@ async def process_dialog(chat_id):
 
             if msg.tool_calls:
                 chat_history[chat_id].append(msg)
+                # КАЖДЫЙ tool_call ОБЯЗАН получить парный ответ role:"tool" — иначе
+                # история становится невалидной и все следующие запросы к OpenAI
+                # падают 400 (диалог клиента залипает на fallback). Поэтому ответ
+                # гарантируем даже при битых аргументах / неожиданном сбое create_lead.
                 for tool in msg.tool_calls:
-                    args = json.loads(tool.function.arguments)
+                    try:
+                        args = json.loads(tool.function.arguments)
+                    except (json.JSONDecodeError, TypeError, ValueError) as e:
+                        logger.error(
+                            f"CRM вызов: не удалось распарсить аргументы "
+                            f"{tool.function.arguments!r}: {e}"
+                        )
+                        args = {}
+                    # Валидный JSON может оказаться не object (null / [] / число) —
+                    # тогда args.get(...) упал бы AttributeError и сорвал гарантию
+                    # tool-ответа. Приводим к пустому dict.
+                    if not isinstance(args, dict):
+                        logger.error("CRM вызов: аргументы не object: %r", args)
+                        args = {}
                     logger.info(f"CRM вызов: {args}")
 
                     if tool.function.name == "register_client_request":
                         lead_registered_this_turn = True
-
-                    phone_to_save = args.get("client_phone")
-                    if not phone_to_save or "не указа" in phone_to_save.lower():
-                        phone_to_save = chat_id.split("@")[0]
-
-                    result_text = await crm.create_lead(
-                        name=args.get("client_name", "Клиент"),
-                        phone=phone_to_save,
-                        age=args.get("client_age", "-"),
-                        experience=args.get("experience", "-"),
-                        preference=args.get("preference", "Не выбрано")
-                    )
+                        phone_to_save = args.get("client_phone")
+                        if not phone_to_save or "не указа" in phone_to_save.lower():
+                            phone_to_save = chat_id.split("@")[0]
+                        try:
+                            result_text = await crm.create_lead(
+                                name=args.get("client_name", "Клиент"),
+                                phone=phone_to_save,
+                                age=args.get("client_age", "-"),
+                                experience=args.get("experience", "-"),
+                                preference=args.get("preference", "Не выбрано")
+                            )
+                        except Exception as e:
+                            logger.error(f"create_lead неожиданно упал: {e}")
+                            mgr_name, mgr_phone = crm._pick_manager_info("default", None)
+                            result_text = crm._handoff_message(mgr_name, mgr_phone, success=False)
+                    else:
+                        logger.warning(
+                            f"Неизвестный tool-call {tool.function.name!r} — отвечаю нейтрально"
+                        )
+                        result_text = "СИСТЕМНОЕ СООБЩЕНИЕ: функция не поддерживается."
 
                     chat_history[chat_id].append({
                         "tool_call_id": tool.id,
@@ -1821,11 +1987,11 @@ async def process_dialog(chat_id):
 
         except Exception as e:
             logger.error(f"Ошибка AI: {e}")
+            # Чиним историю, если упали посреди tool-call (иначе все следующие
+            # запросы к OpenAI будут падать 400 и диалог залипнет на fallback).
+            _repair_dangling_tool_calls(chat_id)
             try:
-                await send_whatsapp(
-                    chat_id,
-                    "Произошла техническая ошибка. Напишите ещё раз или обратитесь к менеджеру напрямую."
-                )
+                await send_whatsapp(chat_id, _DIALOG_ERROR_FALLBACK)
             except Exception as send_err:
                 logger.error(f"Не удалось отправить fallback: {send_err}")
 
@@ -2376,7 +2542,10 @@ async def _dispatch_moyklass_webhook(
             logger.warning("%s: не удалось нормализовать телефон %r", log_prefix, phone)
             continue
         try:
-            await send_whatsapp(chat_id, message)
+            delivered = await send_whatsapp(chat_id, message)
+            if not delivered:
+                logger.error("%s: НЕ доставлено %s (см. send_whatsapp выше)", log_prefix, chat_id)
+                continue
             if record_history:
                 record_crm_notification_in_history(chat_id, message)
             logger.info("%s: отправлено %s", log_prefix, chat_id)
