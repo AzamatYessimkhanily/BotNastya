@@ -63,6 +63,7 @@ LEAD_POLL_INTERVAL = int(os.getenv("LEAD_POLL_INTERVAL", "120") or "120")  # с�
 LEAD_POLL_PAGE = int(os.getenv("LEAD_POLL_PAGE", "100") or "100")          # сколько свежих юзеров тянуть
 LEAD_POLL_MAX_PER_TICK = int(os.getenv("LEAD_POLL_MAX_PER_TICK", "15") or "15")  # потолок уведомлений за тик
 LEAD_POLL_STATE_FILE = os.getenv("LEAD_POLL_STATE_FILE", "lead_poll_state.json")
+CRM_SENT_STATE_FILE = os.getenv("CRM_SENT_STATE_FILE", "crm_sent_state.json")
 # watermark: максимальный id лида, который уже обработан опросом (None = ещё не инициализирован)
 _lead_poll_watermark: Optional[int] = None
 _SCHOOL_TZ = ZoneInfo("Asia/Almaty")
@@ -573,6 +574,62 @@ def _lead_already_notified(user_id) -> bool:
         _notified_lead_users.pop(int(user_id), None)
         return False
     return True
+
+
+# Дедуп CRM-уведомлений, которые MoyKlass может слать повторно (напр. user_birthday
+# каждую минуту, пока условие сценария истинно). Ключ: event:userId:дата:телефон.
+_CRM_DEDUP_EVENTS = frozenset({"user_birthday"})
+_crm_sent_keys: set = set()
+
+
+def _crm_dedup_today() -> str:
+    return datetime.now(_SCHOOL_TZ).strftime("%Y-%m-%d")
+
+
+def _crm_dedup_key(event: Optional[str], user_id, phone: str) -> Optional[str]:
+    if event not in _CRM_DEDUP_EVENTS or user_id is None:
+        return None
+    phone_norm = re.sub(r"[^0-9]", "", phone or "")
+    if not phone_norm:
+        return None
+    return f"{event}:{int(user_id)}:{_crm_dedup_today()}:{phone_norm}"
+
+
+def _crm_already_sent(key: str) -> bool:
+    return key in _crm_sent_keys
+
+
+def _mark_crm_sent(key: str) -> None:
+    _crm_sent_keys.add(key)
+    _save_crm_sent_state()
+
+
+def _load_crm_sent_state() -> None:
+    global _crm_sent_keys
+    today = _crm_dedup_today()
+    try:
+        with open(CRM_SENT_STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        keys = data.get("keys", [])
+        _crm_sent_keys = {
+            k for k in keys
+            if isinstance(k, str) and len(k.split(":")) >= 4 and k.split(":")[2] == today
+        }
+        logger.info("crm-dedup: загружено %d ключей за %s", len(_crm_sent_keys), today)
+    except FileNotFoundError:
+        _crm_sent_keys = set()
+        logger.info("crm-dedup: state-файл отсутствует — начинаем с пустого кэша")
+    except Exception as e:
+        logger.warning("crm-dedup: не удалось загрузить state: %s", e)
+        _crm_sent_keys = set()
+
+
+def _save_crm_sent_state() -> None:
+    try:
+        with open(CRM_SENT_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"keys": sorted(_crm_sent_keys)}, f)
+    except Exception as e:
+        logger.warning("crm-dedup: не удалось сохранить state: %s", e)
 
 
 def _voice_download_url(msg_data: dict) -> Optional[str]:
@@ -1275,6 +1332,8 @@ class MoyKlassCRM:
             return enriched
 
         class_id = obj.get("classId")
+        lesson_data: Optional[dict] = None
+        cls_data: Optional[dict] = None
 
         async with httpx.AsyncClient(timeout=MOYKLASS_HTTP_TIMEOUT) as client:
             if obj.get("lessonId") is not None:
@@ -1284,11 +1343,11 @@ class MoyKlassCRM:
                         headers=headers,
                     )
                     if resp.status_code == 200:
-                        lesson = resp.json()
-                        enriched.setdefault("date", lesson.get("date", ""))
-                        enriched.setdefault("beginTime", lesson.get("beginTime", ""))
-                        if class_id is None and lesson.get("classId") is not None:
-                            class_id = lesson.get("classId")
+                        lesson_data = resp.json()
+                        enriched.setdefault("date", lesson_data.get("date", ""))
+                        enriched.setdefault("beginTime", lesson_data.get("beginTime", ""))
+                        if class_id is None and lesson_data.get("classId") is not None:
+                            class_id = lesson_data.get("classId")
                     else:
                         logger.warning(
                             "enrich_webhook_object_context: lesson %s -> %s",
@@ -1306,11 +1365,16 @@ class MoyKlassCRM:
                 cls_data = await self._get_class_data(int(class_id), headers, client)
                 if cls_data:
                     self._apply_class_enrichment(enriched, cls_data)
-                    logger.info(
-                        "enrich_webhook_object_context: class %s onlineLink=%s",
-                        class_id,
-                        bool(enriched.get("onlineLink")),
-                    )
+
+        online_link = _pick_online_link(enriched, lesson_data, cls_data)
+        if online_link:
+            enriched["onlineLink"] = online_link
+        if class_id is not None:
+            logger.info(
+                "enrich_webhook_object_context: class %s onlineLink=%s",
+                class_id,
+                bool(enriched.get("onlineLink")),
+            )
 
         return enriched
 
@@ -2137,7 +2201,7 @@ async def wait_user_input(chat_id):
 # --- 8. MOYKLASS СЦЕНАРИИ → WHATSAPP ---
 _URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
-# События, где уместна ссылка на онлайн-урок из комментария группы MoyKlass.
+# События, где уместна ссылка на онлайн-урок (группа / занятие / webinar в MoyKlass).
 _CLIENT_ONLINE_LINK_EVENTS = frozenset({
     "lesson_start",
     "lesson_start_hours",
@@ -2153,7 +2217,7 @@ _EMPLOYEE_ONLINE_LINK_EVENTS = frozenset({
 
 
 def _extract_online_link_from_comment(comment: Optional[str]) -> Optional[str]:
-    """Ссылка на онлайн-урок из поля comment группы в MoyKlass."""
+    """Ссылка на онлайн-урок из произвольного текстового поля MoyKlass."""
     if not comment:
         return None
     text = str(comment).strip()
@@ -2164,6 +2228,63 @@ def _extract_online_link_from_comment(comment: Optional[str]) -> Optional[str]:
         return match.group(0).rstrip(".,;)")
     if text.lower().startswith("www."):
         return "https://" + text.split()[0].rstrip(".,;)")
+    return None
+
+
+def _extract_online_link_from_params(params) -> Optional[str]:
+    """Ссылка из params занятия MoyKlass (массивы webinars / videos)."""
+    if not isinstance(params, dict):
+        return None
+    for key in ("webinars", "videos"):
+        items = params.get(key) or []
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, str):
+                link = _extract_online_link_from_comment(item)
+                if link:
+                    return link
+                continue
+            if not isinstance(item, dict):
+                continue
+            for field in ("url", "link", "href", "webinarLink", "videoLink", "webinar_link"):
+                val = item.get(field)
+                if val:
+                    link = _extract_online_link_from_comment(str(val))
+                    if link:
+                        return link
+            for val in item.values():
+                if isinstance(val, str):
+                    link = _extract_online_link_from_comment(val)
+                    if link:
+                        return link
+    return None
+
+
+def _extract_online_link_from_lesson_fields(data: Optional[dict]) -> Optional[str]:
+    """Ссылка из полей занятия: params.webinars, description, comment."""
+    if not data:
+        return None
+    link = _extract_online_link_from_params(data.get("params"))
+    if link:
+        return link
+    link = _extract_online_link_from_comment(data.get("description"))
+    if link:
+        return link
+    return _extract_online_link_from_comment(data.get("comment"))
+
+
+def _pick_online_link(*sources: Optional[dict]) -> Optional[str]:
+    """Первый найденный URL: занятие (webinar/описание) → комментарий группы."""
+    for src in sources:
+        if not src:
+            continue
+        link = _extract_online_link_from_lesson_fields(src)
+        if link:
+            return link
+        link = _extract_online_link_from_comment(src.get("comment"))
+        if link:
+            return link
     return None
 
 
@@ -2592,7 +2713,16 @@ async def _dispatch_moyklass_webhook(
 
     logger.info("%s: event=%s получатели=%s", log_prefix, event, phones)
 
+    user_id = obj.get("userId")
     for phone in phones:
+        dedup_key = _crm_dedup_key(event, user_id, phone)
+        if dedup_key and _crm_already_sent(dedup_key):
+            logger.info(
+                "%s: event=%s userId=%s phone=%s — уже отправляли сегодня, пропуск (dedup)",
+                log_prefix, event, user_id, phone,
+            )
+            continue
+
         chat_id = phone_to_chat_id(phone)
         if not chat_id:
             logger.warning("%s: не удалось нормализовать телефон %r", log_prefix, phone)
@@ -2602,6 +2732,8 @@ async def _dispatch_moyklass_webhook(
             if not delivered:
                 logger.error("%s: НЕ доставлено %s (см. send_whatsapp выше)", log_prefix, chat_id)
                 continue
+            if dedup_key:
+                _mark_crm_sent(dedup_key)
             if record_history:
                 record_crm_notification_in_history(chat_id, message)
             logger.info("%s: отправлено %s", log_prefix, chat_id)
@@ -2919,6 +3051,11 @@ async def _lead_poll_loop() -> None:
         except Exception as e:
             logger.error("lead-poll: ошибка тика: %s", e, exc_info=True)
         await asyncio.sleep(LEAD_POLL_INTERVAL)
+
+
+@app.on_event("startup")
+async def _load_bot_persistent_state() -> None:
+    _load_crm_sent_state()
 
 
 @app.on_event("startup")

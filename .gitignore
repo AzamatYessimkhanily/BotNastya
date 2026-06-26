@@ -7,3 +7,4 @@ failed_leads.jsonl
 
 # Runtime-состояние опроса новых лидов
 lead_poll_state.json
+crm_sent_state.json

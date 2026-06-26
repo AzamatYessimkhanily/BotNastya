@@ -155,6 +155,16 @@ def main() -> int:
     check("www prefix", bot._extract_online_link_from_comment(
         "www.meet.google.com/abc-defg-hij"
     ).startswith("https://"))
+    check("url from webinar params", bot._extract_online_link_from_params({
+        "webinars": [{"url": "https://zoom.us/j/abc123", "description": "Вход"}],
+    }) == "https://zoom.us/j/abc123")
+    check("url from webhook lesson payload", bot._pick_online_link({
+        "lessonId": 1,
+        "params": {"webinars": [{"link": "https://meet.google.com/xyz-abc"}]},
+    }) == "https://meet.google.com/xyz-abc")
+    check("class comment fallback", bot._pick_online_link(
+        None, {"comment": "https://zoom.us/j/group"},
+    ) == "https://zoom.us/j/group")
 
     msg = bot.build_notification_message(
         "lesson_start_hours",
@@ -449,6 +459,49 @@ def main() -> int:
         bot._save_lead_poll_state = orig_save
         bot._lead_poll_watermark = None
         bot._notified_lead_users.clear()
+
+    print("=== smoke: birthday CRM dedup ===")
+    bot._crm_sent_keys.clear()
+    orig_send = bot.send_whatsapp
+    orig_save_crm = bot._save_crm_sent_state
+    try:
+        bot._save_crm_sent_state = lambda: None
+        send_calls = []
+
+        async def _spy_send(chat_id, message):
+            send_calls.append((chat_id, message))
+            return True
+
+        bot.send_whatsapp = _spy_send
+        obj = {"userId": 4242, "userName": "Азамат Тест"}
+        msg = bot.build_employee_notification_message("user_birthday", obj)
+        phones = ["+7 778 104 8127"]
+
+        asyncio.run(bot._dispatch_moyklass_webhook(
+            "test", "user_birthday", obj, msg, phones, record_history=False,
+        ))
+        check("birthday: первый раз отправляем", len(send_calls) == 1)
+
+        asyncio.run(bot._dispatch_moyklass_webhook(
+            "test", "user_birthday", obj, msg, phones, record_history=False,
+        ))
+        check("birthday: повтор за сегодня не шлём", len(send_calls) == 1)
+
+        key = bot._crm_dedup_key("user_birthday", 4242, phones[0])
+        check("birthday: ключ дедупа создан", key and "user_birthday:4242:" in key)
+        check("birthday: ключ помечен отправленным", key in bot._crm_sent_keys)
+
+        # Другой ученик — отдельное уведомление
+        obj2 = {"userId": 9999, "userName": "Другой"}
+        msg2 = bot.build_employee_notification_message("user_birthday", obj2)
+        asyncio.run(bot._dispatch_moyklass_webhook(
+            "test", "user_birthday", obj2, msg2, phones, record_history=False,
+        ))
+        check("birthday: другой userId — новое сообщение", len(send_calls) == 2)
+    finally:
+        bot.send_whatsapp = orig_send
+        bot._save_crm_sent_state = orig_save_crm
+        bot._crm_sent_keys.clear()
 
     print("=== smoke: enrich class helper ===")
     enriched = {}
