@@ -50,8 +50,10 @@ _NEW_LEAD_EVENTS_ENV = os.getenv("MOYKLASS_NEW_LEAD_EVENTS", "join_new").strip()
 _NEW_LEAD_ADMIN_EVENTS = frozenset(
     e.strip() for e in _NEW_LEAD_EVENTS_ENV.split(",") if e.strip()
 )
-# Получатель уведомлений о новом лиде — ОДИН центральный администратор/владелец
-# (а не управляющий филиала). По умолчанию Данияр Омаров; меняется через env.
+# DEPRECATED: +7 702 728 3711 — это номер САМОГО БОТА (основной аккаунт в MoyKlass),
+# поэтому уведомления о новых лидах прилетали боту самому себе. Маршрутизация лида
+# теперь идёт через notify_new_lead_managers → BRANCH_MANAGERS (управляющий филиала).
+# Константы оставлены, чтобы не падали внешние .env-переопределения; в коде НЕ ИСПОЛЬЗУЮТСЯ.
 NEW_LEAD_ADMIN_PHONE = os.getenv("NEW_LEAD_ADMIN_PHONE", "+7 702 728 3711").strip()
 NEW_LEAD_ADMIN_NAME = os.getenv("NEW_LEAD_ADMIN_NAME", "Данияр Биржанович Омаров").strip()
 
@@ -133,6 +135,36 @@ BRANCH_MANAGERS = {
     "online": ("Айгерим Аманжолқызы", "+7 775 254 2671"),
     "default": ("наш управляющий", "+7 708 174 7426"),
 }
+
+def _unique_branch_managers() -> List[tuple]:
+    """Все управляющие филиалов по одному разу (дедуп по номеру).
+
+    Несколько filial_id ведут на одного человека (напр. Айгерим — на 6 филиалах),
+    поэтому дедупим по телефону, чтобы не слать одному менеджеру одно и то же N раз.
+    """
+    seen = set()
+    recipients: List[tuple] = []
+    for mgr_name, mgr_phone in BRANCH_MANAGERS.values():
+        if mgr_phone and mgr_phone not in seen:
+            seen.add(mgr_phone)
+            recipients.append((mgr_name, mgr_phone))
+    return recipients
+
+
+def _new_lead_recipients(filial_id, matched_key: Optional[str] = None) -> List[tuple]:
+    """Кому слать уведомление о новом лиде: список (имя, телефон) управляющих.
+
+    Филиал известен → один управляющий этого филиала.
+    Филиал не определён (None / нет в карте) → все управляющие сразу, чтобы лид
+    точно подхватили (решение заказчика). НИКОГДА не возвращает номер бота —
+    раньше уведомления уходили на NEW_LEAD_ADMIN_PHONE (= номер самого бота).
+    """
+    if matched_key and matched_key in BRANCH_MANAGERS:
+        return [BRANCH_MANAGERS[matched_key]]
+    if filial_id is not None and filial_id in BRANCH_MANAGERS:
+        return [BRANCH_MANAGERS[filial_id]]
+    return _unique_branch_managers()
+
 
 FAILED_LEADS_FILE = os.getenv("FAILED_LEADS_FILE", "failed_leads.jsonl")
 
@@ -1563,8 +1595,8 @@ class MoyKlassCRM:
                          "status": status_code, "body": body[:500]},
                         "joins_failed_but_lead_created",
                     )
-                    await self.notify_new_lead_admin(
-                        NEW_LEAD_ADMIN_PHONE, NEW_LEAD_ADMIN_NAME, name=name, phone=clean_phone,
+                    await self.notify_new_lead_managers(
+                        filial_id, matched_key, name=name, phone=clean_phone,
                         age=age, experience=experience, preference=preference, wa_link=wa_link,
                     )
                     _mark_lead_notified(user_id)
@@ -1588,8 +1620,8 @@ class MoyKlassCRM:
             except Exception as e:
                 logger.warning(f"create_lead: задача не создана: {e}")
 
-            await self.notify_new_lead_admin(
-                NEW_LEAD_ADMIN_PHONE, NEW_LEAD_ADMIN_NAME, name=name, phone=clean_phone,
+            await self.notify_new_lead_managers(
+                filial_id, matched_key, name=name, phone=clean_phone,
                 age=age, experience=experience, preference=preference, wa_link=wa_link,
             )
             _mark_lead_notified(user_id)
@@ -1642,6 +1674,43 @@ class MoyKlassCRM:
             )
         except Exception as e:
             logger.error("notify_new_lead_admin: ошибка отправки %s: %s", chat_id, e)
+
+    async def notify_new_lead_managers(
+        self,
+        filial_id,
+        matched_key: Optional[str] = None,
+        *,
+        name: str,
+        phone: str,
+        age: str,
+        experience: str,
+        preference: str,
+        wa_link: str,
+        source: str = "Бот оформил заявку.",
+    ) -> None:
+        """Уведомить управляющего(их) филиала о новом лиде.
+
+        Раньше слалось на NEW_LEAD_ADMIN_PHONE (= номер бота), и заявки прилетали
+        самому боту. Теперь получатель — управляющий филиала по filial_id; если
+        филиал не определён — все управляющие сразу.
+        В тест-режиме (MOYKLASS_WEBHOOK_TEST_PHONE) шлём один раз на тест-номер.
+        """
+        recipients = _new_lead_recipients(filial_id, matched_key)
+        if not recipients:
+            logger.error("notify_new_lead_managers: пустой список получателей (лид=%r)", name)
+            return
+        if _webhook_test_mode_active():
+            recipients = recipients[:1]  # не дублируем на тест-номер N раз
+        logger.info(
+            "notify_new_lead_managers: лид=%r filial=%s -> %d получателей",
+            name, filial_id, len(recipients),
+        )
+        for mgr_name, mgr_phone in recipients:
+            await self.notify_new_lead_admin(
+                mgr_phone, mgr_name,
+                name=name, phone=phone, age=age, experience=experience,
+                preference=preference, wa_link=wa_link, source=source,
+            )
 
     async def _post_join_with_retry(self, client: httpx.AsyncClient, headers: dict, join_payload: dict):
         """POST /joins с авто-повторами:
@@ -2825,12 +2894,12 @@ async def handle_moyklass_webhook(secret: str, request: Request):
 
 
 async def _handle_new_lead_admin_notification(event: str, obj: dict) -> dict:
-    """Уведомление ЦЕНТРАЛЬНОМУ администратору о новом лиде В СИСТЕМЕ (MoyKlass-сценарий).
+    """Уведомление управляющему(им) филиала о новом лиде В СИСТЕМЕ (MoyKlass-сценарий).
 
     Покрывает лиды из любого источника (менеджер вручную, сайт, бот). Получатель —
-    один центральный администратор (NEW_LEAD_ADMIN_PHONE), не управляющий филиала.
-    Дедуп по userId: если этот лид только что создал бот и уже уведомил администратора
-    напрямую из create_lead — повторно не шлём (защита от двойного уведомления).
+    управляющий филиала лида (по filial_id); если филиал не определён — все
+    управляющие сразу. Дедуп по userId: если этот лид только что создал бот и уже
+    уведомил управляющего из create_lead — повторно не шлём.
     """
     user_id = obj.get("userId")
     if user_id is not None and _lead_already_notified(int(user_id)):
@@ -2854,11 +2923,11 @@ async def _handle_new_lead_admin_notification(event: str, obj: dict) -> dict:
     wa_link = f"https://wa.me/{re.sub(r'[^0-9]', '', phone)}" if phone else "-"
 
     logger.info(
-        "moyklass-webhook-employee: new-lead userId=%s filial=%s -> админ %r",
-        user_id, filial_id, NEW_LEAD_ADMIN_NAME,
+        "moyklass-webhook-employee: new-lead userId=%s filial=%s -> управляющий(е) филиала",
+        user_id, filial_id,
     )
-    await crm.notify_new_lead_admin(
-        NEW_LEAD_ADMIN_PHONE, NEW_LEAD_ADMIN_NAME,
+    await crm.notify_new_lead_managers(
+        filial_id,
         name=name, phone=phone or "-", age="-", experience="-",
         preference=str(filial_id) if filial_id is not None else "-",
         wa_link=wa_link,
@@ -3030,9 +3099,9 @@ async def _poll_new_leads_once() -> None:
             filials = u.get("filials") or []
             filial_id = filials[0] if filials else None
             wa_link = f"https://wa.me/{re.sub(r'[^0-9]', '', phone)}" if phone else "-"
-            logger.info("lead-poll: новый лид userId=%s name=%r -> админ", uid, u.get("name"))
-            await crm.notify_new_lead_admin(
-                NEW_LEAD_ADMIN_PHONE, NEW_LEAD_ADMIN_NAME,
+            logger.info("lead-poll: новый лид userId=%s name=%r -> управляющий(е) филиала", uid, u.get("name"))
+            await crm.notify_new_lead_managers(
+                filial_id,
                 name=u.get("name") or "-", phone=phone or "-", age="-", experience="-",
                 preference=str(filial_id) if filial_id is not None else "-",
                 wa_link=wa_link, source="Новый лид в CRM.",

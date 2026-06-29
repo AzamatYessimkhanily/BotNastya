@@ -374,14 +374,16 @@ def main() -> int:
         asyncio.run(bot._handle_new_lead_admin_notification("join_new", {"userId": 999}))
         check("dedup: повторно НЕ уведомляем", len(calls) == 0)
 
-        # Лид не от бота → уведомляем ЦЕНТРАЛЬНОГО админа, source = CRM
+        # Лид не от бота, филиал 37754 → уведомляем УПРАВЛЯЮЩЕГО этого филиала, source = CRM
         bot._notified_lead_users.clear()
         asyncio.run(bot._handle_new_lead_admin_notification("join_new", {"userId": 1001}))
         check("новый лид -> 1 уведомление", len(calls) == 1)
-        check("получатель = центральный админ (phone)",
-              calls[0].get("admin_phone") == bot.NEW_LEAD_ADMIN_PHONE)
-        check("получатель = центральный админ (name)",
-              calls[0].get("admin_name") == bot.NEW_LEAD_ADMIN_NAME)
+        check("получатель = управляющий филиала 37754 (phone)",
+              calls[0].get("admin_phone") == bot.BRANCH_MANAGERS[37754][1])
+        check("получатель = управляющий филиала 37754 (name)",
+              calls[0].get("admin_name") == bot.BRANCH_MANAGERS[37754][0])
+        check("получатель НЕ номер бота",
+              calls[0].get("admin_phone") != bot.NEW_LEAD_ADMIN_PHONE)
         check("source = Новый лид в CRM", calls[0].get("source") == "Новый лид в CRM.")
         check("имя из CRM", calls[0].get("name") == "Иван")
         check("после вебхука лид помечен", bot._lead_already_notified(1001))
@@ -422,8 +424,10 @@ def main() -> int:
         bot._fetch_recent_lead_users = _f_new
         asyncio.run(bot._poll_new_leads_once())
         check("poll: новый лид -> 1 уведомление", len(poll_calls) == 1)
-        check("poll: получатель = центральный админ",
-              poll_calls[0].get("admin_phone") == bot.NEW_LEAD_ADMIN_PHONE)
+        check("poll: получатель = управляющий филиала 37754",
+              poll_calls[0].get("admin_phone") == bot.BRANCH_MANAGERS[37754][1])
+        check("poll: получатель НЕ номер бота",
+              poll_calls[0].get("admin_phone") != bot.NEW_LEAD_ADMIN_PHONE)
         check("poll: watermark сдвинут", bot._lead_poll_watermark == 103)
 
         # 3) Лид, созданный ботом (уже помечен), не дублируется
