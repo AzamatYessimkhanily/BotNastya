@@ -820,6 +820,22 @@ class MoyKlassCRM:
             return BRANCH_MANAGERS[filial_id]
         return BRANCH_MANAGERS["default"]
 
+    async def get_client_admin_phone(self, user_id: Optional[int]) -> str:
+        """Телефон администратора филиала клиента (BRANCH_PHONES по filial_id).
+
+        Для клиентских уведомлений: номер должен быть админа того филиала, где
+        учится клиент. Филиал берём из user.filials (как в lead-poll); если не
+        нашли — общий номер (BRANCH_PHONES['default']).
+        """
+        filial_id = None
+        if user_id is not None:
+            user = await self.get_user_by_id(int(user_id))
+            if user:
+                filials = user.get("filials") or []
+                if filials:
+                    filial_id = filials[0]
+        return self._pick_manager_phone(filial_id, None)
+
     @staticmethod
     def _handoff_message(mgr_name: str, mgr_phone: str, *, success: bool) -> str:
         """Единое сообщение для модели после попытки оформить заявку.
@@ -2377,7 +2393,7 @@ def _safe_format(template: str, mapping: dict) -> str:
     except (IndexError, ValueError):
         text = template
     # Подчищаем артефакты вида "заканчивается ." когда поле было пустым.
-    text = re.sub(r"\s+([.,;:])", r"\1", text)
+    text = re.sub(r"\s+([.,;:!?])", r"\1", text)
     text = re.sub(r"\s{2,}", " ", text)
     return text.strip()
 
@@ -2392,7 +2408,7 @@ _NOTIFICATION_TEMPLATES = {
     "payment_new": "Здравствуйте. Оплата получена — спасибо. Если есть вопросы, пишите.",
     "sub_end_days": "Здравствуйте. Напоминаем: абонемент заканчивается {endDate}. Чтобы продолжить занятия, обратитесь к управляющему вашего филиала.",
     "sub_days_next_payment": "Здравствуйте. Напоминаем о предстоящем платеже по абонементу. Уточните детали у управляющего вашего филиала.",
-    "sub_lesson_in_debt": "Здравствуйте. Занятие проведено, но баланс недостаточен — оно засчитано в долг. Пожалуйста, пополните баланс.",
+    "sub_lesson_in_debt": "Занятие проведено в долг. Для оплаты свяжитесь с администратором {admin_phone}",
     "sub_lessons_left": "Здравствуйте. В абонементе осталось мало занятий. Свяжитесь с управляющим для продления.",
     "lesson_start": "Здравствуйте. Напоминаем: сегодня занятие в {beginTime}. Ждём вас.",
     "lesson_start_hours": "Здравствуйте. Напоминаем: сегодня занятие в {beginTime}. Ждём вас.",
@@ -2401,9 +2417,13 @@ _NOTIFICATION_TEMPLATES = {
     "class_start_days": "Здравствуйте. Напоминаем: ваша группа стартует {beginDate}. Если есть вопросы, напишите нам.",
     "lesson_mark_set": "Здравствуйте. Преподаватель выставил оценку за {type_text}: {value}.",
     "join_new": "Здравствуйте. Ваша заявка на обучение получена. Управляющий свяжется с вами в ближайшее время.",
-    "user_consecutive_visit_missed_2": "Здравствуйте. Заметили, что занятия пропускаются. Если возникли трудности — напишите, мы готовы помочь.",
-    "user_birthday": "Здравствуйте. Поздравляем с днём рождения! Желаем успехов в шахматах.",
+    "user_consecutive_visit_missed_2": "Ученик отсутствует на уроке или тренер забыл отметить его в журнале. Свяжитесь с тренером {admin_phone}",
+    "user_birthday": "Поздравляем с днём рождения {userName}! Желаем успехов и великих побед по жизни! 🥇♟️",
 }
+
+# Клиентские события, в шаблон которых подставляется телефон администратора
+# филиала клиента ({admin_phone} = BRANCH_PHONES[filial_id]).
+_CLIENT_ADMIN_PHONE_EVENTS = frozenset({"sub_lesson_in_debt", "user_consecutive_visit_missed_2"})
 
 
 def build_new_lead_admin_message(
@@ -2872,6 +2892,17 @@ async def handle_moyklass_webhook(secret: str, request: Request):
                 obj.get("lessonId"),
             )
             return {"status": "ok"}
+
+        # Подставляем телефон администратора филиала клиента и имя ученика —
+        # только для событий, чьи шаблоны это используют (минимум лишних API-вызовов,
+        # после kill-switch/stale-проверок).
+        if event in _CLIENT_ADMIN_PHONE_EVENTS and not obj.get("admin_phone"):
+            obj["admin_phone"] = await crm.get_client_admin_phone(obj.get("userId"))
+        if event == "user_birthday" and not (obj.get("userName") or obj.get("name")):
+            if obj.get("userId") is not None:
+                bday_user = await crm.get_user_by_id(int(obj["userId"]))
+                if bday_user and bday_user.get("name"):
+                    obj["userName"] = bday_user["name"]
 
         message = build_notification_message(event, obj)
         if not message:

@@ -237,6 +237,24 @@ def main() -> int:
     check("birthday requires client filter", "user_birthday" in bot._EVENTS_REQUIRE_ACTIVE_CLIENT)
     check("join_new exempt from client filter", "join_new" not in bot._EVENTS_REQUIRE_ACTIVE_CLIENT)
 
+    # Клиентские шаблоны: телефон администратора филиала + имя ученика
+    cli_debt = bot.build_notification_message("sub_lesson_in_debt", {"admin_phone": "+7 771 231 4549"})
+    check("client debt: текст + админ-номер",
+          cli_debt == "Занятие проведено в долг. Для оплаты свяжитесь с администратором +7 771 231 4549")
+    cli_missed = bot.build_notification_message(
+        "user_consecutive_visit_missed_2", {"admin_phone": "+7 778 104 8197"})
+    check("client missed: текст + админ-номер",
+          cli_missed and "тренер забыл отметить" in cli_missed and "+7 778 104 8197" in cli_missed)
+    cli_bday = bot.build_notification_message("user_birthday", {"userName": "Алибек"})
+    check("client birthday: имя + поздравление",
+          cli_bday and "Алибек" in cli_bday and "великих побед" in cli_bday)
+    cli_bday_noname = bot.build_notification_message("user_birthday", {})
+    check("client birthday без имени: нет висячего пробела перед !",
+          cli_bday_noname and "рождения! " in cli_bday_noname)
+    check("client admin-phone events заданы",
+          "sub_lesson_in_debt" in bot._CLIENT_ADMIN_PHONE_EVENTS
+          and "user_consecutive_visit_missed_2" in bot._CLIENT_ADMIN_PHONE_EVENTS)
+
     print("=== smoke: mailing safety M1/M2/M4 ===")
     import asyncio
 
