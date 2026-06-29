@@ -57,6 +57,13 @@ _NEW_LEAD_ADMIN_EVENTS = frozenset(
 NEW_LEAD_ADMIN_PHONE = os.getenv("NEW_LEAD_ADMIN_PHONE", "+7 702 728 3711").strip()
 NEW_LEAD_ADMIN_NAME = os.getenv("NEW_LEAD_ADMIN_NAME", "Данияр Биржанович Омаров").strip()
 
+# lesson_changed (уведомление сотрудникам об изменении расписания): по умолчанию ВКЛ,
+# но шлём ТОЛЬКО изменения на сегодня/будущее. Прошедшие и без даты — ПРОПУСК: при
+# массовых правках/ресинке расписания MoyKlass проигрывает всю историю занятий и
+# спамит тренеров событиями за прошлые годы. Полностью выключить: LESSON_CHANGED_NOTIFY_ENABLED=0.
+_LESSON_CHANGED_ENV = os.getenv("LESSON_CHANGED_NOTIFY_ENABLED", "1").strip().lower()
+LESSON_CHANGED_NOTIFY_ENABLED = _LESSON_CHANGED_ENV in ("1", "true", "yes", "on")
+
 # Фоновый опрос новых лидов в MoyKlass БЕЗ сценариев/вебхуков (бот сам периодически
 # смотрит GET /users). По умолчанию ВЫКЛ — включить LEAD_POLL_ENABLED=1.
 _LEAD_POLL_ENABLED_ENV = os.getenv("LEAD_POLL_ENABLED", "0").strip().lower()
@@ -2763,6 +2770,12 @@ def _should_skip_stale_client_webhook(data: dict, event: str, obj: dict) -> bool
     if event in _SCHEDULED_REMINDER_EVENTS and _scheduled_event_is_past(obj, event):
         return True
 
+    # lesson_changed по прошедшей/без даты — пропуск (анти-спам исторического backfill).
+    if event == "lesson_changed":
+        lesson_date = _parse_schedule_date(obj.get("date") or obj.get("beginDate") or "")
+        if lesson_date is None or lesson_date < datetime.now(_SCHOOL_TZ).date():
+            return True
+
     return False
 
 
@@ -2979,6 +2992,24 @@ async def handle_moyklass_webhook_employee(secret: str, request: Request):
             return {"status": "ok"}
 
         event = data.get("event")
+
+        # АНТИ-СПАМ lesson_changed: MoyKlass при bulk-правках/ресинке расписания
+        # проигрывает изменения по всей истории занятий (тысячи событий за прошлые
+        # годы) и спамит тренеров. Шлём только изменения на сегодня/будущее;
+        # прошедшие и без даты — пропуск ДО enrich (чтобы ретраи не били по API).
+        if event == "lesson_changed":
+            raw_obj = data.get("object") or {}
+            if not LESSON_CHANGED_NOTIFY_ENABLED:
+                logger.info("moyklass-webhook-employee: lesson_changed отключён (env) — пропуск")
+                return {"status": "ok"}
+            ld = _parse_schedule_date(raw_obj.get("date") or raw_obj.get("beginDate") or "")
+            if ld is None or ld < datetime.now(_SCHOOL_TZ).date():
+                logger.info(
+                    "moyklass-webhook-employee: lesson_changed дата=%r прошлая/без даты — пропуск (анти-спам бэклога)",
+                    raw_obj.get("date") or raw_obj.get("beginDate"),
+                )
+                return {"status": "ok"}
+
         obj = await crm.enrich_webhook_object_context(data.get("object") or {})
         init = data.get("init") or {}
         logger.info(
