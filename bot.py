@@ -615,9 +615,16 @@ def _lead_already_notified(user_id) -> bool:
     return True
 
 
-# Дедуп CRM-уведомлений, которые MoyKlass может слать повторно (напр. user_birthday
-# каждую минуту, пока условие сценария истинно). Ключ: event:userId:дата:телефон.
-_CRM_DEDUP_EVENTS = frozenset({"user_birthday"})
+# Универсальный дедуп CRM-уведомлений: одно и то же событие одному получателю не
+# уходит дважды за день. Защищает от повторных срабатываний сценариев MoyKlass
+# (напр. user_birthday шлётся каждую минуту, пока условие истинно) и от случайных
+# дублей. Ключ: event:userId:дата:телефон[:сущность].
+#
+# «Сущность» (lessonId/classId/paymentId/…) добавляется, когда событие относится к
+# конкретному объекту, чтобы РАЗНЫЕ объекты одного типа за день не схлопывались в
+# один (два разных занятия у ученика → шлём оба; повтор одного и того же — гасим).
+# Дата держится на позиции [2] — этого ждёт _load_crm_sent_state и старые ключи.
+_CRM_DEDUP_DISCRIMINATOR_FIELDS = ("lessonId", "classId", "paymentId", "invoiceId", "id")
 _crm_sent_keys: set = set()
 
 
@@ -625,13 +632,30 @@ def _crm_dedup_today() -> str:
     return datetime.now(_SCHOOL_TZ).strftime("%Y-%m-%d")
 
 
-def _crm_dedup_key(event: Optional[str], user_id, phone: str) -> Optional[str]:
-    if event not in _CRM_DEDUP_EVENTS or user_id is None:
+def _crm_dedup_discriminator(obj: Optional[dict]) -> str:
+    if not obj:
+        return ""
+    for field in _CRM_DEDUP_DISCRIMINATOR_FIELDS:
+        value = obj.get(field)
+        if value is not None:
+            return f"{field}={value}"
+    return ""
+
+
+def _crm_dedup_key(
+    event: Optional[str], user_id, phone: str, obj: Optional[dict] = None
+) -> Optional[str]:
+    if not event:
         return None
     phone_norm = re.sub(r"[^0-9]", "", phone or "")
     if not phone_norm:
         return None
-    return f"{event}:{int(user_id)}:{_crm_dedup_today()}:{phone_norm}"
+    uid = int(user_id) if user_id is not None else "-"
+    parts = [event, str(uid), _crm_dedup_today(), phone_norm]
+    discriminator = _crm_dedup_discriminator(obj)
+    if discriminator:
+        parts.append(discriminator)
+    return ":".join(parts)
 
 
 def _crm_already_sent(key: str) -> bool:
@@ -2817,7 +2841,7 @@ async def _dispatch_moyklass_webhook(
 
     user_id = obj.get("userId")
     for phone in phones:
-        dedup_key = _crm_dedup_key(event, user_id, phone)
+        dedup_key = _crm_dedup_key(event, user_id, phone, obj)
         if dedup_key and _crm_already_sent(dedup_key):
             logger.info(
                 "%s: event=%s userId=%s phone=%s — уже отправляли сегодня, пропуск (dedup)",
