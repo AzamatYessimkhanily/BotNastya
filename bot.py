@@ -521,12 +521,15 @@ GM Legends — после уроков или до уроков (2 смена).
 → Одна попытка. Если отказывается — прими и попрощайся.
 
 ═══════════════════════════════════════
-QOSYMSHA / DAMUBALA
+QOSYMSHA / DAMUBALA / БЕСПЛАТНОЕ ОБУЧЕНИЕ
 ═══════════════════════════════════════
-Если клиент спрашивает про Qosymsha, Дамубала, «дамубала», «қосымша», «бесплатно от государства»:
-→ Кратко: это программа льготного/бесплатного обучения за счёт государства для подходящих категорий.
-→ Точные условия, документы и запись — только у управляющего (GMCA Аркада или Камал).
-→ Не обещай участие. Предложи оставить заявку или обратиться к управляющему напрямую.
+Если клиент спрашивает про Qosymsha, «қосымша», «косымша», Дамубала, «дамубала», ваучер, «бесплатно от государства» или бесплатное обучение — используй этот текст (адаптируй под язык клиента, смысл сохраняй):
+
+«Программа «Қосымша» — это государственная программа, которая предоставляет детям возможность бесплатно посещать кружки и секции.
+
+Чтобы получить ваучер, необходимо зарегистрироваться на сайте программы (https://qosymsha.kz) и встать в очередь. Когда подойдет ваша очередь, вам выдадут ваучер, с которым можно записаться на бесплатные занятия в нашем центре.»
+
+→ Не обещай гарантированное участие или сроки очереди. За точными условиями и документами — к управляющему филиала.
 
 ═══════════════════════════════════════
 ОБЩАЯ ИНФОРМАЦИЯ О КОМПАНИИ
@@ -548,6 +551,8 @@ GM Legends — школьный кружок (от нуля до 2 разряд�
 3. Если есть ближайший урок — скажи: "Ждём вас [дата/время] на уроке с [преподаватель]."
 4. Если данных нет: "Пока не вижу информации о занятиях — уточним у менеджера."
 5. Вопросы по оплате/переносу → контакт управляющего их филиала.
+6. Если действующий ученик просит связаться / перезвонить / соединить с управляющим, либо у него жалоба или вопрос, требующий человека (оплата, перенос, конфликт) — вызови функцию request_manager_callback. Управляющему филиала уйдёт номер клиента и пометка «клиент просит связаться». Затем подтверди клиенту, что управляющий свяжется в ближайшее время.
+ВАЖНО: для действующего ученика НЕ вызывай register_client_request (это только для новых лидов) — используй request_manager_callback.
 
 ═══════════════════════════════════════
 ТЕХНИЧЕСКОЕ — ПРАВИЛА ВЫЗОВА register_client_request
@@ -571,6 +576,8 @@ openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 chat_history: Dict[str, List[Dict]] = {}
 message_buffers: Dict[str, Dict] = {}
 known_users: Dict[str, dict] = {}
+# Досье действующего ученика по chat_id (имя, филиал и т.д.) — для request_manager_callback.
+client_dossiers: Dict[str, dict] = {}
 last_activity: Dict[str, float] = {}
 # Чат, где заявка уже передана управляющему — не повторять handoff на «хорошо/спасибо»
 handoff_completed: Dict[str, float] = {}
@@ -1759,6 +1766,69 @@ class MoyKlassCRM:
                 preference=preference, wa_link=wa_link, source=source,
             )
 
+    async def notify_client_callback_request(
+        self,
+        *,
+        client_name: str,
+        client_phone: str,
+        filial_id=None,
+        reason: str = "",
+    ) -> str:
+        """Действующий клиент просит связаться → уведомить управляющего его филиала.
+
+        Управляющему уходит номер клиента и текст «клиент просит связаться».
+        Возвращает СИСТЕМНОЕ СООБЩЕНИЕ для модели (с MGR_NAME/MGR_PHONE), чтобы она
+        подтвердила клиенту передачу. Филиал неизвестен → все управляющие сразу.
+        В тест-режиме уходит только на тест-номер с префиксом [ТЕСТ CRM].
+        """
+        recipients = _new_lead_recipients(filial_id)
+        if _webhook_test_mode_active():
+            recipients = recipients[:1]
+
+        clean = re.sub(r"[^0-9]", "", client_phone or "")
+        wa_link = f"https://wa.me/{clean}" if clean else "-"
+        comment = f"\nКомментарий: {reason.strip()}" if reason and reason.strip() else ""
+        body = (
+            "🔔 Клиент просит связаться\n"
+            f"Имя: {client_name or 'Клиент'}\n"
+            f"Телефон: {client_phone or '-'}\n"
+            f"WhatsApp: {wa_link}{comment}"
+        )
+
+        sent = 0
+        for mgr_name, mgr_phone in recipients:
+            target_phone = MOYKLASS_WEBHOOK_TEST_PHONE if _webhook_test_mode_active() else mgr_phone
+            cid = phone_to_chat_id(target_phone)
+            if not cid:
+                logger.warning("callback: не удалось нормализовать номер управляющего %r", target_phone)
+                continue
+            prefix = "[ТЕСТ CRM] " if _webhook_test_mode_active() else ""
+            try:
+                await send_whatsapp(cid, prefix + body, sanitize=False)
+                sent += 1
+                logger.info(
+                    "callback: отправлено управляющему %s (клиент=%r, тел=%s)",
+                    cid, client_name, client_phone,
+                )
+            except Exception as e:
+                logger.error("callback: ошибка отправки управляющему %s: %s", cid, e)
+
+        if sent == 0:
+            logger.error(
+                "callback: не удалось уведомить ни одного управляющего (клиент=%r, тел=%s)",
+                client_name, client_phone,
+            )
+
+        mgr_name, mgr_phone = self._pick_manager_info(filial_id, None)
+        return (
+            "СИСТЕМНОЕ СООБЩЕНИЕ: ЗАПРОС НА СВЯЗЬ ПЕРЕДАН УПРАВЛЯЮЩЕМУ.\n"
+            f"MGR_NAME={mgr_name}\n"
+            f"MGR_PHONE={mgr_phone}\n"
+            "ИНСТРУКЦИЯ: ответь клиенту одним коротким сообщением на его языке — "
+            "управляющий свяжется с ним в ближайшее время. При необходимости дай контакт "
+            "из MGR_PHONE как backup. НЕ упоминай никаких ошибок или технических проблем."
+        )
+
     async def _post_join_with_retry(self, client: httpx.AsyncClient, headers: dict, join_payload: dict):
         """POST /joins с авто-повторами:
         - 401/403 → обновить токен и повторить
@@ -1825,6 +1895,29 @@ tools = [
                     "preference": {"type": "string", "description": "Выбранный филиал или формат обучения"}
                 },
                 "required": ["client_name", "client_phone", "client_age", "experience", "preference"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "request_manager_callback",
+            "description": (
+                "Только для ДЕЙСТВУЮЩЕГО ученика (в диалоге есть [СИСТЕМНОЕ ДОСЬЕ КЛИЕНТА]), "
+                "который просит связаться, перезвонить или соединить с управляющим, либо "
+                "у него жалоба/вопрос по оплате/переносу. Отправляет управляющему филиала "
+                "номер клиента и текст «клиент просит связаться». "
+                "НЕ используй для новых клиентов и лидов — для них register_client_request."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Кратко: по какому вопросу клиент просит связаться (необязательно)"
+                    }
+                },
+                "required": []
             }
         }
     }
@@ -2078,6 +2171,7 @@ async def process_dialog(chat_id):
                 logger.info(f"Сброс памяти для {chat_id}")
                 chat_history.pop(chat_id, None)
                 known_users.pop(chat_id, None)
+                client_dossiers.pop(chat_id, None)
                 handoff_completed.pop(chat_id, None)
         last_activity[chat_id] = current_time
 
@@ -2102,6 +2196,7 @@ async def process_dialog(chat_id):
                     user_obj = found["user"]
                     dossier = found["dossier"]
                     known_users[chat_id] = user_obj
+                    client_dossiers[chat_id] = dossier
 
                     mgr_contact = ""
                     if dossier["filial_id"] and dossier["filial_id"] in BRANCH_PHONES:
@@ -2194,6 +2289,27 @@ async def process_dialog(chat_id):
                             logger.error(f"create_lead неожиданно упал: {e}")
                             mgr_name, mgr_phone = crm._pick_manager_info("default", None)
                             result_text = crm._handoff_message(mgr_name, mgr_phone, success=False)
+                    elif tool.function.name == "request_manager_callback":
+                        dossier = client_dossiers.get(chat_id) or {}
+                        client_phone = chat_id.split("@")[0]
+                        client_name = dossier.get("name") or "Клиент"
+                        filial_id = dossier.get("filial_id")
+                        try:
+                            result_text = await crm.notify_client_callback_request(
+                                client_name=client_name,
+                                client_phone=client_phone,
+                                filial_id=filial_id,
+                                reason=args.get("reason", ""),
+                            )
+                        except Exception as e:
+                            logger.error(f"request_manager_callback неожиданно упал: {e}")
+                            mgr_name, mgr_phone = crm._pick_manager_info(filial_id, None)
+                            result_text = (
+                                "СИСТЕМНОЕ СООБЩЕНИЕ: ЗАПРОС НА СВЯЗЬ ЗАФИКСИРОВАН.\n"
+                                f"MGR_NAME={mgr_name}\n"
+                                f"MGR_PHONE={mgr_phone}\n"
+                                "ИНСТРУКЦИЯ: подтверди клиенту, что управляющий свяжется в ближайшее время."
+                            )
                     else:
                         logger.warning(
                             f"Неизвестный tool-call {tool.function.name!r} — отвечаю нейтрально"
