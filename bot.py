@@ -586,6 +586,17 @@ known_users: Dict[str, dict] = {}
 # Досье действующего ученика по chat_id (имя, филиал и т.д.) — для request_manager_callback.
 client_dossiers: Dict[str, dict] = {}
 last_activity: Dict[str, float] = {}
+
+# Анти-зацикливание на вопросе об имени ребёнка: детектим, что бот УЖЕ спрашивал имя,
+# и жёстко запрещаем переспрашивать (модель одним промптом это правило игнорирует).
+_NAME_ASK_RE = re.compile(r"как\s+зовут|зовут\s+ваш|имя\s+ваш|имя\s+реб", re.IGNORECASE)
+_NAME_GUARD_DIRECTIVE = (
+    "СИСТЕМНОЕ: Имя ребёнка/клиента уже запрашивалось в этом диалоге. "
+    "НЕ спрашивай имя снова ни при каких условиях. Если в последнем сообщении клиент "
+    "назвал имя — используй его и вызови register_client_request. Если имя так и не названо — "
+    "НЕМЕДЛЕННО вызови register_client_request с client_name='не указано' "
+    "(телефон известен из чата, управляющий уточнит). Повторный вопрос об имени ЗАПРЕЩЁН."
+)
 # Чат, где заявка уже передана управляющему — не повторять handoff на «хорошо/спасибо»
 handoff_completed: Dict[str, float] = {}
 # Защита от повторной доставки одного и того же входящего (Green API) и гонок при обработке
@@ -2244,6 +2255,21 @@ async def process_dialog(chat_id):
             handoff_completed.pop(chat_id, None)
 
         chat_history[chat_id].append({"role": "user", "content": user_payload})
+
+        # Детерминированная защита от зацикливания на имени: если бот уже спрашивал имя,
+        # вставляем жёсткую директиву — переспрашивать нельзя, надо оформлять заявку.
+        _already_asked_name = any(
+            isinstance(m, dict) and m.get("role") == "assistant"
+            and isinstance(m.get("content"), str) and _NAME_ASK_RE.search(m["content"])
+            for m in chat_history[chat_id]
+        )
+        _name_guard_present = any(
+            isinstance(m, dict) and m.get("role") == "system"
+            and m.get("content") == _NAME_GUARD_DIRECTIVE
+            for m in chat_history[chat_id]
+        )
+        if _already_asked_name and not _name_guard_present:
+            chat_history[chat_id].append({"role": "system", "content": _NAME_GUARD_DIRECTIVE})
 
         try:
             response = await openai_client.chat.completions.create(
