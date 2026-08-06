@@ -95,6 +95,24 @@ LEAD_CLASS_ID = int(os.getenv("LEAD_CLASS_ID", "341820"))
 MANAGER_ID = int(os.getenv("MANAGER_ID", "98753"))
 SESSION_TIMEOUT = 5 * 60 * 60
 
+# --- Авто-реактивация «спящих» лидов ---
+# Если диалог с потенциальным клиентом не дошёл до логического завершения
+# (не записался и не отказался) и клиент замолчал — бот сам напоминает о себе:
+#   1) через FOLLOWUP_SILENCE_SECONDS молчания (по умолчанию 2 часа);
+#   2) на следующий день в FOLLOWUP_NEXT_DAY_HOUR:00 (по умолчанию 12:00).
+# Действующим ученикам и тем, кто записался/отказался, реактивация НЕ шлётся.
+FOLLOWUP_ENABLED = os.getenv("FOLLOWUP_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+FOLLOWUP_SILENCE_SECONDS = int(os.getenv("FOLLOWUP_SILENCE_SECONDS", "7200") or "7200")
+FOLLOWUP_NEXT_DAY_HOUR = int(os.getenv("FOLLOWUP_NEXT_DAY_HOUR", "12") or "12")
+FOLLOWUP_CHECK_INTERVAL = int(os.getenv("FOLLOWUP_CHECK_INTERVAL", "300") or "300")  # как часто проверять
+# Тихие часы: follow-up «через 2 часа» не шлём ночью, откладываем до утра.
+FOLLOWUP_QUIET_START = int(os.getenv("FOLLOWUP_QUIET_START", "21") or "21")  # с 21:00
+FOLLOWUP_QUIET_END = int(os.getenv("FOLLOWUP_QUIET_END", "9") or "9")        # до 09:00
+FOLLOWUP_MESSAGE = os.getenv("FOLLOWUP_MESSAGE", "").strip() or (
+    "Вы ранее интересовались развитием интеллекта через шахматы, но так и не записались к нам. "
+    "Подскажите, ваш запрос ещё актуален?"
+)
+
 # Опциональный statusId для POST /joins. Если не задан — поле не отправляем,
 # MoyKlass сам подставит дефолтный начальный статус. Раньше было хардкод 1,
 # но в этом кабинете statusId=1 стал «end status» (Закрыт/Архив),
@@ -599,6 +617,16 @@ _NAME_GUARD_DIRECTIVE = (
 )
 # Чат, где заявка уже передана управляющему — не повторять handoff на «хорошо/спасибо»
 handoff_completed: Dict[str, float] = {}
+# Авто-реактивация: chat_id -> {"last_client_ts": float, "stage": int}.
+# stage: 0 — ещё не напоминали, 1 — отправлен follow-up «через 2 часа»,
+#        2 — отправлен follow-up «на следующий день в 12:00» (цепочка завершена).
+followups: Dict[str, dict] = {}
+# Явный отказ клиента = логическое завершение → реактивацию НЕ шлём.
+_FOLLOWUP_REFUSAL_RE = re.compile(
+    r"не\s+интерес|неинтерес|не\s+надо|не\s+нужн|не\s+буд|не\s+хоч|передума|"
+    r"отказ|отстань|не\s+пишите|спам|уже\s+не\s+актуал|больше\s+не\s+пиш",
+    re.IGNORECASE,
+)
 # Защита от повторной доставки одного и того же входящего (Green API) и гонок при обработке
 seen_incoming_ids: Dict[str, deque] = defaultdict(lambda: deque(maxlen=400))
 _dialog_locks: Dict[str, asyncio.Lock] = {}
@@ -2096,6 +2124,8 @@ def _repair_dangling_tool_calls(chat_id: str) -> None:
 
 def _mark_handoff_completed(chat_id: str) -> None:
     handoff_completed[chat_id] = time.time()
+    # Заявка передана управляющему = логическое завершение → снимаем с реактивации.
+    followups.pop(chat_id, None)
     if chat_id not in chat_history:
         return
     recent = chat_history[chat_id][-4:]
@@ -2110,6 +2140,28 @@ def _mark_handoff_completed(chat_id: str) -> None:
             "Если клиент задаёт новый вопрос — отвечай по существу."
         ),
     })
+
+
+def _update_followup_tracking(chat_id: str, user_text: str) -> None:
+    """Обновляет план авто-реактивации по входящему сообщению клиента.
+
+    Ставит/сбрасывает таймер напоминания. Действующих учеников (есть досье) и тех,
+    кто явно отказался, снимаем — им реактивация не нужна. Запись = логическое
+    завершение обрабатывается отдельно в _mark_handoff_completed.
+    """
+    if not FOLLOWUP_ENABLED:
+        return
+    # Действующий ученик — «так и не записались» к нему неприменимо.
+    if chat_id in known_users:
+        followups.pop(chat_id, None)
+        return
+    if _FOLLOWUP_REFUSAL_RE.search(user_text or ""):
+        if chat_id in followups:
+            logger.info("followup: %s — клиент отказался, снимаем с реактивации", chat_id)
+        followups.pop(chat_id, None)
+        return
+    # Клиент активен: (пере)ставим таймер, цепочку напоминаний начинаем заново.
+    followups[chat_id] = {"last_client_ts": time.time(), "stage": 0}
 
 
 def sanitize_bot_outgoing(text: Optional[str], *, fallback: str = "handoff") -> str:
@@ -2255,6 +2307,9 @@ async def process_dialog(chat_id):
             handoff_completed.pop(chat_id, None)
 
         chat_history[chat_id].append({"role": "user", "content": user_payload})
+
+        # План авто-реактивации: клиент написал — (пере)ставим таймер напоминаний.
+        _update_followup_tracking(chat_id, user_text)
 
         # Детерминированная защита от зацикливания на имени: если бот уже спрашивал имя,
         # вставляем жёсткую директиву — переспрашивать нельзя, надо оформлять заявку.
@@ -3369,3 +3424,87 @@ async def _start_lead_poller() -> None:
         return
     _load_lead_poll_state()
     asyncio.create_task(_lead_poll_loop())
+
+
+# --- 10. АВТО-РЕАКТИВАЦИЯ «СПЯЩИХ» ЛИДОВ ---
+def _followup_in_quiet_hours(now_local: datetime) -> bool:
+    """Тихие часы — follow-up «через 2 часа» откладываем (ночью не пишем)."""
+    if FOLLOWUP_QUIET_START == FOLLOWUP_QUIET_END:
+        return False
+    h = now_local.hour
+    if FOLLOWUP_QUIET_START < FOLLOWUP_QUIET_END:
+        return FOLLOWUP_QUIET_START <= h < FOLLOWUP_QUIET_END
+    # Окно через полночь (напр. 21:00–09:00).
+    return h >= FOLLOWUP_QUIET_START or h < FOLLOWUP_QUIET_END
+
+
+def _followup_noon_reached(last_ts: float, now_local: datetime) -> bool:
+    """Наступил ли СЛЕДУЮЩИЙ календарный день и время >= FOLLOWUP_NEXT_DAY_HOUR."""
+    last_local = datetime.fromtimestamp(last_ts, _SCHOOL_TZ)
+    target_day = last_local.date() + timedelta(days=1)
+    target = datetime(
+        target_day.year, target_day.month, target_day.day,
+        FOLLOWUP_NEXT_DAY_HOUR, 0, 0, tzinfo=_SCHOOL_TZ,
+    )
+    return now_local >= target
+
+
+async def _send_followup_message(chat_id: str) -> bool:
+    ok = await send_whatsapp(chat_id, FOLLOWUP_MESSAGE, sanitize=False)
+    if ok and chat_id in chat_history:
+        chat_history[chat_id].append({"role": "assistant", "content": FOLLOWUP_MESSAGE})
+    return ok
+
+
+async def _followup_tick() -> None:
+    now = time.time()
+    now_local = datetime.now(_SCHOOL_TZ)
+    quiet = _followup_in_quiet_hours(now_local)
+    for chat_id, st in list(followups.items()):
+        # Действующий ученик или уже завершённая заявка — снимаем.
+        if chat_id in known_users or chat_id in handoff_completed:
+            followups.pop(chat_id, None)
+            continue
+        last_ts = st.get("last_client_ts", now)
+        stage = st.get("stage", 0)
+        silence = now - last_ts
+
+        # Follow-up #2: на следующий день в 12:00 — завершает цепочку.
+        if stage <= 1 and _followup_noon_reached(last_ts, now_local):
+            if await _send_followup_message(chat_id):
+                logger.info(
+                    "followup: #2 (след. день %02d:00) отправлен %s",
+                    FOLLOWUP_NEXT_DAY_HOUR, chat_id,
+                )
+            followups.pop(chat_id, None)
+            continue
+
+        # Follow-up #1: через N часов молчания (не в тихие часы).
+        if stage == 0 and silence >= FOLLOWUP_SILENCE_SECONDS and not quiet:
+            if await _send_followup_message(chat_id):
+                st["stage"] = 1
+                logger.info(
+                    "followup: #1 (молчание %dч) отправлен %s",
+                    FOLLOWUP_SILENCE_SECONDS // 3600, chat_id,
+                )
+
+
+async def _followup_loop() -> None:
+    logger.info(
+        "followup: авто-реактивация запущена (молчание=%ss, след. день в %02d:00, проверка каждые %ss)",
+        FOLLOWUP_SILENCE_SECONDS, FOLLOWUP_NEXT_DAY_HOUR, FOLLOWUP_CHECK_INTERVAL,
+    )
+    while True:
+        try:
+            await _followup_tick()
+        except Exception as e:
+            logger.error("followup: ошибка тика: %s", e, exc_info=True)
+        await asyncio.sleep(FOLLOWUP_CHECK_INTERVAL)
+
+
+@app.on_event("startup")
+async def _start_followup_worker() -> None:
+    if not FOLLOWUP_ENABLED:
+        logger.info("followup: авто-реактивация отключена (FOLLOWUP_ENABLED=0)")
+        return
+    asyncio.create_task(_followup_loop())
