@@ -621,6 +621,10 @@ handoff_completed: Dict[str, float] = {}
 # stage: 0 — ещё не напоминали, 1 — отправлен follow-up «через 2 часа»,
 #        2 — отправлен follow-up «на следующий день в 12:00» (цепочка завершена).
 followups: Dict[str, dict] = {}
+# Чаты, где в текущей сессии УЖЕ оформлена заявка (лид записан). Реактивацию им
+# больше не шлём, даже если клиент продолжил переписку (тогда handoff_completed
+# снимается для ответов на новые вопросы, а этот признак сохраняется до сброса сессии).
+session_registered_leads: set = set()
 # Явный отказ клиента = логическое завершение → реактивацию НЕ шлём.
 _FOLLOWUP_REFUSAL_RE = re.compile(
     r"не\s+интерес|неинтерес|не\s+надо|не\s+нужн|не\s+буд|не\s+хоч|передума|"
@@ -2124,8 +2128,11 @@ def _repair_dangling_tool_calls(chat_id: str) -> None:
 
 def _mark_handoff_completed(chat_id: str) -> None:
     handoff_completed[chat_id] = time.time()
-    # Заявка передана управляющему = логическое завершение → снимаем с реактивации.
+    # Заявка передана управляющему = логическое завершение → снимаем с реактивации
+    # и запоминаем на всю сессию, чтобы не «дожимать» уже записанного клиента,
+    # даже если он продолжит переписку после оформления.
     followups.pop(chat_id, None)
+    session_registered_leads.add(chat_id)
     if chat_id not in chat_history:
         return
     recent = chat_history[chat_id][-4:]
@@ -2150,6 +2157,10 @@ def _update_followup_tracking(chat_id: str, user_text: str) -> None:
     завершение обрабатывается отдельно в _mark_handoff_completed.
     """
     if not FOLLOWUP_ENABLED:
+        return
+    # Уже оформленный лид в этой сессии — реактивацию НЕ шлём (бот сам его записал).
+    if chat_id in session_registered_leads:
+        followups.pop(chat_id, None)
         return
     # Действующий ученик — «так и не записались» к нему неприменимо.
     if chat_id in known_users:
@@ -2243,6 +2254,8 @@ async def process_dialog(chat_id):
                 known_users.pop(chat_id, None)
                 client_dossiers.pop(chat_id, None)
                 handoff_completed.pop(chat_id, None)
+                followups.pop(chat_id, None)
+                session_registered_leads.discard(chat_id)
         last_activity[chat_id] = current_time
 
         if chat_id not in chat_history:
@@ -3461,8 +3474,12 @@ async def _followup_tick() -> None:
     now_local = datetime.now(_SCHOOL_TZ)
     quiet = _followup_in_quiet_hours(now_local)
     for chat_id, st in list(followups.items()):
-        # Действующий ученик или уже завершённая заявка — снимаем.
-        if chat_id in known_users or chat_id in handoff_completed:
+        # Действующий ученик, уже завершённая или оформленная заявка — снимаем.
+        if (
+            chat_id in known_users
+            or chat_id in handoff_completed
+            or chat_id in session_registered_leads
+        ):
             followups.pop(chat_id, None)
             continue
         last_ts = st.get("last_client_ts", now)
