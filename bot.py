@@ -210,6 +210,7 @@ def _log_failed_lead(payload: dict, reason: str) -> None:
 
 FILIALS_MAP = {
     "аркада": 37754, "arkada": 37754,
+    "айтеке": 37754, "айтеке би": 37754,  # адрес GMCA Аркада
     "камал": 42763, "kamal": 42763,
     "онлайн": 50847, "online": 50847,
     "тест": 49458,
@@ -575,8 +576,9 @@ GM Legends — школьный кружок (от нуля до 2 разряд�
 2. Поздоровайся по имени.
 3. Если есть ближайший урок — скажи: "Ждём вас [дата/время] на уроке с [преподаватель]."
 4. Если данных нет: "Пока не вижу информации о занятиях — уточним у менеджера."
-5. Вопросы по оплате/переносу → контакт управляющего их филиала.
-6. Если действующий ученик просит связаться / перезвонить / соединить с управляющим, либо у него жалоба или вопрос, требующий человека (оплата, перенос, конфликт) — вызови функцию request_manager_callback. Управляющему филиала уйдёт номер клиента и пометка «клиент просит связаться». Затем подтверди клиенту, что управляющий свяжется в ближайшее время.
+5. Вопросы по оплате/переносу / «никто не отвечает» / уточнение расписания у действующего ученика → НЕ ограничивайся словами. СНАЧАЛА вызови request_manager_callback, потом подтверди клиенту.
+6. Если действующий ученик просит связаться / перезвонить / соединить с управляющим, либо у него жалоба или вопрос, требующий человека (оплата, перенос, конфликт, «на филиале никто не отвечает», уточнение визита/урока) — ОБЯЗАТЕЛЬНО вызови request_manager_callback. Управляющему уйдёт номер клиента и текст «у клиента есть вопросы — свяжитесь». Только ПОСЛЕ вызова функции подтверди клиенту, что управляющий свяжется.
+КРИТИЧНО: ЗАПРЕЩЕНО писать «передам управляющему» / «жеткіземін» / «управляющий свяжется» БЕЗ вызова request_manager_callback. Иначе запрос клиента останется в воздухе.
 ВАЖНО: для действующего ученика НЕ вызывай register_client_request (это только для новых лидов) — используй request_manager_callback.
 
 ═══════════════════════════════════════
@@ -625,6 +627,10 @@ followups: Dict[str, dict] = {}
 # больше не шлём, даже если клиент продолжил переписку (тогда handoff_completed
 # снимается для ответов на новые вопросы, а этот признак сохраняется до сброса сессии).
 session_registered_leads: set = set()
+# Дедуп WhatsApp-уведомлений управляющему «свяжитесь с клиентом» (чтобы не спамить
+# при каждом сообщении в том же диалоге). chat_id -> unix ts последней отправки.
+session_manager_notified: Dict[str, float] = {}
+MANAGER_CALLBACK_DEDUP_SECONDS = int(os.getenv("MANAGER_CALLBACK_DEDUP_SECONDS", "21600"))  # 6ч
 # Явный отказ клиента = логическое завершение → реактивацию НЕ шлём.
 _FOLLOWUP_REFUSAL_RE = re.compile(
     r"не\s+интерес|неинтерес|не\s+надо|не\s+нужн|не\s+буд|не\s+хоч|передума|"
@@ -1839,7 +1845,7 @@ class MoyKlassCRM:
         wa_link = f"https://wa.me/{clean}" if clean else "-"
         comment = f"\nКомментарий: {reason.strip()}" if reason and reason.strip() else ""
         body = (
-            "🔔 Клиент просит связаться\n"
+            "🔔 У клиента есть вопросы — свяжитесь, пожалуйста\n"
             f"Имя: {client_name or 'Клиент'}\n"
             f"Телефон: {client_phone or '-'}\n"
             f"WhatsApp: {wa_link}{comment}"
@@ -1953,11 +1959,12 @@ tools = [
         "function": {
             "name": "request_manager_callback",
             "description": (
-                "Только для ДЕЙСТВУЮЩЕГО ученика (в диалоге есть [СИСТЕМНОЕ ДОСЬЕ КЛИЕНТА]), "
-                "который просит связаться, перезвонить или соединить с управляющим, либо "
-                "у него жалоба/вопрос по оплате/переносу. Отправляет управляющему филиала "
-                "номер клиента и текст «клиент просит связаться». "
-                "НЕ используй для новых клиентов и лидов — для них register_client_request."
+                "Для ДЕЙСТВУЮЩЕГО ученика ([СИСТЕМНОЕ ДОСЬЕ КЛИЕНТА]) ИЛИ когда клиент "
+                "просит связаться / жалуется («никто не отвечает») / задаёт операционный "
+                "вопрос, который должен закрыть человек (оплата, перенос, визит на занятие). "
+                "Сразу отправляет управляющему WhatsApp с номером клиента и текстом "
+                "«у клиента есть вопросы — свяжитесь». Вызывай ДО фразы «передам управляющему». "
+                "НЕ используй вместо записи нового лида — для новых клиентов register_client_request."
             ),
             "parameters": {
                 "type": "object",
@@ -2149,6 +2156,91 @@ def _mark_handoff_completed(chat_id: str) -> None:
     })
 
 
+# Клиент (обычно действующий ученик) пишет так, что нужен живой человек — не оставлять в воздухе.
+_CLIENT_NEEDS_HUMAN_RE = re.compile(
+    r"никто\s+не\s+отвеча|не\s+отвеча(ет|ют)|не\s+бер(ут|ёт|ет)\s+труб|"
+    r"свяжит|перезвон|позвонит|соединит|управл|менеджер|"
+    r"жалоб|не\s+пуска|не\s+откры|где\s+(тренер|апай|учитель)|"
+    r"можно\s+ли\s+прийт|приходить|прийти\s+к|к\s+\d+\s*час|"
+    r"насколько\s+актуальн|актуально\s+предложен",
+    re.IGNORECASE,
+)
+# Бот обещает передать управляющему — без реального WhatsApp это «запрос в воздухе».
+_MANAGER_PROMISE_RE = re.compile(
+    r"(передам|передаю|передала|передал)\w*.{0,60}(запрос|вопрос|ваш|управляющ|менеджер)|"
+    r"(управляющ\w*|менеджер\w*).{0,40}свяж|"
+    r"свяжется с вами|"
+    r"жеткіз|байланыс орнат|байланыстырамын",
+    re.IGNORECASE | re.DOTALL,
+)
+_CALLBACK_FORCE_DIRECTIVE = (
+    "СИСТЕМНОЕ: У клиента вопрос/жалоба, которые должен закрыть человек. "
+    "ОБЯЗАТЕЛЬНО вызови request_manager_callback ПРЯМО СЕЙЧАС (reason = кратко суть). "
+    "ЗАПРЕЩЕНО только обещать «передам управляющему» / «жеткіземін» без вызова функции — "
+    "иначе запрос клиента никуда не уйдёт."
+)
+
+
+def _guess_filial_from_text(text: str):
+    """Пытается вытащить filial_id из текста клиента (Айтеке би → Аркада и т.п.)."""
+    low = (text or "").lower()
+    if not low:
+        return None
+    # Более длинные ключи раньше (айтеке би / қадыр мырза).
+    for key in sorted(FILIALS_MAP.keys(), key=len, reverse=True):
+        if key in low:
+            return FILIALS_MAP[key]
+    return None
+
+
+def _client_needs_human(user_text: str) -> bool:
+    return bool(_CLIENT_NEEDS_HUMAN_RE.search(user_text or ""))
+
+
+def _bot_promises_manager(bot_text: str) -> bool:
+    return bool(_MANAGER_PROMISE_RE.search(bot_text or ""))
+
+
+async def _ensure_manager_callback(chat_id: str, reason: str = "") -> bool:
+    """Гарантированно шлёт управляющему WhatsApp «свяжитесь с клиентом».
+
+    Дедуп по сессии/окну MANAGER_CALLBACK_DEDUP_SECONDS — не спамим при каждом
+    сообщении. Возвращает True, если уведомление реально отправили.
+    """
+    last = session_manager_notified.get(chat_id)
+    if last is not None and (time.time() - last) < MANAGER_CALLBACK_DEDUP_SECONDS:
+        logger.info(
+            "callback: пропуск дедупа для %s (уже уведомляли %.0fс назад)",
+            chat_id, time.time() - last,
+        )
+        return False
+
+    dossier = client_dossiers.get(chat_id) or {}
+    client_phone = chat_id.split("@")[0]
+    client_name = dossier.get("name") or "Клиент"
+    filial_id = dossier.get("filial_id")
+    if filial_id is None:
+        filial_id = _guess_filial_from_text(reason)
+
+    try:
+        await crm.notify_client_callback_request(
+            client_name=client_name,
+            client_phone=client_phone,
+            filial_id=filial_id,
+            reason=(reason or "")[:300],
+        )
+    except Exception as e:
+        logger.error("callback safety-net упал для %s: %s", chat_id, e)
+        return False
+
+    session_manager_notified[chat_id] = time.time()
+    logger.info(
+        "callback: safety-net уведомил управляющего по %s (filial=%s, reason=%r)",
+        chat_id, filial_id, (reason or "")[:120],
+    )
+    return True
+
+
 def _update_followup_tracking(chat_id: str, user_text: str) -> None:
     """Обновляет план авто-реактивации по входящему сообщению клиента.
 
@@ -2256,6 +2348,7 @@ async def process_dialog(chat_id):
                 handoff_completed.pop(chat_id, None)
                 followups.pop(chat_id, None)
                 session_registered_leads.discard(chat_id)
+                session_manager_notified.pop(chat_id, None)
         last_activity[chat_id] = current_time
 
         if chat_id not in chat_history:
@@ -2296,7 +2389,9 @@ async def process_dialog(chat_id):
                         f"1. Поздоровайся по имени.\n"
                         f"2. Если есть урок в поле 'Ближайшие уроки', ОБЯЗАТЕЛЬНО скажи: 'Ждем вас [Дата/Время] на уроке с [Имя преподавателя]'.\n"
                         f"3. Если нет — спроси, чем помочь.\n"
-                        f"4. Если вопрос сложный, дай номер менеджера филиала."
+                        f"4. Жалоба / «никто не отвечает» / просьба связаться / операционный вопрос "
+                        f"(оплата, перенос, визит на занятие) — СНАЧАЛА вызови request_manager_callback, "
+                        f"ПОТОМ подтверди клиенту. Нельзя обещать передачу без вызова функции."
                     )
                     chat_history[chat_id].append({"role": "system", "content": inject_msg})
                     logger.info(f"Загружено досье: {dossier['name']}")
@@ -2339,6 +2434,16 @@ async def process_dialog(chat_id):
         if _already_asked_name and not _name_guard_present:
             chat_history[chat_id].append({"role": "system", "content": _NAME_GUARD_DIRECTIVE})
 
+        # Действующий ученик + вопрос, который должен закрыть человек → жёстко требуем tool-call.
+        if chat_id in known_users and _client_needs_human(user_text):
+            _cb_guard_present = any(
+                isinstance(m, dict) and m.get("role") == "system"
+                and m.get("content") == _CALLBACK_FORCE_DIRECTIVE
+                for m in chat_history[chat_id][-6:]
+            )
+            if not _cb_guard_present:
+                chat_history[chat_id].append({"role": "system", "content": _CALLBACK_FORCE_DIRECTIVE})
+
         try:
             response = await openai_client.chat.completions.create(
                 model=OPENAI_MODEL,
@@ -2349,6 +2454,7 @@ async def process_dialog(chat_id):
             )
             msg = response.choices[0].message
             lead_registered_this_turn = False
+            callback_sent_this_turn = False
 
             if msg.tool_calls:
                 chat_history[chat_id].append(msg)
@@ -2395,13 +2501,19 @@ async def process_dialog(chat_id):
                         client_phone = chat_id.split("@")[0]
                         client_name = dossier.get("name") or "Клиент"
                         filial_id = dossier.get("filial_id")
+                        if filial_id is None:
+                            filial_id = _guess_filial_from_text(
+                                f"{args.get('reason', '')} {user_text}"
+                            )
                         try:
                             result_text = await crm.notify_client_callback_request(
                                 client_name=client_name,
                                 client_phone=client_phone,
                                 filial_id=filial_id,
-                                reason=args.get("reason", ""),
+                                reason=args.get("reason", "") or user_text[:200],
                             )
+                            callback_sent_this_turn = True
+                            session_manager_notified[chat_id] = time.time()
                         except Exception as e:
                             logger.error(f"request_manager_callback неожиданно упал: {e}")
                             mgr_name, mgr_phone = crm._pick_manager_info(filial_id, None)
@@ -2432,6 +2544,19 @@ async def process_dialog(chat_id):
                 bot_answer = msg.content
 
             sanitized_answer = sanitize_bot_outgoing(bot_answer)
+
+            # Страховка: бот пообещал передать / действующий клиент ждёт человека,
+            # а tool не вызван → всё равно шлём WhatsApp управляющему с номером клиента.
+            if not lead_registered_this_turn and not callback_sent_this_turn:
+                needs_callback = False
+                if chat_id in known_users and _client_needs_human(user_text):
+                    needs_callback = True
+                elif _bot_promises_manager(sanitized_answer or ""):
+                    # Обещал передать — даже без досье нельзя оставлять запрос в воздухе.
+                    needs_callback = True
+                if needs_callback:
+                    await _ensure_manager_callback(chat_id, reason=user_text)
+
             if lead_registered_this_turn or _is_handoff_message(sanitized_answer):
                 _mark_handoff_completed(chat_id)
             chat_history[chat_id].append({"role": "assistant", "content": sanitized_answer})
