@@ -191,6 +191,20 @@ def _new_lead_recipients(filial_id, matched_key: Optional[str] = None) -> List[t
     return _unique_branch_managers()
 
 
+def _callback_recipients(filial_id, matched_key: Optional[str] = None) -> List[tuple]:
+    """Кому слать «свяжитесь с клиентом»: РОВНО ОДИН управляющий.
+
+    В отличие от новых лидов, callback НИКОГДА не шлём всем админам — иначе
+    спам по всем филиалам на каждый вопрос клиента без досье/филиала.
+    Филиал известен → его управляющий; иначе → default.
+    """
+    if matched_key and matched_key in BRANCH_MANAGERS:
+        return [BRANCH_MANAGERS[matched_key]]
+    if filial_id is not None and filial_id in BRANCH_MANAGERS:
+        return [BRANCH_MANAGERS[filial_id]]
+    return [BRANCH_MANAGERS["default"]]
+
+
 FAILED_LEADS_FILE = os.getenv("FAILED_LEADS_FILE", "failed_leads.jsonl")
 
 
@@ -1837,12 +1851,12 @@ class MoyKlassCRM:
     ) -> str:
         """Действующий клиент просит связаться → уведомить управляющего его филиала.
 
-        Управляющему уходит номер клиента и текст «клиент просит связаться».
+        Управляющему уходит номер клиента и текст «у клиента есть вопросы».
         Возвращает СИСТЕМНОЕ СООБЩЕНИЕ для модели (с MGR_NAME/MGR_PHONE), чтобы она
-        подтвердила клиенту передачу. Филиал неизвестен → все управляющие сразу.
+        подтвердила клиенту передачу. Филиал неизвестен → ТОЛЬКО default (не всем!).
         В тест-режиме уходит только на тест-номер с префиксом [ТЕСТ CRM].
         """
-        recipients = _new_lead_recipients(filial_id)
+        recipients = _callback_recipients(filial_id)
         if _webhook_test_mode_active():
             recipients = recipients[:1]
 
@@ -1868,8 +1882,8 @@ class MoyKlassCRM:
                 await send_whatsapp(cid, prefix + body, sanitize=False)
                 sent += 1
                 logger.info(
-                    "callback: отправлено управляющему %s (клиент=%r, тел=%s)",
-                    cid, client_name, client_phone,
+                    "callback: отправлено управляющему %s (клиент=%r, тел=%s, filial=%s)",
+                    cid, client_name, client_phone, filial_id,
                 )
             except Exception as e:
                 logger.error("callback: ошибка отправки управляющему %s: %s", cid, e)
@@ -2161,16 +2175,17 @@ def _mark_handoff_completed(chat_id: str) -> None:
     })
 
 
-# Клиент (обычно действующий ученик) пишет так, что нужен живой человек — не оставлять в воздухе.
+# Клиент — ДЕЙСТВУЮЩИЙ ученик — пишет так, что нужен живой человек.
+# Не путать с обычной квалификацией лида (прайс / расписание / офлайн / филиал).
 _CLIENT_NEEDS_HUMAN_RE = re.compile(
     r"никто\s+не\s+отвеча|не\s+отвеча(ет|ют)|не\s+бер(ут|ёт|ет)\s+труб|"
-    r"свяжит|перезвон|позвонит|соединит|управл|менеджер|"
+    r"свяжит(?:есь|е)|перезвон|позвонит(?:е)?\s+мне|соединит|"
     r"жалоб|не\s+пуска|не\s+откры|где\s+(тренер|апай|учитель)|"
-    r"можно\s+ли\s+прийт|приходить|прийти\s+к|к\s+\d+\s*час|"
     r"насколько\s+актуальн|актуально\s+предложен",
     re.IGNORECASE,
 )
-# Бот обещает передать управляющему — без реального WhatsApp это «запрос в воздухе».
+# Бот обещает передать управляющему — без реального WhatsApp это «запрос в воздухе»
+# (только для действующих учеников; новые лиды идут через register_client_request).
 _MANAGER_PROMISE_RE = re.compile(
     r"(передам|передаю|передала|передал)\w*.{0,60}(запрос|вопрос|ваш|управляющ|менеджер)|"
     r"(управляющ\w*|менеджер\w*).{0,40}свяж|"
@@ -2550,17 +2565,20 @@ async def process_dialog(chat_id):
 
             sanitized_answer = sanitize_bot_outgoing(bot_answer)
 
-            # Страховка: бот пообещал передать / действующий клиент ждёт человека,
-            # а tool не вызван → всё равно шлём WhatsApp управляющему с номером клиента.
-            if not lead_registered_this_turn and not callback_sent_this_turn:
-                needs_callback = False
-                if chat_id in known_users and _client_needs_human(user_text):
-                    needs_callback = True
-                elif _bot_promises_manager(sanitized_answer or ""):
-                    # Обещал передать — даже без досье нельзя оставлять запрос в воздухе.
-                    needs_callback = True
-                if needs_callback:
-                    await _ensure_manager_callback(chat_id, reason=user_text)
+            # Страховка ТОЛЬКО для действующих учеников: бот пообещал передать /
+            # клиент ждёт человека, а tool не вызван → WhatsApp одному управляющему.
+            # Новым лидам сюда нельзя: иначе «расписание/офлайн» + фраза «свяжется»
+            # разлетается спамом (раньше ещё и ВСЕМ админам при filial=None).
+            if (
+                not lead_registered_this_turn
+                and not callback_sent_this_turn
+                and chat_id in known_users
+                and (
+                    _client_needs_human(user_text)
+                    or _bot_promises_manager(sanitized_answer or "")
+                )
+            ):
+                await _ensure_manager_callback(chat_id, reason=user_text)
 
             if lead_registered_this_turn or _is_handoff_message(sanitized_answer):
                 _mark_handoff_completed(chat_id)
