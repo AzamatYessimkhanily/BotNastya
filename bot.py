@@ -177,32 +177,25 @@ def _unique_branch_managers() -> List[tuple]:
 
 
 def _new_lead_recipients(filial_id, matched_key: Optional[str] = None) -> List[tuple]:
-    """Кому слать уведомление о новом лиде: список (имя, телефон) управляющих.
+    """Кому слать уведомление о новом лиде: РОВНО ОДИН управляющий.
 
-    Филиал известен → один управляющий этого филиала.
-    Филиал не определён (None / нет в карте) → все управляющие сразу, чтобы лид
-    точно подхватили (решение заказчика). НИКОГДА не возвращает номер бота —
-    раньше уведомления уходили на NEW_LEAD_ADMIN_PHONE (= номер самого бота).
-    """
-    if matched_key and matched_key in BRANCH_MANAGERS:
-        return [BRANCH_MANAGERS[matched_key]]
-    if filial_id is not None and filial_id in BRANCH_MANAGERS:
-        return [BRANCH_MANAGERS[filial_id]]
-    return _unique_branch_managers()
-
-
-def _callback_recipients(filial_id, matched_key: Optional[str] = None) -> List[tuple]:
-    """Кому слать «свяжитесь с клиентом»: РОВНО ОДИН управляющий.
-
-    В отличие от новых лидов, callback НИКОГДА не шлём всем админам — иначе
-    спам по всем филиалам на каждый вопрос клиента без досье/филиала.
-    Филиал известен → его управляющий; иначе → default.
+    Филиал известен → управляющий этого филиала.
+    Филиал не определён / id нет в карте → default.
+    НИКОГДА не шлём всем админам сразу (это спамило команду).
     """
     if matched_key and matched_key in BRANCH_MANAGERS:
         return [BRANCH_MANAGERS[matched_key]]
     if filial_id is not None and filial_id in BRANCH_MANAGERS:
         return [BRANCH_MANAGERS[filial_id]]
     return [BRANCH_MANAGERS["default"]]
+
+
+def _callback_recipients(filial_id, matched_key: Optional[str] = None) -> List[tuple]:
+    """Кому слать «свяжитесь с клиентом»: РОВНО ОДИН управляющий.
+
+    Филиал известен → его управляющий; иначе → default.
+    """
+    return _new_lead_recipients(filial_id, matched_key)
 
 
 FAILED_LEADS_FILE = os.getenv("FAILED_LEADS_FILE", "failed_leads.jsonl")
@@ -1817,11 +1810,10 @@ class MoyKlassCRM:
         wa_link: str,
         source: str = "Бот оформил заявку.",
     ) -> None:
-        """Уведомить управляющего(их) филиала о новом лиде.
+        """Уведомить управляющего филиала о новом лиде.
 
-        Раньше слалось на NEW_LEAD_ADMIN_PHONE (= номер бота), и заявки прилетали
-        самому боту. Теперь получатель — управляющий филиала по filial_id; если
-        филиал не определён — все управляющие сразу.
+        Получатель — управляющий филиала по filial_id / matched_key; если филиал
+        не определён — только default (НЕ всем админам).
         В тест-режиме (MOYKLASS_WEBHOOK_TEST_PHONE) шлём один раз на тест-номер.
         """
         recipients = _new_lead_recipients(filial_id, matched_key)
@@ -1829,10 +1821,11 @@ class MoyKlassCRM:
             logger.error("notify_new_lead_managers: пустой список получателей (лид=%r)", name)
             return
         if _webhook_test_mode_active():
-            recipients = recipients[:1]  # не дублируем на тест-номер N раз
+            recipients = recipients[:1]
         logger.info(
-            "notify_new_lead_managers: лид=%r filial=%s -> %d получателей",
-            name, filial_id, len(recipients),
+            "notify_new_lead_managers: лид=%r filial=%s matched=%s -> %d получатель(ей): %s",
+            name, filial_id, matched_key, len(recipients),
+            [p for _, p in recipients],
         )
         for mgr_name, mgr_phone in recipients:
             await self.notify_new_lead_admin(
@@ -3327,12 +3320,12 @@ async def handle_moyklass_webhook(secret: str, request: Request):
 
 
 async def _handle_new_lead_admin_notification(event: str, obj: dict) -> dict:
-    """Уведомление управляющему(им) филиала о новом лиде В СИСТЕМЕ (MoyKlass-сценарий).
+    """Уведомление управляющему филиала о новом лиде В СИСТЕМЕ (MoyKlass-сценарий).
 
     Покрывает лиды из любого источника (менеджер вручную, сайт, бот). Получатель —
-    управляющий филиала лида (по filial_id); если филиал не определён — все
-    управляющие сразу. Дедуп по userId: если этот лид только что создал бот и уже
-    уведомил управляющего из create_lead — повторно не шлём.
+    управляющий филиала лида (по filial_id); если филиал не определён — только
+    default (не всем админам). Дедуп по userId: если этот лид только что создал бот
+    и уже уведомил управляющего из create_lead — повторно не шлём.
     """
     user_id = obj.get("userId")
     if user_id is not None and _lead_already_notified(int(user_id)):
