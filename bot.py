@@ -36,9 +36,46 @@ _CLIENT_WEBHOOKS_ENV = os.getenv("MOYKLASS_CLIENT_WEBHOOKS_ENABLED", "0").strip(
 MOYKLASS_CLIENT_WEBHOOKS_ENABLED = _CLIENT_WEBHOOKS_ENV in ("1", "true", "yes", "on")
 # Тест CRM: все вебхуки (клиент + сотрудник) уходят только на этот номер. Пусто = выкл.
 MOYKLASS_WEBHOOK_TEST_PHONE = os.getenv("MOYKLASS_WEBHOOK_TEST_PHONE", "").strip()
-# Клиентские вебхуки: игнорировать события старше этого Unix-времени (защита от массовой рассылки при деплое).
+# --- АНТИБАН / анти-спам WhatsApp ---
+# Время старта процесса: при каждом рестарте отсекаем бэклог CRM и старые входящие.
+BOT_STARTED_AT = int(time.time())
+# Клиентские/сотруднические вебхуки: игнорировать события старше effective_since.
+# Env MOYKLASS_WEBHOOK_ENABLED_SINCE — нижняя планка вручную; всегда поднимаем
+# минимум до BOT_STARTED_AT, чтобы рестарт без обновления .env не разлил ретраи MoyKlass.
 _ENABLED_SINCE_ENV = os.getenv("MOYKLASS_WEBHOOK_ENABLED_SINCE", "").strip()
-MOYKLASS_WEBHOOK_ENABLED_SINCE = int(_ENABLED_SINCE_ENV) if _ENABLED_SINCE_ENV.isdigit() else None
+_ENABLED_SINCE_RAW = int(_ENABLED_SINCE_ENV) if _ENABLED_SINCE_ENV.isdigit() else None
+MOYKLASS_WEBHOOK_ENABLED_SINCE = max(_ENABLED_SINCE_RAW or 0, BOT_STARTED_AT)
+logger.info(
+    "anti-ban: ENABLED_SINCE effective=%s (env=%s, started=%s)",
+    MOYKLASS_WEBHOOK_ENABLED_SINCE, _ENABLED_SINCE_RAW, BOT_STARTED_AT,
+)
+# Rate-limit исходящих WhatsApp (защита номера от бана Meta/WhatsApp).
+_WA_RATE_ENV = os.getenv("WA_RATE_LIMIT_ENABLED", "1").strip().lower()
+WA_RATE_LIMIT_ENABLED = _WA_RATE_ENV in ("1", "true", "yes", "on")
+WA_MIN_INTERVAL_SEC = float(os.getenv("WA_MIN_INTERVAL_SEC", "4") or "4")
+WA_PER_CHAT_COOLDOWN_SEC = float(os.getenv("WA_PER_CHAT_COOLDOWN_SEC", "12") or "12")
+WA_MAX_PER_HOUR = int(os.getenv("WA_MAX_PER_HOUR", "40") or "40")
+WA_MAX_PER_DAY = int(os.getenv("WA_MAX_PER_DAY", "200") or "200")
+WA_FLOOD_PAUSE_SEC = float(os.getenv("WA_FLOOD_PAUSE_SEC", "180") or "180")
+# Входящие WhatsApp, накопленные пока бот был выключен / слишком старые — не отвечаем.
+_SKIP_OLD_IN_ENV = os.getenv("WA_SKIP_OLD_INCOMING", "1").strip().lower()
+WA_SKIP_OLD_INCOMING = _SKIP_OLD_IN_ENV in ("1", "true", "yes", "on")
+WA_INCOMING_MAX_AGE_SEC = int(os.getenv("WA_INCOMING_MAX_AGE_SEC", "600") or "600")
+WA_INCOMING_CLOCK_SKEW_SEC = int(os.getenv("WA_INCOMING_CLOCK_SKEW_SEC", "30") or "30")
+# Режим «прогрева» нового/разбаненного номера: жёстче лимиты, пока WA_WARMUP_MODE=1.
+_WA_WARMUP_ENV = os.getenv("WA_WARMUP_MODE", "1").strip().lower()
+WA_WARMUP_MODE = _WA_WARMUP_ENV in ("1", "true", "yes", "on")
+if WA_WARMUP_MODE:
+    WA_MIN_INTERVAL_SEC = max(WA_MIN_INTERVAL_SEC, 6.0)
+    WA_PER_CHAT_COOLDOWN_SEC = max(WA_PER_CHAT_COOLDOWN_SEC, 20.0)
+    WA_MAX_PER_HOUR = min(WA_MAX_PER_HOUR, 25)
+    WA_MAX_PER_DAY = min(WA_MAX_PER_DAY, 80)
+    WA_FLOOD_PAUSE_SEC = max(WA_FLOOD_PAUSE_SEC, 300.0)
+logger.info(
+    "anti-ban: rate_limit=%s warmup=%s interval=%.1fs chat_cd=%.1fs hour=%d day=%d",
+    WA_RATE_LIMIT_ENABLED, WA_WARMUP_MODE, WA_MIN_INTERVAL_SEC,
+    WA_PER_CHAT_COOLDOWN_SEC, WA_MAX_PER_HOUR, WA_MAX_PER_DAY,
+)
 # Потолок получателей на одно broadcast-событие (classId/lessonId без userId).
 # Превышение → рассылку НЕ делаем (skip + ERROR), чтобы misconfigured-сценарий
 # не разослал сотням. Группы шахмат маленькие; при необходимости поднять через env.
@@ -2308,12 +2345,176 @@ def sanitize_bot_outgoing(text: Optional[str], *, fallback: str = "handoff") -> 
     return t
 
 
+# --- АНТИБАН: глобальный шлюз исходящих WhatsApp ---
+_wa_send_lock: Optional[asyncio.Lock] = None
+_wa_last_send_ts: float = 0.0
+_wa_last_chat_ts: Dict[str, float] = {}
+_wa_send_times: deque = deque()  # timestamps успешных отправок (для лимитов час/день)
+_wa_paused_until: float = 0.0
+
+
+def _get_wa_send_lock() -> asyncio.Lock:
+    global _wa_send_lock
+    if _wa_send_lock is None:
+        _wa_send_lock = asyncio.Lock()
+    return _wa_send_lock
+
+
+def _wa_prune_send_times(now: float) -> None:
+    day_ago = now - 86400
+    while _wa_send_times and _wa_send_times[0] < day_ago:
+        _wa_send_times.popleft()
+
+
+def _wa_count_since(now: float, window_sec: float) -> int:
+    cutoff = now - window_sec
+    return sum(1 for t in _wa_send_times if t >= cutoff)
+
+
+def _wa_is_flood_response(status_code: int, body_text: str) -> bool:
+    if status_code in (429, 466):
+        return True
+    low = (body_text or "").lower()
+    return any(
+        marker in low
+        for marker in (
+            "too many",
+            "rate limit",
+            "flood",
+            "quota",
+            "spammed",
+            "blocked",
+            "ban",
+        )
+    )
+
+
+async def _wa_acquire_send_slot(chat_id: str) -> bool:
+    """Ждём слот по rate-limit. False = лимит час/день исчерпан (не шлём)."""
+    global _wa_last_send_ts, _wa_paused_until
+    if not WA_RATE_LIMIT_ENABLED:
+        return True
+
+    async with _get_wa_send_lock():
+        while True:
+            now = time.time()
+            _wa_prune_send_times(now)
+
+            if now < _wa_paused_until:
+                wait = _wa_paused_until - now
+                logger.warning(
+                    "anti-ban: пауза после flood ещё %.0fs — ждём перед %s",
+                    wait, chat_id,
+                )
+                await asyncio.sleep(min(wait, 30.0))
+                continue
+
+            if WA_MAX_PER_DAY > 0 and _wa_count_since(now, 86400) >= WA_MAX_PER_DAY:
+                logger.error(
+                    "anti-ban: дневной лимит %d исчерпан — НЕ отправляю %s",
+                    WA_MAX_PER_DAY, chat_id,
+                )
+                return False
+            if WA_MAX_PER_HOUR > 0 and _wa_count_since(now, 3600) >= WA_MAX_PER_HOUR:
+                logger.error(
+                    "anti-ban: часовой лимит %d исчерпан — НЕ отправляю %s",
+                    WA_MAX_PER_HOUR, chat_id,
+                )
+                return False
+
+            wait_global = (_wa_last_send_ts + WA_MIN_INTERVAL_SEC) - now
+            last_chat = _wa_last_chat_ts.get(chat_id, 0.0)
+            wait_chat = (last_chat + WA_PER_CHAT_COOLDOWN_SEC) - now
+            wait = max(wait_global, wait_chat, 0.0)
+            if wait > 0:
+                logger.info(
+                    "anti-ban: throttle %.1fs перед отправкой %s",
+                    wait, chat_id,
+                )
+                await asyncio.sleep(wait)
+                continue
+
+            # Слот наш: резервируем время ДО HTTP, чтобы параллельные вызовы ждали.
+            _wa_last_send_ts = time.time()
+            _wa_last_chat_ts[chat_id] = _wa_last_send_ts
+            return True
+
+
+def _wa_mark_sent_ok() -> None:
+    _wa_send_times.append(time.time())
+
+
+def _wa_trip_flood_pause(reason: str) -> None:
+    global _wa_paused_until
+    _wa_paused_until = time.time() + WA_FLOOD_PAUSE_SEC
+    logger.error(
+        "anti-ban: FLOOD/quota (%s) — пауза исходящих на %.0fs до %s",
+        reason, WA_FLOOD_PAUSE_SEC, int(_wa_paused_until),
+    )
+
+
+def _incoming_message_timestamp(data: dict) -> Optional[int]:
+    """Unix-время входящего WhatsApp из Green API webhook (если есть)."""
+    for key in ("timestamp", "time"):
+        raw = data.get(key)
+        if raw is None:
+            continue
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            continue
+    msg_data = data.get("messageData") or {}
+    for key in ("timestamp", "time"):
+        raw = msg_data.get(key)
+        if raw is None:
+            continue
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _should_skip_stale_incoming(data: dict) -> bool:
+    """Пропуск бэклога: сообщения до старта бота или слишком старые."""
+    if not WA_SKIP_OLD_INCOMING:
+        return False
+    ts = _incoming_message_timestamp(data)
+    if ts is None:
+        # Без метки времени в первые минуты после старта — не отвечаем (анти-бэклог).
+        if time.time() - BOT_STARTED_AT < 120:
+            logger.warning(
+                "anti-ban: входящее без timestamp в grace после старта — пропуск"
+            )
+            return True
+        return False
+    now = int(time.time())
+    if ts < BOT_STARTED_AT - WA_INCOMING_CLOCK_SKEW_SEC:
+        logger.info(
+            "anti-ban: входящее timestamp=%s < старт=%s — бэклог, пропуск",
+            ts, BOT_STARTED_AT,
+        )
+        return True
+    if WA_INCOMING_MAX_AGE_SEC > 0 and (now - ts) > WA_INCOMING_MAX_AGE_SEC:
+        logger.info(
+            "anti-ban: входящее слишком старое age=%ss > %ss — пропуск",
+            now - ts, WA_INCOMING_MAX_AGE_SEC,
+        )
+        return True
+    return False
+
+
 async def send_whatsapp(chat_id, text, *, sanitize_fallback: str = "handoff", sanitize: bool = True) -> bool:
     # Доп. нормализация на случай прямых вызовов (голосовые ошибки и т.д.).
     # sanitize=False — для служебных сообщений сотрудникам (сохраняем формат/переносы).
     # Возвращает True только при подтверждённой отправке (Green API отдал idMessage).
+    # Все исходящие проходят anti-ban rate-limit (интервал, per-chat, час/день, flood-pause).
     if sanitize:
         text = sanitize_bot_outgoing(text, fallback=sanitize_fallback)
+
+    if not await _wa_acquire_send_slot(chat_id):
+        return False
+
     url = f"https://api.green-api.com/waInstance{GREEN_API_ID}/sendMessage/{GREEN_API_TOKEN}"
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -2327,6 +2528,8 @@ async def send_whatsapp(chat_id, text, *, sanitize_fallback: str = "handoff", sa
             "send_whatsapp: Green API %s -> %s %s",
             chat_id, resp.status_code, (resp.text or "")[:300],
         )
+        if _wa_is_flood_response(resp.status_code, resp.text or ""):
+            _wa_trip_flood_pause(f"HTTP {resp.status_code}")
         return False
 
     # При успехе Green API возвращает {"idMessage": "..."}; его отсутствие = не доставлено.
@@ -2339,7 +2542,10 @@ async def send_whatsapp(chat_id, text, *, sanitize_fallback: str = "handoff", sa
             "send_whatsapp: ответ без idMessage %s -> %s",
             chat_id, (resp.text or "")[:200],
         )
+        if _wa_is_flood_response(resp.status_code, resp.text or ""):
+            _wa_trip_flood_pause("body without idMessage")
         return False
+    _wa_mark_sent_ok()
     return True
 
 # --- 6. ЛОГИКА ДИАЛОГА ---
@@ -2593,6 +2799,10 @@ async def process_dialog(chat_id):
 async def handle_webhook(request: Request):
     data = await request.json()
     if data.get("typeWebhook") != "incomingMessageReceived":
+        return "ok"
+
+    # Анти-бэклог: не отвечаем на сообщения, накопленные пока бот был выключен.
+    if _should_skip_stale_incoming(data):
         return "ok"
 
     sender = data.get("senderData", {}).get("chatId")
@@ -3139,15 +3349,21 @@ def _scheduled_event_is_past(obj: dict, event: Optional[str] = None) -> bool:
 
 
 def _should_skip_stale_client_webhook(data: dict, event: str, obj: dict) -> bool:
-    """Пропустить старые/ретраи вебхуков — только события с момента деплоя и будущие напоминания."""
-    if MOYKLASS_WEBHOOK_ENABLED_SINCE is not None:
-        event_time = data.get("time")
-        if event_time is not None:
-            try:
-                if int(event_time) < MOYKLASS_WEBHOOK_ENABLED_SINCE:
-                    return True
-            except (TypeError, ValueError):
-                pass
+    """Пропустить старые/ретраи вебхуков — только события с момента старта и будущие напоминания."""
+    event_time = data.get("time")
+    if event_time is not None:
+        try:
+            if int(event_time) < MOYKLASS_WEBHOOK_ENABLED_SINCE:
+                return True
+        except (TypeError, ValueError):
+            pass
+    elif time.time() - BOT_STARTED_AT < 180:
+        # Сразу после рестарта вебхук без time — с высокой вероятностью ретрай бэклога.
+        logger.warning(
+            "anti-ban: CRM event=%s без time в grace после старта — пропуск",
+            event,
+        )
+        return True
 
     if event in _SCHEDULED_REMINDER_EVENTS and _scheduled_event_is_past(obj, event):
         return True

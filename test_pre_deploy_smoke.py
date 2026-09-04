@@ -339,8 +339,11 @@ def main() -> int:
         return lambda *a, **k: _FakeClient(resp, exc)
 
     orig_httpx_client = bot.httpx.AsyncClient
+    orig_rate = bot.WA_RATE_LIMIT_ENABLED
     msg = "Тестовое сообщение для проверки доставки через Green API."
     try:
+        bot.WA_RATE_LIMIT_ENABLED = False
+        bot._wa_paused_until = 0.0
         bot.httpx.AsyncClient = _factory(resp=_FakeResp(200, {"idMessage": "BAE5"}))
         check("M3 успех (idMessage) -> True",
               asyncio.run(bot.send_whatsapp("77000000000@c.us", msg)) is True)
@@ -355,6 +358,44 @@ def main() -> int:
               asyncio.run(bot.send_whatsapp("77000000000@c.us", msg)) is False)
     finally:
         bot.httpx.AsyncClient = orig_httpx_client
+        bot.WA_RATE_LIMIT_ENABLED = orig_rate
+        bot._wa_paused_until = 0.0
+
+    print("=== smoke: anti-ban backlog / rate-limit ===")
+    check("ENABLED_SINCE >= BOT_STARTED_AT",
+          bot.MOYKLASS_WEBHOOK_ENABLED_SINCE >= bot.BOT_STARTED_AT)
+    check("stale CRM time skipped",
+          bot._should_skip_stale_client_webhook(
+              {"time": bot.BOT_STARTED_AT - 100}, "join_new", {}))
+    check("fresh CRM time allowed",
+          not bot._should_skip_stale_client_webhook(
+              {"time": bot.BOT_STARTED_AT + 5}, "join_new", {}))
+    check("old incoming skipped",
+          bot._should_skip_stale_incoming({"timestamp": bot.BOT_STARTED_AT - 120}))
+    check("fresh incoming allowed",
+          not bot._should_skip_stale_incoming({"timestamp": int(__import__("time").time())}))
+    check("flood marker 466", bot._wa_is_flood_response(466, "quota exceeded"))
+    check("flood marker 429", bot._wa_is_flood_response(429, "too many requests"))
+    # Дневной лимит: при исчерпании send_whatsapp не ходит в сеть.
+    orig_rate2 = bot.WA_RATE_LIMIT_ENABLED
+    orig_day = bot.WA_MAX_PER_DAY
+    orig_times = list(bot._wa_send_times)
+    try:
+        bot.WA_RATE_LIMIT_ENABLED = True
+        bot.WA_MAX_PER_DAY = 1
+        bot._wa_send_times.clear()
+        bot._wa_send_times.append(__import__("time").time())
+        bot._wa_paused_until = 0.0
+        bot.WA_MIN_INTERVAL_SEC = 0
+        bot.WA_PER_CHAT_COOLDOWN_SEC = 0
+        check("дневной лимит блокирует отправку",
+              asyncio.run(bot.send_whatsapp("77000000001@c.us", msg)) is False)
+    finally:
+        bot.WA_RATE_LIMIT_ENABLED = orig_rate2
+        bot.WA_MAX_PER_DAY = orig_day
+        bot._wa_send_times.clear()
+        bot._wa_send_times.extend(orig_times)
+        bot._wa_paused_until = 0.0
 
     print("=== smoke: new-lead admin notify (any source, dedup) ===")
 
