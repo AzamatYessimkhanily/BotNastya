@@ -168,19 +168,25 @@ def main() -> int:
 
     msg = bot.build_notification_message(
         "lesson_start_hours",
-        {"beginTime": "18:00:00", "onlineLink": "https://zoom.us/j/test"},
+        {
+            "beginTime": "18:00:00",
+            "onlineLink": "https://zoom.us/j/test",
+            "trainer_phone": "+7 702 561 3672",
+        },
     )
     check("lesson link appended", msg and "Ссылка на урок: https://zoom.us/j/test" in msg)
     check("time normalized", msg and "18:00" in msg)
+    check("client lesson trainer phone", msg and "Тренер: +7 702 561 3672" in msg)
 
     msg_no_link = bot.build_notification_message(
         "lesson_start_hours",
-        {"beginTime": "10:00"},
+        {"beginTime": "10:00", "trainer_phone": "+7 702 561 3672"},
     )
     check("no link when absent", msg_no_link and "Ссылка на урок" not in msg_no_link)
+    check("client lesson trainer without link", msg_no_link and "Тренер: +7 702 561 3672" in msg_no_link)
 
     pay = bot.build_notification_message("payment_new", {"userId": 1})
-    check("payment unchanged", pay and "Ссылка на урок" not in pay)
+    check("payment unchanged", pay and "Ссылка на урок" not in pay and "Тренер:" not in pay)
 
     # Регресс: отсутствующее поле не должно протекать сырым {плейсхолдером} клиенту.
     sub_missing = bot.build_notification_message("sub_end_days", {"userId": 1})
@@ -194,19 +200,27 @@ def main() -> int:
 
     emp = bot.build_employee_notification_message(
         "lesson_changed",
-        {"date": "2026-06-22", "beginTime": "19:00:00", "onlineLink": "https://zoom.us/j/emp"},
+        {
+            "date": "2026-06-22",
+            "beginTime": "19:00:00",
+            "onlineLink": "https://zoom.us/j/emp",
+            "trainer_phone": "+7 778 104 8197",
+        },
     )
     check("employee lesson_changed link", emp and "https://zoom.us/j/emp" in emp)
     check("employee lesson_changed text", emp and "графике занятий" in emp and "22.06.2026" in emp)
+    check("employee lesson_changed trainer", emp and "Тренер: +7 778 104 8197" in emp)
 
     emp_1h = bot.build_employee_notification_message(
         "lesson_start_hours",
-        {"onlineLink": "https://zoom.us/j/t"},
+        {"onlineLink": "https://zoom.us/j/t", "trainer_phone": "+7 702 561 3672"},
     )
     check("employee 1h reminder", emp_1h and "через 1 час" in emp_1h and "zoom.us" in emp_1h)
+    check("employee 1h trainer", emp_1h and "Тренер: +7 702 561 3672" in emp_1h)
 
     emp_5m = bot.build_employee_notification_message("lesson_start", {})
     check("employee 5m fallback no time", emp_5m and "через 5 минут" in emp_5m)
+    check("employee 5m no fake trainer", emp_5m and "Тренер:" not in emp_5m)
 
     from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
@@ -237,14 +251,19 @@ def main() -> int:
     check("birthday requires client filter", "user_birthday" in bot._EVENTS_REQUIRE_ACTIVE_CLIENT)
     check("join_new exempt from client filter", "join_new" not in bot._EVENTS_REQUIRE_ACTIVE_CLIENT)
 
-    # Клиентские шаблоны: телефон администратора филиала + имя ученика
+    # Клиентские шаблоны: телефон администратора филиала / тренера + имя ученика
     cli_debt = bot.build_notification_message("sub_lesson_in_debt", {"admin_phone": "+7 771 231 4549"})
     check("client debt: текст + админ-номер",
           cli_debt == "Занятие проведено в долг. Для оплаты свяжитесь с администратором +7 771 231 4549")
     cli_missed = bot.build_notification_message(
-        "user_consecutive_visit_missed_2", {"admin_phone": "+7 778 104 8197"})
-    check("client missed: текст + админ-номер",
-          cli_missed and "тренер забыл отметить" in cli_missed and "+7 778 104 8197" in cli_missed)
+        "user_consecutive_visit_missed_2", {"trainer_phone": "+7 778 104 8197"})
+    check("client missed: текст + тренер-номер",
+          cli_missed and "тренер забыл отметить" in cli_missed and "+7 778 104 8197" in cli_missed
+          and "Свяжитесь с тренером" in cli_missed)
+    cli_missed_empty = bot.build_notification_message("user_consecutive_visit_missed_2", {})
+    check("client missed без тренера: без висячего контакта",
+          cli_missed_empty and "Свяжитесь с тренером" not in cli_missed_empty
+          and "разберёмся" in cli_missed_empty)
     cli_bday = bot.build_notification_message("user_birthday", {"userName": "Алибек"})
     check("client birthday: имя + поздравление",
           cli_bday and "Алибек" in cli_bday and "великих побед" in cli_bday)
@@ -253,7 +272,9 @@ def main() -> int:
           cli_bday_noname and "рождения! " in cli_bday_noname)
     check("client admin-phone events заданы",
           "sub_lesson_in_debt" in bot._CLIENT_ADMIN_PHONE_EVENTS
-          and "user_consecutive_visit_missed_2" in bot._CLIENT_ADMIN_PHONE_EVENTS)
+          and "user_consecutive_visit_missed_2" not in bot._CLIENT_ADMIN_PHONE_EVENTS)
+    check("client trainer-phone events заданы",
+          "user_consecutive_visit_missed_2" in bot._CLIENT_TRAINER_PHONE_EVENTS)
 
     print("=== smoke: mailing safety M1/M2/M4 ===")
     import asyncio

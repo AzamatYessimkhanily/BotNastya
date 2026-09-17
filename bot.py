@@ -173,7 +173,7 @@ BRANCH_PHONES = {
     "рфмш": "+7 771 231 4549",     # РФМШ (Томирис)
     50847: "+7 775 254 2671",       # Онлайн (Айгерим)
     "online": "+7 775 254 2671",    # Онлайн (Айгерим)
-    "default": "+7 708 174 7426"    # Общий
+    # default НЕ используем для исходящих лидов/callback — без филиала никому не шлём.
 }
 
 BRANCH_MANAGERS = {
@@ -195,7 +195,7 @@ BRANCH_MANAGERS = {
     "квантум": (QUANTUM_MANAGER_NAME, QUANTUM_MANAGER_PHONE),
     "рфмш": ("Томирис Ержанқызы", "+7 771 231 4549"),
     "online": ("Айгерим Аманжолқызы", "+7 775 254 2671"),
-    "default": ("наш управляющий", "+7 708 174 7426"),
+    # Без филиала — никому. Ключ default намеренно отсутствует.
 }
 
 def _unique_branch_managers() -> List[tuple]:
@@ -217,20 +217,20 @@ def _new_lead_recipients(filial_id, matched_key: Optional[str] = None) -> List[t
     """Кому слать уведомление о новом лиде: РОВНО ОДИН управляющий.
 
     Филиал известен → управляющий этого филиала.
-    Филиал не определён / id нет в карте → default.
-    НИКОГДА не шлём всем админам сразу (это спамило команду).
+    Филиал не определён / id нет в карте → никому (пустой список).
+    НИКОГДА не шлём «общему» номеру и не шлём всем админам сразу.
     """
     if matched_key and matched_key in BRANCH_MANAGERS:
         return [BRANCH_MANAGERS[matched_key]]
     if filial_id is not None and filial_id in BRANCH_MANAGERS:
         return [BRANCH_MANAGERS[filial_id]]
-    return [BRANCH_MANAGERS["default"]]
+    return []
 
 
 def _callback_recipients(filial_id, matched_key: Optional[str] = None) -> List[tuple]:
     """Кому слать «свяжитесь с клиентом»: РОВНО ОДИН управляющий.
 
-    Филиал известен → его управляющий; иначе → default.
+    Филиал известен → его управляющий; иначе → никому.
     """
     return _new_lead_recipients(filial_id, matched_key)
 
@@ -311,7 +311,7 @@ _SYSTEM_PROMPT_TEMPLATE = """
 - Для оформления заявки в CRM используй номер из [ТЕЛЕФОН КЛИЕНТА], если клиент сам не дал другой. Не выдумывай запрос телефона как условие связи в WhatsApp.
 - ЗАПРЕЩЕНО называть точное расписание по дням/времени — только управляющий филиала.
 - ЗАПРЕЩЕНО обещать скидки, акции или конкретные спортивные результаты ("гарантируем разряд за 3 месяца" и т.п.).
-- ЗАПРЕЩЕНО критиковать конкурентов или обсуждать темы, не связанные с шахматами/GMCA.
+- ЗАПРЕЩЕНО критиковать конкурентов или обсуждать посторонние темы. Исключение: обучение искусственному интеллекту / ИИ / AI — это наш продукт, см. ТИП 11 (сразу контакт Шолпан Жолдыбаевны, без вопросов).
 - ЗАПРЕЩЕНО писать "Новая заявка..." или любой её вариант текстом. Только через функцию register_client_request.
 - ЗАПРЕЩЕНО давать конфиденциальные данные (телефоны других клиентов, расписание тренера и т.д.).
 - ЗАПРЕЩЕНО говорить клиенту, что заявка «не оформлена», «временно недоступна», «техническая ошибка», «технические проблемы», «попробуем позже», «возникла ошибка», «произошла ошибка», «ошибка при регистрации», «ошибка при подключении к системе», «заявка не обработана». Если система прислала handoff — заявка уже зафиксирована, преподнеси это уверенно.
@@ -385,7 +385,14 @@ _SYSTEM_PROMPT_TEMPLATE = """
 → Передай контакт нашего старшего тренера: Еркежан Маратовна — +7 702 561 3672.
 → Заявку в CRM НЕ создавать. Завершай диалог после передачи контакта.
 
-ТИП 10 — Жалоба / недовольство / конфликт
+ТИП 11 — Обучение искусственному интеллекту / ИИ / AI
+→ Клиент пишет про обучение ИИ, искусственный интеллект, AI-курсы, нейросети (не шахматы).
+→ НИКАКИХ уточняющих вопросов (имя, возраст, филиал, «для кого» и т.п.) — не задавай.
+→ Сразу передай контакт: Шолпан Жолдыбаевна — +7 778 104 8127.
+→ Заявку в CRM НЕ создавать. Завершай диалог после передачи контакта.
+→ Примеры триггеров: «искусственный интеллект», «обучение ИИ», «AI», «нейросеть», «курс по ИИ», «жасанды интеллект».
+
+ТИП 12 — Жалоба / недовольство / конфликт
 → Выслушай, вырази сочувствие: "Мне очень жаль, что так вышло."
 → Не вступай в дискуссию. Не занимай ничью сторону.
 → Попроси имя и телефон для передачи управляющему.
@@ -456,9 +463,11 @@ _SYSTEM_PROMPT_TEMPLATE = """
 ЕДИНСТВЕННЫЙ корректный источник телефона/имени менеджера для клиента — СИСТЕМНОЕ СООБЩЕНИЕ после вызова register_client_request. В нём есть строки `MGR_NAME=...` и `MGR_PHONE=...` — копируй их БУКВАЛЬНО (символ в символ).
 
 Алгоритм:
-1. Если хочешь дать клиенту контакт менеджера филиала — СНАЧАЛА вызови register_client_request (даже если каких-то полей не хватает — подставь «не указано»). Получишь системное сообщение с MGR_NAME / MGR_PHONE. Используй их.
-2. ЗАПРЕЩЕНО копировать телефон вида «+7 XXX XXX XXXX» в ответ клиенту, если ты не получил его из системного сообщения текущего диалога. Это правило не распространяется только на: турниры (Инжу Муратовна +7 778 835 4635), лагерь (Улпан Нурлановна +7 775 259 3540), франшиза/директор (Данияр +7 777 955 9999), менторство тренеров/трудоустройство (Еркежан Маратовна +7 702 561 3672) — для них handoff не делается.
-3. Если CRM не подтвердил заявку или ты сомневаешься в номере — никогда не угадывай. Скажи коротко: «Передаю вашу заявку управляющему — она свяжется с вами в ближайшее время.» И заверши диалог.
+1. Без известного филиала/формата НЕ вызывай register_client_request и НЕ давай никакой номер управляющего. Сначала дожми филиал: «Что удобнее — GMCA Аркада, GMCA Камал или онлайн?» (или школьный кружок, если клиент сам про школу).
+2. Если хочешь дать клиенту контакт менеджера филиала — СНАЧАЛА вызови register_client_request (когда филиал уже известен; недостающие поля — «не указано»). Получишь системное сообщение с MGR_NAME / MGR_PHONE. Используй их.
+3. ЗАПРЕЩЕНО копировать телефон вида «+7 XXX XXX XXXX» в ответ клиенту, если ты не получил его из системного сообщения текущего диалога. Это правило не распространяется только на: турниры (Инжу Муратовна +7 778 835 4635), лагерь (Улпан Нурлановна +7 775 259 3540), франшиза/директор (Данияр +7 777 955 9999), менторство тренеров/трудоустройство (Еркежан Маратовна +7 702 561 3672), обучение ИИ/AI (Шолпан Жолдыбаевна +7 778 104 8127) — для них handoff не делается.
+4. ЗАПРЕЩЕНО подставлять «общий» / «любой» / угаданный номер, если филиал неизвестен. Лучше спросить филиал ещё раз, чем скинуть чужой контакт.
+5. Если CRM не подтвердил заявку или в системном сообщении нет MGR_PHONE — не угадывай номер. Скажи, что передашь заявку, и при необходимости снова уточни филиал.
 
 ═══════════════════════════════════════
 ПЕРЕДАЧА НА ЧЕЛОВЕКА
@@ -502,6 +511,7 @@ __QUANTUM_CONTACT_LINE__
   Подробнее: https://gmchess.kz/lagergmca/
 Франшиза / партнёрство / корпоратив / коллаборация: Данияр Биржанович Омаров — +7 777 955 9999
 Курс менторства для тренеров / трудоустройство в академию: Еркежан Маратовна — +7 702 561 3672
+Обучение искусственному интеллекту / ИИ / AI: Шолпан Жолдыбаевна — +7 778 104 8127
 
 ═══════════════════════════════════════
 АДРЕСА АКАДЕМИЙ GMCA
@@ -952,23 +962,24 @@ class MoyKlassCRM:
         # Для "сборного" filial_id 54672 выбираем телефон по конкретному ключу школы.
         if matched_key and matched_key in BRANCH_PHONES:
             return BRANCH_PHONES[matched_key]
-        if filial_id in BRANCH_PHONES:
+        if filial_id is not None and filial_id in BRANCH_PHONES:
             return BRANCH_PHONES[filial_id]
-        return BRANCH_PHONES["default"]
+        return ""
 
     def _pick_manager_info(self, filial_id, matched_key: Optional[str]):
+        """(имя, телефон) управляющего филиала или (None, None), если филиал неизвестен."""
         if matched_key and matched_key in BRANCH_MANAGERS:
             return BRANCH_MANAGERS[matched_key]
-        if filial_id in BRANCH_MANAGERS:
+        if filial_id is not None and filial_id in BRANCH_MANAGERS:
             return BRANCH_MANAGERS[filial_id]
-        return BRANCH_MANAGERS["default"]
+        return (None, None)
 
     async def get_client_admin_phone(self, user_id: Optional[int]) -> str:
         """Телефон администратора филиала клиента (BRANCH_PHONES по filial_id).
 
         Для клиентских уведомлений: номер должен быть админа того филиала, где
-        учится клиент. Филиал берём из user.filials (как в lead-poll); если не
-        нашли — общий номер (BRANCH_PHONES['default']).
+        учится клиент. Филиал берём из user.filials; если не нашли — пустая строка
+        (не подставляем «общий» номер тренера/чужого менеджера).
         """
         filial_id = None
         if user_id is not None:
@@ -978,6 +989,69 @@ class MoyKlassCRM:
                 if filials:
                     filial_id = filials[0]
         return self._pick_manager_phone(filial_id, None)
+
+    async def get_client_trainer_phone(
+        self,
+        *,
+        user_id: Optional[int] = None,
+        class_id: Optional[int] = None,
+        lesson_id: Optional[int] = None,
+    ) -> str:
+        """Телефон тренера группы/урока из MoyKlass (teacherIds → /managers).
+
+        Приоритет: lessonId → classId → responsibles ученика.
+        """
+        headers = await self._get_headers()
+        if not headers:
+            return ""
+
+        teacher_ids: List[int] = []
+        async with httpx.AsyncClient(timeout=MOYKLASS_HTTP_TIMEOUT) as client:
+            if lesson_id is not None:
+                try:
+                    resp = await client.get(
+                        f"{MOYKLASS_BASE_URL}/lessons/{int(lesson_id)}",
+                        headers=headers,
+                    )
+                    if resp.status_code == 200:
+                        for tid in resp.json().get("teacherIds") or []:
+                            teacher_ids.append(int(tid))
+                except Exception as e:
+                    logger.warning("get_client_trainer_phone: GET /lessons/%s: %s", lesson_id, e)
+
+            if not teacher_ids and class_id is not None:
+                cls = await self._get_class_data(int(class_id), headers, client)
+                if cls:
+                    for tid in cls.get("teacherIds") or []:
+                        teacher_ids.append(int(tid))
+
+        if not teacher_ids and user_id is not None:
+            user = await self.get_user_by_id(int(user_id))
+            if user:
+                for mid in user.get("responsibles") or []:
+                    teacher_ids.append(int(mid))
+                if user.get("responsibleId") is not None:
+                    teacher_ids.append(int(user["responsibleId"]))
+
+        seen = set()
+        for tid in teacher_ids:
+            if tid in seen:
+                continue
+            seen.add(tid)
+            phone = await self.get_manager_phone_by_id(tid)
+            if phone:
+                display = _format_kz_phone_display(phone)
+                logger.info(
+                    "get_client_trainer_phone: userId=%s classId=%s lessonId=%s -> managerId=%s phone=%s",
+                    user_id, class_id, lesson_id, tid, display,
+                )
+                return display
+
+        logger.warning(
+            "get_client_trainer_phone: телефон тренера не найден userId=%s classId=%s lessonId=%s",
+            user_id, class_id, lesson_id,
+        )
+        return ""
 
     @staticmethod
     def _handoff_message(mgr_name: str, mgr_phone: str, *, success: bool) -> str:
@@ -1676,6 +1750,19 @@ class MoyKlassCRM:
                 except Exception as e:
                     logger.error(f"create_lead: исключение при POST /users: {e}")
                     _log_failed_lead({**lead_payload, "stage": "users_post_exception", "error": str(e)}, "users_post_exception")
+                    # MoyKlass мог уже создать пользователя, а ответ оборвался.
+                    # Уведомляем управляющего филиала (не default/тренера) и
+                    # помечаем dedup, чтобы lead-poll не продублировал на fallback.
+                    await self.notify_new_lead_managers(
+                        filial_id, matched_key, name=name, phone=clean_phone,
+                        age=age, experience=experience, preference=preference, wa_link=wa_link,
+                    )
+                    try:
+                        maybe = await self.find_user_smart(clean_phone)
+                        if maybe and maybe.get("user", {}).get("id") is not None:
+                            _mark_lead_notified(int(maybe["user"]["id"]))
+                    except Exception as dedup_err:
+                        logger.warning("create_lead: dedup после users_post_exception: %s", dedup_err)
                     return self._handoff_message(mgr_name, mgr_phone, success=False)
 
                 if create_resp.status_code in [200, 201]:
@@ -1849,13 +1936,16 @@ class MoyKlassCRM:
     ) -> None:
         """Уведомить управляющего филиала о новом лиде.
 
-        Получатель — управляющий филиала по filial_id / matched_key; если филиал
-        не определён — только default (НЕ всем админам).
+        Получатель — управляющий филиала по filial_id / matched_key.
+        Если филиал не определён — никому не шлём (пустой список).
         В тест-режиме (MOYKLASS_WEBHOOK_TEST_PHONE) шлём один раз на тест-номер.
         """
         recipients = _new_lead_recipients(filial_id, matched_key)
         if not recipients:
-            logger.error("notify_new_lead_managers: пустой список получателей (лид=%r)", name)
+            logger.warning(
+                "notify_new_lead_managers: филиал неизвестен — никому не отправляю (лид=%r filial=%s matched=%s)",
+                name, filial_id, matched_key,
+            )
             return
         if _webhook_test_mode_active():
             recipients = recipients[:1]
@@ -1882,11 +1972,24 @@ class MoyKlassCRM:
         """Действующий клиент просит связаться → уведомить управляющего его филиала.
 
         Управляющему уходит номер клиента и текст «у клиента есть вопросы».
-        Возвращает СИСТЕМНОЕ СООБЩЕНИЕ для модели (с MGR_NAME/MGR_PHONE), чтобы она
-        подтвердила клиенту передачу. Филиал неизвестен → ТОЛЬКО default (не всем!).
+        Филиал неизвестен → никому не шлём; модель должна дожать филиал у клиента.
         В тест-режиме уходит только на тест-номер с префиксом [ТЕСТ CRM].
         """
         recipients = _callback_recipients(filial_id)
+        if not recipients:
+            logger.warning(
+                "callback: филиал неизвестен — никому не отправляю (клиент=%r тел=%s)",
+                client_name, client_phone,
+            )
+            return (
+                "СИСТЕМНОЕ СООБЩЕНИЕ: ЗАПРОС НЕ ОТПРАВЛЕН — неизвестен филиал.\n"
+                "ИНСТРУКЦИЯ: НЕ давай клиенту никакой номер управляющего и НЕ обещай, "
+                "что уже передала. Коротко уточни филиал/формат: "
+                "«Подскажите, пожалуйста, в каком филиале занимаетесь или куда обращались — "
+                "GMCA Аркада, GMCA Камал, онлайн или школьный кружок?» "
+                "Как только клиент назовёт филиал — снова вызови request_manager_callback."
+            )
+
         if _webhook_test_mode_active():
             recipients = recipients[:1]
 
@@ -1901,8 +2004,9 @@ class MoyKlassCRM:
         )
 
         sent = 0
-        for mgr_name, mgr_phone in recipients:
-            target_phone = MOYKLASS_WEBHOOK_TEST_PHONE if _webhook_test_mode_active() else mgr_phone
+        mgr_name, mgr_phone = recipients[0]
+        for name, phone in recipients:
+            target_phone = MOYKLASS_WEBHOOK_TEST_PHONE if _webhook_test_mode_active() else phone
             cid = phone_to_chat_id(target_phone)
             if not cid:
                 logger.warning("callback: не удалось нормализовать номер управляющего %r", target_phone)
@@ -1911,6 +2015,7 @@ class MoyKlassCRM:
             try:
                 await send_whatsapp(cid, prefix + body, sanitize=False)
                 sent += 1
+                mgr_name, mgr_phone = name, phone
                 logger.info(
                     "callback: отправлено управляющему %s (клиент=%r, тел=%s, filial=%s)",
                     cid, client_name, client_phone, filial_id,
@@ -1923,8 +2028,12 @@ class MoyKlassCRM:
                 "callback: не удалось уведомить ни одного управляющего (клиент=%r, тел=%s)",
                 client_name, client_phone,
             )
+            return (
+                "СИСТЕМНОЕ СООБЩЕНИЕ: ЗАПРОС ЗАФИКСИРОВАН, НО WHATSAPP УПРАВЛЯЮЩЕМУ НЕ УШЁЛ.\n"
+                "ИНСТРУКЦИЯ: НЕ давай клиенту номер. Скажи, что передашь вопрос и "
+                "управляющий свяжется. Не упоминай технические проблемы."
+            )
 
-        mgr_name, mgr_phone = self._pick_manager_info(filial_id, None)
         return (
             "СИСТЕМНОЕ СООБЩЕНИЕ: ЗАПРОС НА СВЯЗЬ ПЕРЕДАН УПРАВЛЯЮЩЕМУ.\n"
             f"MGR_NAME={mgr_name}\n"
@@ -2243,6 +2352,49 @@ def _guess_filial_from_text(text: str):
     return None
 
 
+def _matched_key_from_text(text: str) -> Optional[str]:
+    low = (text or "").lower()
+    if not low:
+        return None
+    for key in sorted(FILIALS_MAP.keys(), key=len, reverse=True):
+        if key in low:
+            return key
+    return None
+
+
+def _remember_session_branch(
+    chat_id: str,
+    *,
+    preference: str = "",
+    client_name: Optional[str] = None,
+    filial_id=None,
+) -> None:
+    """Сохраняет филиал/управляющего в досье чата после заявки.
+
+    Нужно, чтобы повторный «мне не ответили» / request_manager_callback
+    шёл тому же управляющему. Без филиала менеджера не подставляем.
+    """
+    matched_key = _matched_key_from_text(preference)
+    if filial_id is None:
+        filial_id = FILIALS_MAP.get(matched_key) if matched_key else _guess_filial_from_text(preference)
+    mgr_name, mgr_phone = crm._pick_manager_info(filial_id, matched_key)
+    dossier = client_dossiers.get(chat_id) or {}
+    if client_name:
+        dossier["name"] = client_name
+    if filial_id is not None:
+        dossier["filial_id"] = filial_id
+    if matched_key:
+        dossier["matched_key"] = matched_key
+    if mgr_name and mgr_phone:
+        dossier["mgr_name"] = mgr_name
+        dossier["mgr_phone"] = mgr_phone
+    client_dossiers[chat_id] = dossier
+    logger.info(
+        "session branch: chat=%s filial=%s matched=%r mgr=%s %s",
+        chat_id, filial_id, matched_key, mgr_name, mgr_phone,
+    )
+
+
 def _client_needs_human(user_text: str) -> bool:
     return bool(_CLIENT_NEEDS_HUMAN_RE.search(user_text or ""))
 
@@ -2270,10 +2422,14 @@ async def _ensure_manager_callback(chat_id: str, reason: str = "") -> bool:
     client_name = dossier.get("name") or "Клиент"
     filial_id = dossier.get("filial_id")
     if filial_id is None:
-        filial_id = _guess_filial_from_text(reason)
+        hist_blob = " ".join(
+            _history_message_content(m)
+            for m in (chat_history.get(chat_id) or [])[-12:]
+        )
+        filial_id = _guess_filial_from_text(f"{reason} {hist_blob}")
 
     try:
-        await crm.notify_client_callback_request(
+        result = await crm.notify_client_callback_request(
             client_name=client_name,
             client_phone=client_phone,
             filial_id=filial_id,
@@ -2283,7 +2439,16 @@ async def _ensure_manager_callback(chat_id: str, reason: str = "") -> bool:
         logger.error("callback safety-net упал для %s: %s", chat_id, e)
         return False
 
+    if "MGR_PHONE=" not in (result or ""):
+        logger.info(
+            "callback safety-net: филиал неизвестен для %s — WhatsApp не отправлен",
+            chat_id,
+        )
+        return False
+
     session_manager_notified[chat_id] = time.time()
+    if filial_id is not None:
+        _remember_session_branch(chat_id, filial_id=filial_id, client_name=client_name)
     logger.info(
         "callback: safety-net уведомил управляющего по %s (filial=%s, reason=%r)",
         chat_id, filial_id, (reason or "")[:120],
@@ -2703,26 +2868,53 @@ async def process_dialog(chat_id):
                         phone_to_save = args.get("client_phone")
                         if not phone_to_save or "не указа" in phone_to_save.lower():
                             phone_to_save = chat_id.split("@")[0]
+                        preference = args.get("preference", "Не выбрано")
+                        # Запоминаем филиал/управляющего в сессии — иначе при
+                        # «мне не ответили» callback уйдёт на default.
+                        _remember_session_branch(
+                            chat_id,
+                            preference=preference,
+                            client_name=args.get("client_name"),
+                        )
                         try:
                             result_text = await crm.create_lead(
                                 name=args.get("client_name", "Клиент"),
                                 phone=phone_to_save,
                                 age=args.get("client_age", "-"),
                                 experience=args.get("experience", "-"),
-                                preference=args.get("preference", "Не выбрано")
+                                preference=preference,
                             )
                         except Exception as e:
                             logger.error(f"create_lead неожиданно упал: {e}")
-                            mgr_name, mgr_phone = crm._pick_manager_info("default", None)
-                            result_text = crm._handoff_message(mgr_name, mgr_phone, success=False)
+                            dossier = client_dossiers.get(chat_id) or {}
+                            mgr_name = dossier.get("mgr_name")
+                            mgr_phone = dossier.get("mgr_phone")
+                            if not mgr_name or not mgr_phone:
+                                mgr_name, mgr_phone = crm._pick_manager_info(
+                                    dossier.get("filial_id"), dossier.get("matched_key")
+                                )
+                            if mgr_name and mgr_phone:
+                                result_text = crm._handoff_message(mgr_name, mgr_phone, success=False)
+                            else:
+                                result_text = (
+                                    "СИСТЕМНОЕ СООБЩЕНИЕ: ЗАЯВКУ ПОКА НЕ ОФОРМЛЯЙ — неизвестен филиал.\n"
+                                    "ИНСТРУКЦИЯ: НЕ давай никакой номер. Спроси филиал: "
+                                    "GMCA Аркада, GMCA Камал или онлайн?"
+                                )
                     elif tool.function.name == "request_manager_callback":
                         dossier = client_dossiers.get(chat_id) or {}
                         client_phone = chat_id.split("@")[0]
                         client_name = dossier.get("name") or "Клиент"
                         filial_id = dossier.get("filial_id")
                         if filial_id is None:
+                            # Досье пустое (новый лид) — ищем филиал в причине,
+                            # тексте клиента и недавней истории чата.
+                            hist_blob = " ".join(
+                                _history_message_content(m)
+                                for m in (chat_history.get(chat_id) or [])[-12:]
+                            )
                             filial_id = _guess_filial_from_text(
-                                f"{args.get('reason', '')} {user_text}"
+                                f"{args.get('reason', '')} {user_text} {hist_blob}"
                             )
                         try:
                             result_text = await crm.notify_client_callback_request(
@@ -2732,15 +2924,19 @@ async def process_dialog(chat_id):
                                 reason=args.get("reason", "") or user_text[:200],
                             )
                             callback_sent_this_turn = True
-                            session_manager_notified[chat_id] = time.time()
+                            # Помечаем только если реально ушло (есть MGR_PHONE).
+                            if "MGR_PHONE=" in result_text:
+                                session_manager_notified[chat_id] = time.time()
+                                if filial_id is not None:
+                                    _remember_session_branch(
+                                        chat_id, filial_id=filial_id, client_name=client_name
+                                    )
                         except Exception as e:
                             logger.error(f"request_manager_callback неожиданно упал: {e}")
-                            mgr_name, mgr_phone = crm._pick_manager_info(filial_id, None)
                             result_text = (
-                                "СИСТЕМНОЕ СООБЩЕНИЕ: ЗАПРОС НА СВЯЗЬ ЗАФИКСИРОВАН.\n"
-                                f"MGR_NAME={mgr_name}\n"
-                                f"MGR_PHONE={mgr_phone}\n"
-                                "ИНСТРУКЦИЯ: подтверди клиенту, что управляющий свяжется в ближайшее время."
+                                "СИСТЕМНОЕ СООБЩЕНИЕ: ЗАПРОС ЗАФИКСИРОВАН.\n"
+                                "ИНСТРУКЦИЯ: НЕ давай номер. Подтверди, что вопрос передашь, "
+                                "и при необходимости уточни филиал."
                             )
                     else:
                         logger.warning(
@@ -2975,7 +3171,18 @@ def _pick_online_link(*sources: Optional[dict]) -> Optional[str]:
 def _append_online_link(message: str, online_link: Optional[str]) -> str:
     if not online_link or online_link in message:
         return message
-    return f"{message.rstrip()} Ссылка на урок: {online_link}"
+    return f"{message.rstrip()}\nСсылка на урок: {online_link}"
+
+
+def _append_trainer_contact(message: str, trainer_phone: Optional[str]) -> str:
+    """Добавляет строку с номером тренера в конец сообщения (если есть)."""
+    phone = (trainer_phone or "").strip()
+    if not phone:
+        return message
+    line = f"Тренер: {phone}"
+    if line in message or phone in message:
+        return message
+    return f"{message.rstrip()}\n{line}"
 
 
 class _SafeFormatDict(dict):
@@ -3016,13 +3223,38 @@ _NOTIFICATION_TEMPLATES = {
     "class_start_days": "Здравствуйте. Напоминаем: ваша группа стартует {beginDate}. Если есть вопросы, напишите нам.",
     "lesson_mark_set": "Здравствуйте. Преподаватель выставил оценку за {type_text}: {value}.",
     "join_new": "Здравствуйте. Ваша заявка на обучение получена. Управляющий свяжется с вами в ближайшее время.",
-    "user_consecutive_visit_missed_2": "Ученик отсутствует на уроке или тренер забыл отметить его в журнале. Свяжитесь с тренером {admin_phone}",
+    "user_consecutive_visit_missed_2": "Ученик отсутствует на уроке или тренер забыл отметить его в журнале. Свяжитесь с тренером {trainer_phone}",
     "user_birthday": "Поздравляем с днём рождения {userName}! Желаем успехов и великих побед по жизни! 🥇♟️",
 }
 
 # Клиентские события, в шаблон которых подставляется телефон администратора
 # филиала клиента ({admin_phone} = BRANCH_PHONES[filial_id]).
-_CLIENT_ADMIN_PHONE_EVENTS = frozenset({"sub_lesson_in_debt", "user_consecutive_visit_missed_2"})
+_CLIENT_ADMIN_PHONE_EVENTS = frozenset({"sub_lesson_in_debt"})
+# События с телефоном тренера группы ({trainer_phone} из MoyKlass teacherIds).
+_CLIENT_TRAINER_PHONE_EVENTS = frozenset({
+    "user_consecutive_visit_missed_2",
+    "lesson_start",
+    "lesson_start_hours",
+    "lesson_start_days",
+    "class_start_hours",
+    "class_start_days",
+})
+# Сотруднические события, куда тоже дописываем номер тренера занятия.
+_EMPLOYEE_TRAINER_PHONE_EVENTS = frozenset({
+    "lesson_start",
+    "lesson_start_hours",
+    "lesson_changed",
+})
+
+
+def _format_kz_phone_display(phone: str) -> str:
+    """Приводит номер к виду +7 XXX XXX XXXX для текста клиенту."""
+    digits = re.sub(r"\D", "", phone or "")
+    if len(digits) == 11 and digits.startswith("7"):
+        return f"+7 {digits[1:4]} {digits[4:7]} {digits[7:]}"
+    if len(digits) == 10:
+        return f"+7 {digits[0:3]} {digits[3:6]} {digits[6:]}"
+    return (phone or "").strip()
 
 
 def build_new_lead_admin_message(
@@ -3071,8 +3303,17 @@ def build_notification_message(event: str, obj: dict) -> Optional[str]:
 
     message = _safe_format(template, fmt_obj)
 
+    if event == "user_consecutive_visit_missed_2" and not (fmt_obj.get("trainer_phone") or "").strip():
+        # Нет телефона тренера — не оставляем висячее «Свяжитесь с тренером».
+        message = (
+            "Ученик отсутствует на уроке или тренер забыл отметить его в журнале. "
+            "Напишите нам — разберёмся."
+        )
+
     if event in _CLIENT_ONLINE_LINK_EVENTS:
         message = _append_online_link(message, obj.get("onlineLink"))
+    if event in _CLIENT_TRAINER_PHONE_EVENTS:
+        message = _append_trainer_contact(message, fmt_obj.get("trainer_phone") or obj.get("trainer_phone"))
     return message
 
 
@@ -3131,6 +3372,8 @@ def build_employee_notification_message(event: str, obj: dict) -> Optional[str]:
         message = lesson_reminder
         if event in _EMPLOYEE_ONLINE_LINK_EVENTS:
             message = _append_online_link(message, obj.get("onlineLink"))
+        if event in _EMPLOYEE_TRAINER_PHONE_EVENTS:
+            message = _append_trainer_contact(message, obj.get("trainer_phone"))
         return message
 
     template = _EMPLOYEE_NOTIFICATION_TEMPLATES.get(event)
@@ -3155,6 +3398,8 @@ def build_employee_notification_message(event: str, obj: dict) -> Optional[str]:
 
     if event in _EMPLOYEE_ONLINE_LINK_EVENTS:
         message = _append_online_link(message, obj.get("onlineLink"))
+    if event in _EMPLOYEE_TRAINER_PHONE_EVENTS:
+        message = _append_trainer_contact(message, obj.get("trainer_phone") or fmt_obj.get("trainer_phone"))
     return message
 
 
@@ -3504,11 +3749,17 @@ async def handle_moyklass_webhook(secret: str, request: Request):
             )
             return {"status": "ok"}
 
-        # Подставляем телефон администратора филиала клиента и имя ученика —
+        # Подставляем телефон администратора филиала / тренера группы —
         # только для событий, чьи шаблоны это используют (минимум лишних API-вызовов,
         # после kill-switch/stale-проверок).
         if event in _CLIENT_ADMIN_PHONE_EVENTS and not obj.get("admin_phone"):
             obj["admin_phone"] = await crm.get_client_admin_phone(obj.get("userId"))
+        if event in _CLIENT_TRAINER_PHONE_EVENTS and not obj.get("trainer_phone"):
+            obj["trainer_phone"] = await crm.get_client_trainer_phone(
+                user_id=obj.get("userId"),
+                class_id=obj.get("classId"),
+                lesson_id=obj.get("lessonId"),
+            )
         if event == "user_birthday" and not (obj.get("userName") or obj.get("name")):
             if obj.get("userId") is not None:
                 bday_user = await crm.get_user_by_id(int(obj["userId"]))
@@ -3629,6 +3880,13 @@ async def handle_moyklass_webhook_employee(secret: str, request: Request):
         # филиалу лида, а не по преподавателю/ответственному, как обычные staff-события.
         if event in _NEW_LEAD_ADMIN_EVENTS:
             return await _handle_new_lead_admin_notification(event, obj)
+
+        if event in _EMPLOYEE_TRAINER_PHONE_EVENTS and not obj.get("trainer_phone"):
+            obj["trainer_phone"] = await crm.get_client_trainer_phone(
+                user_id=obj.get("userId"),
+                class_id=obj.get("classId"),
+                lesson_id=obj.get("lessonId"),
+            )
 
         message = build_employee_notification_message(event, obj)
         if not message:
@@ -3757,9 +4015,25 @@ async def _poll_new_leads_once() -> None:
         else:
             phone = u.get("phone") or ""
             filials = u.get("filials") or []
+            # В списке /users filials иногда пустой — дотягиваем карточку.
+            if not filials:
+                try:
+                    full = await crm.get_user_by_id(uid)
+                    if full:
+                        filials = full.get("filials") or []
+                except Exception as e:
+                    logger.warning("lead-poll: get_user_by_id(%s) failed: %s", uid, e)
             filial_id = filials[0] if filials else None
+            if filial_id is None:
+                logger.warning(
+                    "lead-poll: userId=%s без филиала — никому не отправляю (нужен филиал)",
+                    uid,
+                )
+                _mark_lead_notified(uid)
+                _lead_poll_watermark = max(_lead_poll_watermark, uid)
+                continue
             wa_link = f"https://wa.me/{re.sub(r'[^0-9]', '', phone)}" if phone else "-"
-            logger.info("lead-poll: новый лид userId=%s name=%r -> управляющий(е) филиала", uid, u.get("name"))
+            logger.info("lead-poll: новый лид userId=%s name=%r filial=%s -> управляющий(е) филиала", uid, u.get("name"), filial_id)
             await crm.notify_new_lead_managers(
                 filial_id,
                 name=u.get("name") or "-", phone=phone or "-", age="-", experience="-",
