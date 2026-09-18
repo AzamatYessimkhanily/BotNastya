@@ -1,0 +1,23 @@
+---
+description: How the agent accesses MoyKlass CRM (API first, browser for UI)
+alwaysApply: true
+---
+
+# MoyKlass access for BotNastya
+
+## Prefer API first
+- Use `MOYKLASS_API_KEY` from project `.env` (never commit secrets).
+- Auth: `POST https://api.moyklass.com/v1/company/auth/getToken` with `{"apiKey": "..."}`.
+- Then call company endpoints with header `x-access-token`.
+- Use API for: users, lessons, lessonRecords, joins, managers, subscriptions, webhooks testing via bot endpoints.
+
+## Browser (Playwright MCP) for UI-only work
+- Use Playwright MCP when API cannot do it: MoyKlass **Сценарии**, scheduled/deferred sends, UI toggles, visual checks.
+- Login URL is typically `https://app.moyklass.com` (or the school’s MoyKlass cabinet).
+- Profile is persisted in `.playwright-moyklass-profile` so login can be reused after the human logs in once.
+- Do not store passwords in git. If session expired, ask the user to log in once in the opened browser window.
+
+## Safety
+- Keep `MOYKLASS_WEBHOOK_TEST_PHONE` set while testing CRM→WhatsApp so parents are not spammed.
+- Prefer dry-runs / test phone before clearing test mode.
+- Never disable rate limits completely; raise caps carefully if needed.

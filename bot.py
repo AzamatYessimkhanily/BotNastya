@@ -114,6 +114,10 @@ CRM_SENT_STATE_FILE = os.getenv("CRM_SENT_STATE_FILE", "crm_sent_state.json")
 _lead_poll_watermark: Optional[int] = None
 _SCHOOL_TZ = ZoneInfo("Asia/Almaty")
 
+# --- Монитор посещаемости (долг на 2-м визите / не отмечен через N минут) ---
+# По умолчанию ВЫКЛ в коде; на сервере включаем ATTENDANCE_MONITOR_ENABLED=1 + тест-номер.
+import attendance_monitor as _attendance_monitor  # noqa: E402
+
 # Контакт Quantum STEM: при необходимости переопределить через QUANTUM_MANAGER_PHONE / QUANTUM_MANAGER_NAME в .env
 QUANTUM_MANAGER_NAME = os.getenv("QUANTUM_MANAGER_NAME", "Запись на кружки школы")
 QUANTUM_MANAGER_PHONE = os.getenv("QUANTUM_MANAGER_PHONE", "+7 708 809 9840")
@@ -4068,6 +4072,46 @@ async def _start_lead_poller() -> None:
         return
     _load_lead_poll_state()
     asyncio.create_task(_lead_poll_loop())
+
+
+@app.on_event("startup")
+async def _start_attendance_monitor() -> None:
+    if not _attendance_monitor.ATTENDANCE_MONITOR_ENABLED:
+        logger.info("attendance: отключён (ATTENDANCE_MONITOR_ENABLED=0)")
+        return
+
+    async def _dispatch_client(event, obj, message, phones):
+        if _attendance_monitor.ATTENDANCE_DRY_RUN:
+            logger.info(
+                "attendance DRY: event=%s phones=%s msg=%s",
+                event, phones, (message or "")[:120],
+            )
+            return {"status": "dry"}
+        return await _dispatch_moyklass_webhook(
+            "attendance-monitor", event, obj, message, phones, record_history=True,
+        )
+
+    async def _trainer(**kw):
+        return await crm.get_client_trainer_phone(**kw)
+
+    async def _admin(uid):
+        return await crm.get_client_admin_phone(uid)
+
+    async def _is_client(uid):
+        return await crm.user_is_mailing_client(uid)
+
+    async def _phone(uid):
+        return await crm.get_user_phone_by_id(uid)
+
+    asyncio.create_task(_attendance_monitor.attendance_loop(
+        crm=crm,
+        base_url=MOYKLASS_BASE_URL,
+        dispatch_client_message=_dispatch_client,
+        get_trainer_phone=_trainer,
+        get_admin_phone=_admin,
+        user_is_mailing_client=_is_client,
+        get_user_phone=_phone,
+    ))
 
 
 # --- 10. АВТО-РЕАКТИВАЦИЯ «СПЯЩИХ» ЛИДОВ ---

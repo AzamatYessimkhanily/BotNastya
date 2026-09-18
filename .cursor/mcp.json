@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@playwright/mcp@latest",
+        "--browser=chrome",
+        "--viewport-size=1440,900",
+        "--user-data-dir=/Users/miraszhukenov/BotNastya/.playwright-moyklass-profile"
+      ]
+    }
+  }
+}
