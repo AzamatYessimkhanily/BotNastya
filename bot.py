@@ -1891,37 +1891,38 @@ class MoyKlassCRM:
         wa_link: str,
         source: str = "Бот оформил заявку.",
     ) -> None:
-        """Служебное WhatsApp-уведомление центральному администратору о новом лиде.
+        """Служебное WhatsApp-уведомление управляющему о новом лиде.
 
-        Не клиентское сообщение. В тест-режиме (MOYKLASS_WEBHOOK_TEST_PHONE)
-        уходит на тест-номер с префиксом [ТЕСТ CRM], а не реальному администратору.
+        Всегда уходит на реальный номер управляющего.
+        MOYKLASS_WEBHOOK_TEST_PHONE сюда НЕ применяется — это внутренний алерт,
+        а не клиентская CRM-рассылка (иначе заявки «теряются» у Шолпан и др.).
         Любая ошибка отправки гасится — она НЕ должна ломать создание лида.
         """
-        target_phone = admin_phone
-        prefix = ""
-        if _webhook_test_mode_active():
-            target_phone = MOYKLASS_WEBHOOK_TEST_PHONE
-            prefix = "[ТЕСТ CRM] "
-
-        chat_id = phone_to_chat_id(target_phone)
+        chat_id = phone_to_chat_id(admin_phone)
         if not chat_id:
             logger.warning(
                 "notify_new_lead_admin: не удалось нормализовать номер %r (admin=%r)",
-                target_phone, admin_name,
+                admin_phone, admin_name,
             )
             return
 
-        message = prefix + build_new_lead_admin_message(
+        message = build_new_lead_admin_message(
             name=name, phone=phone, age=age,
             experience=experience, preference=preference, wa_link=wa_link,
             source=source,
         )
         try:
-            await send_whatsapp(chat_id, message, sanitize=False)
-            logger.info(
-                "notify_new_lead_admin: отправлено %s (admin=%r, лид=%r)",
-                chat_id, admin_name, name,
-            )
+            delivered = await send_whatsapp(chat_id, message, sanitize=False)
+            if delivered:
+                logger.info(
+                    "notify_new_lead_admin: отправлено %s (admin=%r, лид=%r)",
+                    chat_id, admin_name, name,
+                )
+            else:
+                logger.error(
+                    "notify_new_lead_admin: НЕ доставлено %s (admin=%r, лид=%r)",
+                    chat_id, admin_name, name,
+                )
         except Exception as e:
             logger.error("notify_new_lead_admin: ошибка отправки %s: %s", chat_id, e)
 
@@ -1942,7 +1943,7 @@ class MoyKlassCRM:
 
         Получатель — управляющий филиала по filial_id / matched_key.
         Если филиал не определён — никому не шлём (пустой список).
-        В тест-режиме (MOYKLASS_WEBHOOK_TEST_PHONE) шлём один раз на тест-номер.
+        Тест-номер CRM сюда не подмешиваем.
         """
         recipients = _new_lead_recipients(filial_id, matched_key)
         if not recipients:
@@ -1951,8 +1952,6 @@ class MoyKlassCRM:
                 name, filial_id, matched_key,
             )
             return
-        if _webhook_test_mode_active():
-            recipients = recipients[:1]
         logger.info(
             "notify_new_lead_managers: лид=%r filial=%s matched=%s -> %d получатель(ей): %s",
             name, filial_id, matched_key, len(recipients),
@@ -1977,7 +1976,7 @@ class MoyKlassCRM:
 
         Управляющему уходит номер клиента и текст «у клиента есть вопросы».
         Филиал неизвестен → никому не шлём; модель должна дожать филиал у клиента.
-        В тест-режиме уходит только на тест-номер с префиксом [ТЕСТ CRM].
+        Тест-номер CRM сюда не подмешиваем — callback всегда на реального управляющего.
         """
         recipients = _callback_recipients(filial_id)
         if not recipients:
@@ -1994,9 +1993,6 @@ class MoyKlassCRM:
                 "Как только клиент назовёт филиал — снова вызови request_manager_callback."
             )
 
-        if _webhook_test_mode_active():
-            recipients = recipients[:1]
-
         clean = re.sub(r"[^0-9]", "", client_phone or "")
         wa_link = f"https://wa.me/{clean}" if clean else "-"
         comment = f"\nКомментарий: {reason.strip()}" if reason and reason.strip() else ""
@@ -2010,14 +2006,15 @@ class MoyKlassCRM:
         sent = 0
         mgr_name, mgr_phone = recipients[0]
         for name, phone in recipients:
-            target_phone = MOYKLASS_WEBHOOK_TEST_PHONE if _webhook_test_mode_active() else phone
-            cid = phone_to_chat_id(target_phone)
+            cid = phone_to_chat_id(phone)
             if not cid:
-                logger.warning("callback: не удалось нормализовать номер управляющего %r", target_phone)
+                logger.warning("callback: не удалось нормализовать номер управляющего %r", phone)
                 continue
-            prefix = "[ТЕСТ CRM] " if _webhook_test_mode_active() else ""
             try:
-                await send_whatsapp(cid, prefix + body, sanitize=False)
+                delivered = await send_whatsapp(cid, body, sanitize=False)
+                if not delivered:
+                    logger.error("callback: НЕ доставлено управляющему %s", cid)
+                    continue
                 sent += 1
                 mgr_name, mgr_phone = name, phone
                 logger.info(
