@@ -43,9 +43,16 @@ ATTENDANCE_MAX_SEND_PER_TICK = int(os.getenv("ATTENDANCE_MAX_SEND_PER_TICK", "5"
 
 _DRY = os.getenv("ATTENDANCE_DRY_RUN", "0").strip().lower()
 ATTENDANCE_DRY_RUN = _DRY in ("1", "true", "yes", "on")
-# Одноразовый прогон: пометить текущих кандидатов в state без WhatsApp (анти-бэклог перед продом).
 _SEED = os.getenv("ATTENDANCE_SEED_ONLY", "0").strip().lower()
 ATTENDANCE_SEED_ONLY = _SEED in ("1", "true", "yes", "on")
+# Абонементы «Қосымша» / бесплатные (цена 0–1₸) — «в долг» НЕ шлём.
+_FREE_SUB_IDS_RAW = os.getenv("DEBT_EXCLUDE_SUBSCRIPTION_IDS", "132913,181106")
+DEBT_EXCLUDE_SUBSCRIPTION_IDS: Set[int] = {
+    int(x) for x in re.split(r"[\s,;]+", _FREE_SUB_IDS_RAW) if x.strip().isdigit()
+}
+DEBT_EXCLUDE_MAX_PRICE = float(os.getenv("DEBT_EXCLUDE_MAX_PRICE", "1") or "1")
+# statusId активного абонемента в MoyKlass (2 = действует).
+_ACTIVE_SUB_STATUS = int(os.getenv("MOYKLASS_ACTIVE_SUB_STATUS_ID", "2") or "2")
 
 _state_lock = asyncio.Lock()
 _missed_sent: Set[str] = set()
@@ -129,6 +136,52 @@ def format_debt_message(admin_phone: Optional[str]) -> str:
         "Занятие проведено в долг. "
         "Для оплаты свяжитесь с администратором филиала."
     )
+
+
+async def user_has_free_or_qosymsha_sub(crm, base_url: str, user_id: int) -> bool:
+    """True если у ученика активный абонемент Қосымша / бесплатный / цена ≤1₸."""
+    headers = await crm._get_headers()
+    if not headers:
+        return False
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                f"{base_url}/userSubscriptions",
+                headers=headers,
+                params={"userId": int(user_id), "limit": 50},
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    "attendance: userSubscriptions userId=%s -> %s",
+                    user_id, resp.status_code,
+                )
+                return False
+            items = resp.json().get("subscriptions") or resp.json().get("userSubscriptions") or []
+            for sub in items:
+                status_id = sub.get("statusId")
+                if status_id is not None and int(status_id) != _ACTIVE_SUB_STATUS:
+                    continue
+                sid = sub.get("subscriptionId")
+                try:
+                    price = float(sub.get("price") if sub.get("price") is not None else 999999)
+                except (TypeError, ValueError):
+                    price = 999999
+                if sid is not None and int(sid) in DEBT_EXCLUDE_SUBSCRIPTION_IDS:
+                    logger.info(
+                        "attendance: skip debt free-sub userId=%s subscriptionId=%s price=%s",
+                        user_id, sid, price,
+                    )
+                    return True
+                if price <= DEBT_EXCLUDE_MAX_PRICE:
+                    logger.info(
+                        "attendance: skip debt low-price userId=%s subscriptionId=%s price=%s",
+                        user_id, sid, price,
+                    )
+                    return True
+    except Exception as e:
+        logger.warning("attendance: free-sub check userId=%s: %s", user_id, e)
+    return False
 
 
 async def count_visits_this_month(crm, base_url: str, user_id: int, now: datetime) -> int:
@@ -239,6 +292,7 @@ async def attendance_tick(
     client_cache: Dict[int, bool] = {}
     phone_cache: Dict[int, Optional[str]] = {}
     trainer_cache: Dict[Tuple[int, int], str] = {}
+    free_sub_cache: Dict[int, bool] = {}
 
     for lesson in lessons:
         lesson_id = lesson.get("id")
@@ -321,6 +375,15 @@ async def attendance_tick(
             if in_debt_window and rec.get("visit"):
                 dkey = _month_key(uid, now)
                 if dkey in _debt_sent:
+                    continue
+                if uid not in free_sub_cache:
+                    free_sub_cache[uid] = await user_has_free_or_qosymsha_sub(
+                        crm, base_url, uid,
+                    )
+                if free_sub_cache[uid]:
+                    # Қосымша / бесплатные — не считаем «в долг», сразу в state.
+                    _debt_sent.add(dkey)
+                    stats["skipped"] += 1
                     continue
                 if uid not in visits_cache:
                     visits_cache[uid] = await count_visits_this_month(
