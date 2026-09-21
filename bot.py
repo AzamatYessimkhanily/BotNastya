@@ -2171,6 +2171,35 @@ _HANDOFF_MARKERS = (
     "передаю управляющему",
     "заявку оформила",
     "заявку оформили",
+    "оформляю заявку",
+    "оформляю предварительную",
+    "предварительную заявку",
+    "предварительная заявка",
+    "заявку на имя",
+    "скоро с вами свяжется",
+    "свяжется с вами",
+    "свяжется управляющ",
+    "управляющий скоро",
+    "управляющий свяжется",
+    "передала управляющ",
+    "передал управляющ",
+    "өтінішті рәсімдедім",
+    "өтінішті рәсімдеді",
+    "басқарушымен байланысады",
+)
+
+# Клиент закрыл/отложил вопрос — реактивацию «ещё актуален?» не шлём.
+_FOLLOWUP_CLOSED_RE = re.compile(
+    r"не\s+интерес|неинтерес|не\s+надо|не\s+нужн|не\s+буд|не\s+хоч|передума|"
+    r"отказ|отстань|не\s+пишите|спам|уже\s+не\s+актуал|больше\s+не\s+пиш|"
+    r"потом\s+запиш|позже\s+запиш|запиш\w*\s+потом|запиш\w*\s+позже|"
+    r"с\s+октябр|с\s+ноябр|с\s+декабр|с\s+январ|с\s+феврал|с\s+март|"
+    r"с\s+апрел|с\s+ма[йя]|с\s+июн|с\s+июл|с\s+август|с\s+сентябр|"
+    r"со\s+следующ|в\s+следующ\w*\s+месяц|через\s+месяц|"
+    r"пока\s+не\s+|не\s+сейчас|отлож|перенес\w*\s+на|"
+    r"ещ[её]\s+нет\s+\d|когда\s+исполнит|когда\s+будет\s+\d|"
+    r"кейін\s+жаз|кейінірек|қазаннан|қарашадан|желтоқсаннан",
+    re.IGNORECASE,
 )
 
 _SUBSTANTIVE_FOLLOWUP_HINTS = (
@@ -2474,9 +2503,9 @@ def _update_followup_tracking(chat_id: str, user_text: str) -> None:
     if chat_id in known_users:
         followups.pop(chat_id, None)
         return
-    if _FOLLOWUP_REFUSAL_RE.search(user_text or ""):
+    if _FOLLOWUP_CLOSED_RE.search(user_text or "") or _FOLLOWUP_REFUSAL_RE.search(user_text or ""):
         if chat_id in followups:
-            logger.info("followup: %s — клиент отказался, снимаем с реактивации", chat_id)
+            logger.info("followup: %s — вопрос закрыт/отложен клиентом, снимаем с реактивации", chat_id)
         followups.pop(chat_id, None)
         return
     # Клиент активен: (пере)ставим таймер, цепочку напоминаний начинаем заново.
@@ -4134,7 +4163,33 @@ def _followup_noon_reached(last_ts: float, now_local: datetime) -> bool:
     return now_local >= target
 
 
+def _chat_looks_followup_closed(chat_id: str) -> bool:
+    """По истории: заявка уже оформлена / клиент отложил — follow-up не шлём."""
+    if (
+        chat_id in handoff_completed
+        or chat_id in session_registered_leads
+        or chat_id in known_users
+    ):
+        return True
+    history = chat_history.get(chat_id) or []
+    for msg in history[-8:]:
+        content = _history_message_content(msg)
+        role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", None)
+        if role == "assistant" and _is_handoff_message(content):
+            return True
+        if role == "user" and (
+            _FOLLOWUP_CLOSED_RE.search(content or "")
+            or _FOLLOWUP_REFUSAL_RE.search(content or "")
+        ):
+            return True
+    return False
+
+
 async def _send_followup_message(chat_id: str) -> bool:
+    if _chat_looks_followup_closed(chat_id):
+        followups.pop(chat_id, None)
+        logger.info("followup: skip %s — диалог уже закрыт/оформлен", chat_id)
+        return False
     ok = await send_whatsapp(chat_id, FOLLOWUP_MESSAGE, sanitize=False)
     if ok and chat_id in chat_history:
         chat_history[chat_id].append({"role": "assistant", "content": FOLLOWUP_MESSAGE})
