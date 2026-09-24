@@ -6,6 +6,7 @@ __pycache__/
 failed_leads.jsonl
 bot.py.backup-*
 attendance_state.json
+followup_blocked.json
 .playwright-moyklass-profile/
 .playwright-mcp/
 

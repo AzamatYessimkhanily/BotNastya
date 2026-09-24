@@ -690,6 +690,12 @@ followups: Dict[str, dict] = {}
 # больше не шлём, даже если клиент продолжил переписку (тогда handoff_completed
 # снимается для ответов на новые вопросы, а этот признак сохраняется до сброса сессии).
 session_registered_leads: set = set()
+# Персистентный блок follow-up (переживает SESSION_TIMEOUT / рестарт процесса).
+FOLLOWUP_BLOCKED_FILE = os.getenv("FOLLOWUP_BLOCKED_FILE", "followup_blocked.json")
+followup_blocked: set = set()
+# Недавнее CRM-автоуведомление: chat_id -> unix ts (ответ = реакция на CRM, не новый лид).
+crm_notify_recent: Dict[str, float] = {}
+CRM_NOTIFY_CONTEXT_SEC = int(os.getenv("CRM_NOTIFY_CONTEXT_SEC", "21600") or "21600")  # 6ч
 # Дедуп WhatsApp-уведомлений управляющему «свяжитесь с клиентом» (чтобы не спамить
 # при каждом сообщении в том же диалоге). chat_id -> unix ts последней отправки.
 session_manager_notified: Dict[str, float] = {}
@@ -2198,7 +2204,12 @@ _FOLLOWUP_CLOSED_RE = re.compile(
     r"со\s+следующ|в\s+следующ\w*\s+месяц|через\s+месяц|"
     r"пока\s+не\s+|не\s+сейчас|отлож|перенес\w*\s+на|"
     r"ещ[её]\s+нет\s+\d|когда\s+исполнит|когда\s+будет\s+\d|"
-    r"кейін\s+жаз|кейінірек|қазаннан|қарашадан|желтоқсаннан",
+    r"кейін\s+жаз|кейінірек|қазаннан|қарашадан|желтоқсаннан|"
+    r"до\s*свидан|всего\s+доброг|хорошего\s+дня|пока\b|досвидан|"
+    r"закрыл\w*\s+вопрос|вопрос\s+закрыт|мы\s+же\s+закрыл|"
+    r"мы\s+ходим|уже\s+ходим|ходим\s+к\s+вам|уже\s+учим|уже\s+клиент|"
+    r"на\s+уроке|на\s+занятии|сейчас\s+на\s+уроке|"
+    r"қош\s+болыңыз|сау\s+болыңыз|рақмет.*қош|рахмет.*қош",
     re.IGNORECASE,
 )
 
@@ -2212,9 +2223,10 @@ _PURE_ACK_PHRASES = frozenset({
     "хорошо", "ок", "okay", "ok", "ладно", "понятно", "ясно",
     "спасибо", "благодарю", "thanks", "thank you",
     "до свидания", "всего доброго", "пока", "досвидания",
-    "жарайды", "рахмет", "рақмет", "окей",
+    "жарайды", "жақсы", "жаксы", "рахмет", "рақмет", "окей",
     "хорошо спасибо", "ок спасибо", "ладно спасибо",
     "спасибо вам", "большое спасибо", "хорошо благодарю",
+    "спасибо до свидания", "хорошо до свидания", "ок до свидания",
 })
 
 
@@ -2321,6 +2333,41 @@ def _repair_dangling_tool_calls(chat_id: str) -> None:
         del history[idx:end]
 
 
+def _load_followup_blocked() -> None:
+    global followup_blocked
+    try:
+        with open(FOLLOWUP_BLOCKED_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        followup_blocked = set(data.get("chats") or [])
+        logger.info("followup: blocked loaded %d chats", len(followup_blocked))
+    except FileNotFoundError:
+        followup_blocked = set()
+    except Exception as e:
+        logger.warning("followup: blocked load failed: %s", e)
+        followup_blocked = set()
+
+
+def _save_followup_blocked() -> None:
+    try:
+        chats = list(followup_blocked)[-5000:]
+        with open(FOLLOWUP_BLOCKED_FILE, "w", encoding="utf-8") as f:
+            json.dump({"chats": chats}, f)
+        followup_blocked.clear()
+        followup_blocked.update(chats)
+    except Exception as e:
+        logger.warning("followup: blocked save failed: %s", e)
+
+
+def _block_followup(chat_id: str, reason: str = "") -> None:
+    """Навсегда (пока файл жив) запретить «ещё актуален?» этому чату."""
+    followups.pop(chat_id, None)
+    if chat_id in followup_blocked:
+        return
+    followup_blocked.add(chat_id)
+    _save_followup_blocked()
+    logger.info("followup: blocked %s (%s)", chat_id, reason or "-")
+
+
 def _mark_handoff_completed(chat_id: str) -> None:
     handoff_completed[chat_id] = time.time()
     # Заявка передана управляющему = логическое завершение → снимаем с реактивации
@@ -2328,6 +2375,7 @@ def _mark_handoff_completed(chat_id: str) -> None:
     # даже если он продолжит переписку после оформления.
     followups.pop(chat_id, None)
     session_registered_leads.add(chat_id)
+    _block_followup(chat_id, "handoff")
     if chat_id not in chat_history:
         return
     recent = chat_history[chat_id][-4:]
@@ -2495,18 +2543,33 @@ def _update_followup_tracking(chat_id: str, user_text: str) -> None:
     """
     if not FOLLOWUP_ENABLED:
         return
+    if chat_id in followup_blocked:
+        followups.pop(chat_id, None)
+        return
     # Уже оформленный лид в этой сессии — реактивацию НЕ шлём (бот сам его записал).
     if chat_id in session_registered_leads:
         followups.pop(chat_id, None)
         return
     # Действующий ученик — «так и не записались» к нему неприменимо.
     if chat_id in known_users:
-        followups.pop(chat_id, None)
+        _block_followup(chat_id, "known_user")
         return
-    if _FOLLOWUP_CLOSED_RE.search(user_text or "") or _FOLLOWUP_REFUSAL_RE.search(user_text or ""):
-        if chat_id in followups:
-            logger.info("followup: %s — вопрос закрыт/отложен клиентом, снимаем с реактивации", chat_id)
+    # Ответ на недавнее CRM-уведомление (посещаемость/долг) — не новый лид.
+    if chat_id in crm_notify_recent:
+        if time.time() - crm_notify_recent[chat_id] <= CRM_NOTIFY_CONTEXT_SEC:
+            _block_followup(chat_id, "crm_notify_reply")
+            return
+        crm_notify_recent.pop(chat_id, None)
+    bare = _bare_client_text(user_text or "")
+    if _FOLLOWUP_CLOSED_RE.search(bare) or _FOLLOWUP_REFUSAL_RE.search(bare):
+        logger.info("followup: %s — вопрос закрыт/отложен клиентом, снимаем с реактивации", chat_id)
+        _block_followup(chat_id, "client_closed")
+        return
+    if _is_pure_acknowledgment(user_text):
+        # «Спасибо / до свидания / жақсы» — не открываем цепочку дожима.
         followups.pop(chat_id, None)
+        if re.search(r"до\s*свидан|пока\b|қош\s+болыңыз|сау\s+болыңыз", bare, re.I):
+            _block_followup(chat_id, "goodbye")
         return
     # Клиент активен: (пере)ставим таймер, цепочку напоминаний начинаем заново.
     followups[chat_id] = {"last_client_ts": time.time(), "stage": 0}
@@ -2763,6 +2826,8 @@ async def process_dialog(chat_id):
                 followups.pop(chat_id, None)
                 session_registered_leads.discard(chat_id)
                 session_manager_notified.pop(chat_id, None)
+                # followup_blocked / crm_notify_recent намеренно НЕ чистим —
+                # иначе после таймаута снова начнём дожимать закрытые чаты.
         last_activity[chat_id] = current_time
 
         if chat_id not in chat_history:
@@ -2778,20 +2843,31 @@ async def process_dialog(chat_id):
                 )
             })
 
-            if chat_id not in known_users:
-                phone = chat_id.split("@")[0]
-                found = await crm.find_user_smart(phone)
+        # Досье подтягиваем всегда, если ещё нет — в т.ч. когда историю создал CRM-уведомитель.
+        if chat_id not in known_users or (
+            isinstance(known_users.get(chat_id), dict)
+            and known_users[chat_id].get("_from_crm_notify")
+        ):
+            phone = chat_id.split("@")[0]
+            found = await crm.find_user_smart(phone)
+            if found:
+                user_obj = found["user"]
+                dossier = found["dossier"]
+                known_users[chat_id] = user_obj
+                client_dossiers[chat_id] = dossier
+                _block_followup(chat_id, "crm_client")
 
-                if found:
-                    user_obj = found["user"]
-                    dossier = found["dossier"]
-                    known_users[chat_id] = user_obj
-                    client_dossiers[chat_id] = dossier
+                mgr_contact = ""
+                if dossier["filial_id"] and dossier["filial_id"] in BRANCH_PHONES:
+                    mgr_contact = f"Его менеджер: {BRANCH_PHONES[dossier['filial_id']]}."
 
-                    mgr_contact = ""
-                    if dossier["filial_id"] and dossier["filial_id"] in BRANCH_PHONES:
-                        mgr_contact = f"Его менеджер: {BRANCH_PHONES[dossier['filial_id']]}."
-
+                already_has_dossier = any(
+                    isinstance(m, dict)
+                    and m.get("role") == "system"
+                    and "[СИСТЕМНОЕ ДОСЬЕ КЛИЕНТА]" in (m.get("content") or "")
+                    for m in chat_history[chat_id]
+                )
+                if not already_has_dossier:
                     inject_msg = (
                         f"[СИСТЕМНОЕ ДОСЬЕ КЛИЕНТА]\n"
                         f"Имя: {dossier['name']}\n"
@@ -2816,6 +2892,27 @@ async def process_dialog(chat_id):
             "СРАЗУ ПЕРЕКЛЮЧИСЬ НА НЕГО.]\n"
             f"{user_text}"
         )
+
+        # Ответ на недавнее CRM-автоуведомление (посещаемость/долг): короткие
+        # «ок / жақсы / на уроке» не должны запускать продающий диалог.
+        recent_crm = (
+            chat_id in crm_notify_recent
+            and time.time() - crm_notify_recent[chat_id] <= CRM_NOTIFY_CONTEXT_SEC
+        )
+        if recent_crm and (
+            _is_pure_acknowledgment(user_text)
+            or _FOLLOWUP_CLOSED_RE.search(_bare_client_text(user_text) or "")
+        ):
+            logger.info("crm-notify ack для %s: %r", chat_id, user_text)
+            chat_history[chat_id].append({"role": "user", "content": user_payload})
+            if _KAZAKH_CHAR_RE.search(_bare_client_text(user_text)):
+                ack_reply = "Түсіндім, рақмет. Басқа сұрақ болса — жазыңыз."
+            else:
+                ack_reply = "Поняла, спасибо. Если будут вопросы — пишите."
+            chat_history[chat_id].append({"role": "assistant", "content": ack_reply})
+            _block_followup(chat_id, "crm_ack")
+            await send_whatsapp(chat_id, ack_reply, sanitize_fallback="short")
+            return
 
         if chat_id in handoff_completed:
             if _is_pure_acknowledgment(user_text):
@@ -3464,11 +3561,20 @@ def record_crm_notification_in_history(chat_id: str, message: str) -> None:
             f"Если клиент ответит — это ответ на данное уведомление. "
             f"Клиент является действующим учеником. "
             f"Отвечай как при работе с действующим клиентом (ТИП 9 в промпте). "
-            f"НЕ создавай новый лид, НЕ спрашивай имя и телефон заново."
+            f"НЕ создавай новый лид, НЕ спрашивай имя и телефон заново. "
+            f"НЕ представляйся заново и НЕ начинай продающий диалог. "
+            f"На короткие ответы (ок, жақсы, хорошо, спасибо, на уроке) — "
+            f"одна короткая фраза подтверждения."
         ),
     })
     chat_history[chat_id].append({"role": "assistant", "content": message})
     last_activity[chat_id] = time.time()
+    crm_notify_recent[chat_id] = time.time()
+    # CRM-уведомления только действующим ученикам — follow-up «не записались» запрещён.
+    _block_followup(chat_id, "crm_notification")
+    # Пометим как known, чтобы AI/фильтры не считали чат новым лидом.
+    if chat_id not in known_users:
+        known_users[chat_id] = {"phone": clean_phone, "_from_crm_notify": True}
 
 
 def _webhook_test_mode_active() -> bool:
@@ -4166,9 +4272,11 @@ def _followup_noon_reached(last_ts: float, now_local: datetime) -> bool:
 def _chat_looks_followup_closed(chat_id: str) -> bool:
     """По истории: заявка уже оформлена / клиент отложил — follow-up не шлём."""
     if (
-        chat_id in handoff_completed
+        chat_id in followup_blocked
+        or chat_id in handoff_completed
         or chat_id in session_registered_leads
         or chat_id in known_users
+        or chat_id in crm_notify_recent
     ):
         return True
     history = chat_history.get(chat_id) or []
@@ -4176,6 +4284,8 @@ def _chat_looks_followup_closed(chat_id: str) -> bool:
         content = _history_message_content(msg)
         role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", None)
         if role == "assistant" and _is_handoff_message(content):
+            return True
+        if role == "system" and "АВТОУВЕДОМЛЕНИЕ CRM" in (content or ""):
             return True
         if role == "user" and (
             _FOLLOWUP_CLOSED_RE.search(content or "")
@@ -4203,9 +4313,12 @@ async def _followup_tick() -> None:
     for chat_id, st in list(followups.items()):
         # Действующий ученик, уже завершённая или оформленная заявка — снимаем.
         if (
-            chat_id in known_users
+            chat_id in followup_blocked
+            or chat_id in known_users
             or chat_id in handoff_completed
             or chat_id in session_registered_leads
+            or chat_id in crm_notify_recent
+            or _chat_looks_followup_closed(chat_id)
         ):
             followups.pop(chat_id, None)
             continue
@@ -4251,4 +4364,5 @@ async def _start_followup_worker() -> None:
     if not FOLLOWUP_ENABLED:
         logger.info("followup: авто-реактивация отключена (FOLLOWUP_ENABLED=0)")
         return
+    _load_followup_blocked()
     asyncio.create_task(_followup_loop())
