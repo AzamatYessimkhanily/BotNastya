@@ -2169,7 +2169,11 @@ _DIALOG_ERROR_FALLBACK = (
     "Секунду, пожалуйста. Напишите, пожалуйста, ваш вопрос ещё раз — я обязательно помогу."
 )
 
-_KAZAKH_CHAR_RE = re.compile(r"[әіңғүұқөһ]", re.IGNORECASE)
+_CRM_GREETING_ONLY_RE = re.compile(
+    r"^(сәлеметсіз\s*бе|салеметсіз\s*бе|сәлем|салем|здравствуйте|здравствуй|"
+    r"добрый\s+(день|вечер|утро)|hello|hi|привет)\W*$",
+    re.IGNORECASE,
+)
 
 _HANDOFF_MARKERS = (
     "передаю вашу заявку",
@@ -2899,16 +2903,18 @@ async def process_dialog(chat_id):
             chat_id in crm_notify_recent
             and time.time() - crm_notify_recent[chat_id] <= CRM_NOTIFY_CONTEXT_SEC
         )
+        bare_user = _bare_client_text(user_text)
         if recent_crm and (
             _is_pure_acknowledgment(user_text)
-            or _FOLLOWUP_CLOSED_RE.search(_bare_client_text(user_text) or "")
+            or _FOLLOWUP_CLOSED_RE.search(bare_user or "")
+            or _CRM_GREETING_ONLY_RE.match(bare_user or "")
         ):
-            logger.info("crm-notify ack для %s: %r", chat_id, user_text)
+            logger.info("crm-notify ack/greeting для %s: %r", chat_id, user_text)
             chat_history[chat_id].append({"role": "user", "content": user_payload})
-            if _KAZAKH_CHAR_RE.search(_bare_client_text(user_text)):
-                ack_reply = "Түсіндім, рақмет. Басқа сұрақ болса — жазыңыз."
+            if _KAZAKH_CHAR_RE.search(bare_user):
+                ack_reply = "Түсіндім. Егер қате болса немесе сұрақ болса — жазыңыз."
             else:
-                ack_reply = "Поняла, спасибо. Если будут вопросы — пишите."
+                ack_reply = "Поняла. Если это ошибка или есть вопрос — напишите."
             chat_history[chat_id].append({"role": "assistant", "content": ack_reply})
             _block_followup(chat_id, "crm_ack")
             await send_whatsapp(chat_id, ack_reply, sanitize_fallback="short")
