@@ -13,3 +13,7 @@ followup_blocked.json
 # Runtime-состояние опроса новых лидов
 lead_poll_state.json
 crm_sent_state.json
+.env.bak*
+bot.py.bak*
+.deploy-backups/
+.deployed-revision

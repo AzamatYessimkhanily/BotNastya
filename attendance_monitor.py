@@ -23,6 +23,7 @@ import time
 from datetime import datetime, timedelta
 from typing import Callable, Awaitable, Dict, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
+from runtime_state import write_json_atomic
 
 logger = logging.getLogger("bot")
 
@@ -82,8 +83,7 @@ def _save_state() -> None:
         # ограничиваем рост файла
         missed = list(_missed_sent)[-4000:]
         debt = list(_debt_sent)[-2000:]
-        with open(ATTENDANCE_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"missed": missed, "debt": debt}, f)
+        write_json_atomic(ATTENDANCE_STATE_FILE, {"missed": missed, "debt": debt})
         _missed_sent.clear()
         _missed_sent.update(missed)
         _debt_sent.clear()
@@ -355,7 +355,7 @@ async def attendance_tick(
                 if sends_left <= 0 and not ATTENDANCE_DRY_RUN:
                     stats["skipped"] += 1
                     continue
-                await dispatch_client_message(
+                delivery = await dispatch_client_message(
                     event="attendance_unmarked",
                     obj={
                         "userId": user_id,
@@ -366,6 +366,11 @@ async def attendance_tick(
                     message=msg,
                     phones=[phone],
                 )
+                if not ATTENDANCE_DRY_RUN and not (
+                    delivery and (delivery.get("delivered") or delivery.get("deduplicated"))
+                ):
+                    stats["skipped"] += 1
+                    continue
                 if not ATTENDANCE_DRY_RUN:
                     _missed_sent.add(mkey)
                     sends_left -= 1
@@ -405,12 +410,17 @@ async def attendance_tick(
                 if sends_left <= 0 and not ATTENDANCE_DRY_RUN:
                     stats["skipped"] += 1
                     continue
-                await dispatch_client_message(
+                delivery = await dispatch_client_message(
                     event="sub_lesson_in_debt",
                     obj={"userId": user_id, "lessonId": lesson_id, "admin_phone": admin_phone},
                     message=msg,
                     phones=[phone],
                 )
+                if not ATTENDANCE_DRY_RUN and not (
+                    delivery and (delivery.get("delivered") or delivery.get("deduplicated"))
+                ):
+                    stats["skipped"] += 1
+                    continue
                 if not ATTENDANCE_DRY_RUN:
                     _debt_sent.add(dkey)
                     sends_left -= 1

@@ -3,13 +3,19 @@
 import importlib.util
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 # Минимальные заглушки, чтобы import bot.py не падал без .env
-os.environ.setdefault("OPENAI_API_KEY", "sk-smoke-test")
-os.environ.setdefault("GREEN_API_ID", "0")
-os.environ.setdefault("GREEN_API_TOKEN", "smoke")
-os.environ.setdefault("MOYKLASS_API_KEY", "smoke")
+os.environ["OPENAI_API_KEY"] = "sk-smoke-test"
+os.environ["GREEN_API_ID"] = "0"
+os.environ["GREEN_API_TOKEN"] = "smoke"
+os.environ["MOYKLASS_API_KEY"] = "smoke"
+# Tests run on the server too: never overwrite its real dedup/block files.
+_STATE_DIR = tempfile.TemporaryDirectory(prefix="botnastya-smoke-")
+for _key in ("FOLLOWUP_BLOCKED_FILE", "CRM_SENT_STATE_FILE", "LEAD_POLL_STATE_FILE",
+             "ATTENDANCE_STATE_FILE", "FAILED_LEADS_FILE"):
+    os.environ[_key] = str(Path(_STATE_DIR.name) / _key)
 
 ROOT = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("bot", ROOT / "bot.py")
@@ -284,7 +290,7 @@ def main() -> int:
     check("M4 совпадение 7/8 формат", m("87053795459", "7053795459"))
     check("M4 совпадение +7 формат", m("+7 705 379 5459", "7053795459"))
     check("M4 чужой номер отвергнут", not m("77051112233", "7053795459"))
-    check("M4 нет телефона -> доверяем", m("", "7053795459"))
+    check("M4 нет телефона -> отклоняем", not m("", "7053795459"))
 
     crm = bot.crm
     orig_state = crm._get_client_state_id
