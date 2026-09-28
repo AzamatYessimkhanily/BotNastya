@@ -2399,6 +2399,23 @@ def _is_pure_acknowledgment(text: str) -> bool:
     return normalized in _PURE_ACK_PHRASES or bare.strip() in {"👍", "🙏", "👌", "❤️", "😊"}
 
 
+def _ack_accepts_offer(chat_id: str, text: str) -> bool:
+    """'Хорошо' accepts an explicit offer, but never reopens a completed handoff."""
+    if chat_id in handoff_completed or chat_id in session_registered_leads or chat_id in crm_notify_recent:
+        return False
+    normalized = " ".join(_normalize_ack_phrase(_bare_client_text(text)).split())
+    if normalized not in {"хорошо", "ок", "окей", "ok", "okay", "ладно", "жақсы", "жарайды", "хорошо спасибо"} and text.strip() != "👍":
+        return False
+    for message in reversed(chat_history.get(chat_id, [])):
+        role = message.get("role") if isinstance(message, dict) else getattr(message, "role", None)
+        if role == "assistant" and _history_message_content(message):
+            content = _history_message_content(message)
+            return "?" in content and bool(re.search(
+                r"записать|запишем|оформить.*заявк|передать.*управляющ|"
+                r"хотите.*(?:пробн|запис)|жазайын|жазылайық", content, re.I))
+    return False
+
+
 def _is_handoff_message(text: str) -> bool:
     low = (text or "").lower()
     return any(marker in low for marker in _HANDOFF_MARKERS)
@@ -3050,7 +3067,7 @@ async def _process_dialog(chat_id):
                 )
             })
 
-        if _is_pure_acknowledgment(user_text):
+        if _is_pure_acknowledgment(user_text) and not _ack_accepts_offer(chat_id, user_text):
             chat_history[chat_id].append({"role": "user", "content": user_text})
             _block_followup(chat_id, "acknowledgment")
             return

@@ -126,6 +126,18 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.ai.await_count, 2)
         self.assertEqual(self.send.await_count, 2)
 
+    async def test_okay_accepts_explicit_offer_but_thanks_does_not(self):
+        bot.chat_history[self.chat] = [{'role': 'assistant', 'content': 'Записать на пробный урок?'}]
+        self.ai.side_effect = [completion('Как зовут ученика?')]
+        self.queue('Хорошо')
+        await bot.process_dialog(self.chat)
+        self.ai.assert_awaited_once()
+        self.send.assert_awaited_once()
+        bot.chat_history[self.chat].append({'role': 'assistant', 'content': 'Записать на пробный урок?'})
+        self.assertFalse(bot._ack_accepts_offer(self.chat, 'Спасибо'))
+        bot.handoff_completed[self.chat] = time.time()
+        self.assertFalse(bot._ack_accepts_offer(self.chat, 'Хорошо'))
+
     async def test_crm_greeting_and_ack_combined_are_silent(self):
         bot.record_crm_notification_in_history(self.chat, 'Ученик не пришёл на урок. Свяжитесь с тренером.')
         self.queue('Сәлеметсіз бе! Жақсы.')
