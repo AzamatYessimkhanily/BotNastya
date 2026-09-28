@@ -38,19 +38,20 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        for name in ('CRM_SENT_STATE_FILE', 'FOLLOWUP_BLOCKED_FILE', 'FAILED_LEADS_FILE'):
+        for name in ('CRM_SENT_STATE_FILE', 'FOLLOWUP_BLOCKED_FILE', 'FAILED_LEADS_FILE', 'CONVERSATION_STATE_FILE'):
             self.enterContext(patch.object(bot, name, str(Path(self.tmp.name) / name)))
         self.enterContext(patch.object(attendance, 'ATTENDANCE_STATE_FILE', str(Path(self.tmp.name) / 'attendance.json')))
         # Unexpected network use fails the test, including indirect API paths.
         self.enterContext(patch('httpx.AsyncClient.send', AsyncMock(side_effect=AssertionError('Unexpected HTTP'))))
         self.ai = self.enterContext(patch.object(bot.openai_client.chat.completions, 'create', AsyncMock(side_effect=AssertionError('Unexpected AI'))))
         self.send = self.enterContext(patch.object(bot, 'send_whatsapp', AsyncMock(return_value=True)))
+        self.hydrate = self.enterContext(patch.object(bot, '_hydrate_chat_history', AsyncMock()))
         self.lookup = self.enterContext(patch.object(bot.crm, 'find_user_smart', AsyncMock(return_value=None)))
         for name in ('chat_history', 'message_buffers', 'known_users', 'client_dossiers', 'last_activity',
                      'followups', 'handoff_completed', 'session_manager_notified', 'seen_incoming_ids',
-                     'crm_notify_recent', '_dialog_locks', '_incoming_locks', '_wa_last_chat_ts'):
+                     'crm_notify_recent', 'conversation_facts', 'incoming_versions', 'incoming_pending', '_dialog_locks', '_incoming_locks', '_wa_last_chat_ts'):
             getattr(bot, name).clear()
-        for name in ('_crm_sent_keys', '_crm_inflight_keys', 'followup_blocked', 'session_registered_leads', '_wa_send_times'):
+        for name in ('_crm_sent_keys', '_crm_inflight_keys', 'followup_blocked', 'session_registered_leads', 'contact_opt_out', 'internal_chats', 'followup_sent', 'history_hydrated', '_wa_send_times'):
             getattr(bot, name).clear()
         attendance._missed_sent.clear()
         attendance._debt_sent.clear()

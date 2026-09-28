@@ -17,3 +17,5 @@ crm_sent_state.json
 bot.py.bak*
 .deploy-backups/
 .deployed-revision
+
+conversation_state.sqlite3*

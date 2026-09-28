@@ -6,6 +6,8 @@ import re
 import io
 import logging
 import time
+from contextvars import ContextVar
+from conversation_memory import save_snapshot, load_snapshots, STOP_CONTACT, AUTO_REPLY, update_facts, remove_answered_questions
 from weakref import WeakValueDictionary
 from collections import defaultdict, deque
 from datetime import date, datetime, timedelta
@@ -127,7 +129,7 @@ _QUANTUM_CONTACT_LINE = (
     f"GM Legends Quantum STEM School: {QUANTUM_MANAGER_NAME} — {QUANTUM_MANAGER_PHONE}"
 )
 
-BUFFER_DELAY = 1.0
+BUFFER_DELAY = max(1.0, float(os.getenv("BUFFER_DELAY", "4")))
 MOYKLASS_BASE_URL = "https://api.moyklass.com/v1/company"
 MOYKLASS_HTTP_TIMEOUT = 30.0
 # Запись в группу «Учится» — MoyKlass join statusId (для отображения в досье, не для рассылок).
@@ -141,9 +143,9 @@ SESSION_TIMEOUT = 5 * 60 * 60
 # --- Авто-реактивация «спящих» лидов ---
 # Если диалог с потенциальным клиентом не дошёл до логического завершения
 # (не записался и не отказался) и клиент замолчал — бот сам напоминает о себе:
-#   1) через FOLLOWUP_SILENCE_SECONDS молчания (по умолчанию 2 часа);
-#   2) на следующий день в FOLLOWUP_NEXT_DAY_HOUR:00 (по умолчанию 12:00).
-# Действующим ученикам и тем, кто записался/отказался, реактивация НЕ шлётся.
+# Одно напоминание через FOLLOWUP_SILENCE_SECONDS молчания (по умолчанию 2 часа).
+# Если пропустили окно — на следующий день после FOLLOWUP_NEXT_DAY_HOUR.
+# Отправку помним постоянно. Действующим ученикам и закрытым чатам не пишем.
 FOLLOWUP_ENABLED = os.getenv("FOLLOWUP_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
 FOLLOWUP_SILENCE_SECONDS = int(os.getenv("FOLLOWUP_SILENCE_SECONDS", "7200") or "7200")
 FOLLOWUP_NEXT_DAY_HOUR = int(os.getenv("FOLLOWUP_NEXT_DAY_HOUR", "12") or "12")
@@ -152,8 +154,7 @@ FOLLOWUP_CHECK_INTERVAL = int(os.getenv("FOLLOWUP_CHECK_INTERVAL", "300") or "30
 FOLLOWUP_QUIET_START = int(os.getenv("FOLLOWUP_QUIET_START", "21") or "21")  # с 21:00
 FOLLOWUP_QUIET_END = int(os.getenv("FOLLOWUP_QUIET_END", "9") or "9")        # до 09:00
 FOLLOWUP_MESSAGE = os.getenv("FOLLOWUP_MESSAGE", "").strip() or (
-    "Вы ранее интересовались развитием интеллекта через шахматы, но так и не записались к нам. "
-    "Подскажите, ваш запрос ещё актуален?"
+    "Подскажите, нужна ли ещё помощь с выбором занятий?"
 )
 
 # Опциональный statusId для POST /joins. Если не задан — поле не отправляем,
@@ -296,8 +297,10 @@ _SYSTEM_PROMPT_TEMPLATE = """
 - ЗАПРЕЩЕНО писать фразы вроде "я обязан отвечать на русском" или любые объяснения, почему не можешь говорить по-казахски.
 - Никогда не задавай два вопроса в одном сообщении.
 - Не давай всю информацию сразу — ответил на одно, подожди реакции, потом продолжай.
-- Если клиент пишет коротко или расплывчато — задавай уточняющий вопрос.
-- Если клиент не ответил или ответил односложно — переформулируй или предложи варианты выбора ("Вы ищете очные занятия или онлайн?").
+- Перед каждым ответом прочитай историю: свои вопросы, сообщения клиента и известные факты.
+- Короткое сообщение часто отвечает на предыдущий вопрос. «Аркада» — выбранный филиал; «4 разряд» — опытный шахматист. Не переспрашивай известное.
+- Несколько сообщений клиента подряд — один ответ. Учитывай все детали, спрашивай только недостающие.
+- «Окей», «хорошо», «спасибо» после завершения вопроса не начинают новый опрос. Не продолжай продажи на автоответы организаций.
 - Не давить. Уровень напора — 5/10. Мягко направляй к следующему шагу.
 - После двух безрезультатных попыток продвинуть диалог (клиент не отвечает или игнорирует вопрос) — напиши: "Если будут вопросы — пишите в любое время, всегда рада помочь 😊" и больше не настаивай. Это правило НЕ применяется, если клиент ещё не выбрал филиал или не дал имя ребёнка — в этом случае одну попытку сделай.
 - ЗАПРЕЩЕНО писать "На здоровье", "на здоровье" и любые варианты — звучит как издёвка в переписке. Благодарность отвечай: "Пожалуйста", "Рада была помочь", "Хорошего дня".
@@ -696,7 +699,88 @@ async def _stop_background_tasks():
     await asyncio.gather(*tasks, return_exceptions=True)
     await openai_client.close()
 
+CONVERSATION_STATE_FILE = os.getenv("CONVERSATION_STATE_FILE", "conversation_state.sqlite3")
 chat_history: Dict[str, List[Dict]] = {}
+conversation_facts: Dict[str, dict] = {}
+contact_opt_out: set = set()
+internal_chats: set = set()
+followup_sent: set = set()
+incoming_versions: Dict[str, int] = defaultdict(int)
+incoming_pending: Dict[str, int] = defaultdict(int)
+history_hydrated: set = set()
+_outbound_context = ContextVar("outbound_context", default=None)
+
+
+def _is_internal_chat(chat_id):
+    phones = list(BRANCH_PHONES.values()) + [p for _, p in BRANCH_MANAGERS.values()]
+    phones += [NEW_LEAD_ADMIN_PHONE] + os.getenv("INTERNAL_PHONES", "").split(",")
+    return chat_id in internal_chats or chat_id in {phone_to_chat_id(p.strip()) for p in phones if p.strip()}
+
+
+def _save_conversation(chat_id):
+    history = []
+    for message in chat_history.get(chat_id, []):
+        if isinstance(message, dict):
+            history.append(message)
+        elif hasattr(message, "model_dump"):
+            history.append(message.model_dump(exclude_none=True))
+    save_snapshot(CONVERSATION_STATE_FILE, chat_id, {
+        "incoming_ids": list(seen_incoming_ids.get(chat_id, [])),
+        "history": history, "hydrated": chat_id in history_hydrated, "facts": conversation_facts.get(chat_id, {}),
+        "opt_out": chat_id in contact_opt_out, "internal": chat_id in internal_chats,
+        "followup_sent": chat_id in followup_sent,
+        "handoff": handoff_completed.get(chat_id), "registered": chat_id in session_registered_leads,
+        "crm_notice": crm_notify_recent.get(chat_id), "last_activity": last_activity.get(chat_id),
+        "manager_notified": session_manager_notified.get(chat_id),
+    })
+
+
+@app.on_event("startup")
+async def _load_conversations():
+    # Fail startup on unreadable state: never silently forget a contact refusal.
+    for chat_id, state in load_snapshots(CONVERSATION_STATE_FILE):
+        if state.get("history"):
+            chat_history[chat_id] = state["history"]
+            # Keep the current policy after an upgrade, preserving dialog content.
+            if chat_history[chat_id][0].get("role") == "system":
+                chat_history[chat_id][0] = {"role": "system", "content": SYSTEM_PROMPT}
+            _repair_dangling_tool_calls(chat_id)
+        conversation_facts[chat_id] = state.get("facts", {})
+        seen_incoming_ids[chat_id].extend(state.get("incoming_ids", [])[-400:])
+        for key, target in (("opt_out", contact_opt_out), ("hydrated", history_hydrated), ("internal", internal_chats),
+                            ("followup_sent", followup_sent), ("registered", session_registered_leads)):
+            if state.get(key):
+                target.add(chat_id)
+        for key, target in (("handoff", handoff_completed), ("crm_notice", crm_notify_recent),
+                            ("last_activity", last_activity), ("manager_notified", session_manager_notified)):
+            if state.get(key):
+                target[chat_id] = state[key]
+        if state.get("crm_notice"):
+            known_users[chat_id] = {"phone": chat_id.split("@")[0], "_from_crm_notify": True}
+    _load_followup_blocked()
+
+
+def _stop_contact(chat_id):
+    contact_opt_out.add(chat_id)
+    incoming_versions[chat_id] += 1
+    pending = message_buffers.pop(chat_id, None)
+    if pending and pending.get("timer"):
+        pending["timer"].cancel()
+    _block_followup(chat_id, "contact_opt_out")
+    _save_conversation(chat_id)
+
+
+def _outbound_allowed(chat_id):
+    if chat_id in contact_opt_out:
+        return False
+    context = _outbound_context.get()
+    if context and context[0] == chat_id:
+        if _is_internal_chat(chat_id) or incoming_versions[chat_id] != context[1] or incoming_pending[chat_id]:
+            return False
+        if context[2] == "followup" and _chat_looks_followup_closed(chat_id):
+            return False
+    return True
+
 message_buffers: Dict[str, Dict] = {}
 known_users: Dict[str, dict] = {}
 # Досье действующего ученика по chat_id (имя, филиал и т.д.) — для request_manager_callback.
@@ -2311,8 +2395,8 @@ def _is_pure_acknowledgment(text: str) -> bool:
     low = bare.lower()
     if any(hint in low for hint in _SUBSTANTIVE_FOLLOWUP_HINTS):
         return False
-    normalized = _normalize_ack_phrase(bare)
-    return normalized in _PURE_ACK_PHRASES
+    normalized = " ".join(_normalize_ack_phrase(bare).split())
+    return normalized in _PURE_ACK_PHRASES or bare.strip() in {"👍", "🙏", "👌", "❤️", "😊"}
 
 
 def _is_handoff_message(text: str) -> bool:
@@ -2600,7 +2684,7 @@ def _update_followup_tracking(chat_id: str, user_text: str) -> None:
     """
     if not FOLLOWUP_ENABLED:
         return
-    if chat_id in followup_blocked:
+    if _chat_looks_followup_closed(chat_id):
         followups.pop(chat_id, None)
         return
     # Уже оформленный лид в этой сессии — реактивацию НЕ шлём (бот сам его записал).
@@ -2805,6 +2889,8 @@ async def send_whatsapp(chat_id, text, *, sanitize_fallback: str = "handoff", sa
     # sanitize=False — для служебных сообщений сотрудникам (сохраняем формат/переносы).
     # Возвращает True только при подтверждённой отправке (Green API отдал idMessage).
     # Все исходящие проходят anti-ban rate-limit (интервал, per-chat, час/день, flood-pause).
+    if not _outbound_allowed(chat_id):
+        return False
     if sanitize:
         text = sanitize_bot_outgoing(text, fallback=sanitize_fallback)
 
@@ -2812,6 +2898,9 @@ async def send_whatsapp(chat_id, text, *, sanitize_fallback: str = "handoff", sa
         return False
 
     if not await _wa_acquire_send_slot(chat_id):
+        return False
+
+    if not _outbound_allowed(chat_id):
         return False
 
     url = f"https://api.green-api.com/waInstance{GREEN_API_ID}/sendMessage/{GREEN_API_TOKEN}"
@@ -2848,13 +2937,76 @@ async def send_whatsapp(chat_id, text, *, sanitize_fallback: str = "handoff", sa
     return True
 
 # --- 6. ЛОГИКА ДИАЛОГА ---
+async def _hydrate_chat_history(chat_id):
+    """Read this chat only, once; never send messages or scan unrelated chats.
+
+    Green API returns newest first: https://green-api.com/en/docs/api/journals/GetChatHistory/
+    """
+    if chat_id in history_hydrated or chat_id in chat_history:
+        return
+    try:
+        url = f"https://api.green-api.com/waInstance{GREEN_API_ID}/getChatHistory/{GREEN_API_TOKEN}"
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            response = await client.post(url, json={"chatId": chat_id, "count": 60})
+        response.raise_for_status()
+        messages = response.json()
+        if not isinstance(messages, list):
+            raise ValueError("Invalid history response")
+    except Exception as error:
+        # URLs contain credentials; do not log the HTTP exception text.
+        logger.warning("History unavailable for %s (%s)", chat_id, type(error).__name__)
+        return
+    history_hydrated.add(chat_id)
+    history = [{"role": "system", "content": SYSTEM_PROMPT},
+               {"role": "system", "content": "[ТЕЛЕФОН КЛИЕНТА]: " + chat_id.split("@")[0] +
+                ". Номер известен из WhatsApp; используй для заявки, не спрашивай повторно."}]
+    facts = conversation_facts.setdefault(chat_id, {})
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("chatId") != chat_id:
+            continue
+        if message.get("idMessage") in seen_incoming_ids[chat_id] or message.get("isDeleted"):
+            continue
+        content = message.get("textMessage") or ""
+        if not isinstance(content, str) or not content.strip():
+            continue
+        if message.get("type") == "incoming":
+            if STOP_CONTACT.search(content):
+                _stop_contact(chat_id)
+            if AUTO_REPLY.search(content):
+                _block_followup(chat_id, "historical_auto_reply")
+            update_facts(facts, content)
+            history.append({"role": "user", "content": content})
+        elif message.get("type") == "outgoing" and message.get("statusMessage") in ("sent", "delivered", "read"):
+            history.append({"role": "assistant", "content": content})
+            if content == FOLLOWUP_MESSAGE or content.startswith("Вы ранее интересовались развитием интеллекта через шахматы"):
+                followup_sent.add(chat_id)
+            if _is_handoff_message(content):
+                handoff_completed[chat_id] = time.time()
+                _block_followup(chat_id, "historical_handoff")
+            if re.search(r"\[НОВЫЙ ЛИД\]|Филиал/формат:.*WhatsApp:", content, re.S):
+                internal_chats.add(chat_id)
+            if re.search(r"ученик не приш|свяжитесь с тренером|занятие начн|оплата получена", content, re.I):
+                crm_notify_recent[chat_id] = time.time()
+                known_users[chat_id] = {"phone": chat_id.split("@")[0], "_from_crm_notify": True}
+                _block_followup(chat_id, "historical_crm_notification")
+    chat_history[chat_id] = history
+    _save_conversation(chat_id)
+
+
 async def process_dialog(chat_id):
+    token = _outbound_context.set((chat_id, incoming_versions[chat_id], "dialog"))
     try:
         await _process_dialog(chat_id)
     except Exception:
         logger.exception("Ошибка обработки диалога %s", chat_id)
         _repair_dangling_tool_calls(chat_id)
-        await send_whatsapp(chat_id, _DIALOG_ERROR_FALLBACK)
+        if _outbound_allowed(chat_id):
+            await send_whatsapp(chat_id, _DIALOG_ERROR_FALLBACK)
+    finally:
+        try:
+            _save_conversation(chat_id)
+        finally:
+            _outbound_context.reset(token)
 
 
 async def _process_dialog(chat_id):
@@ -2865,19 +3017,24 @@ async def _process_dialog(chat_id):
         user_text = " ".join(buffer["messages"])
         logger.info(f"Обработка для {chat_id}: {user_text}")
 
+        _outbound_context.set((chat_id, incoming_versions[chat_id], "dialog"))
+        if STOP_CONTACT.search(_bare_client_text(user_text)):
+            _stop_contact(chat_id)
+            return
+        if chat_id in contact_opt_out or _is_internal_chat(chat_id):
+            _block_followup(chat_id, "internal_or_opt_out")
+            return
+        if AUTO_REPLY.search(_bare_client_text(user_text)):
+            _block_followup(chat_id, "auto_reply")
+            return
+        await _hydrate_chat_history(chat_id)
+        if chat_id in contact_opt_out or _is_internal_chat(chat_id):
+            return
+        # A timeout refreshes the CRM dossier, never erases the conversation.
         current_time = time.time()
-        if chat_id in last_activity:
-            if current_time - last_activity[chat_id] > SESSION_TIMEOUT:
-                logger.info(f"Сброс памяти для {chat_id}")
-                chat_history.pop(chat_id, None)
-                known_users.pop(chat_id, None)
-                client_dossiers.pop(chat_id, None)
-                handoff_completed.pop(chat_id, None)
-                followups.pop(chat_id, None)
-                session_registered_leads.discard(chat_id)
-                session_manager_notified.pop(chat_id, None)
-                # followup_blocked / crm_notify_recent намеренно НЕ чистим —
-                # иначе после таймаута снова начнём дожимать закрытые чаты.
+        if current_time - last_activity.get(chat_id, current_time) > SESSION_TIMEOUT:
+            known_users.pop(chat_id, None)
+            client_dossiers.pop(chat_id, None)
         last_activity[chat_id] = current_time
 
         if chat_id not in chat_history:
@@ -2892,6 +3049,11 @@ async def _process_dialog(chat_id):
                     f"если клиент сам не попросил указать другой."
                 )
             })
+
+        if _is_pure_acknowledgment(user_text):
+            chat_history[chat_id].append({"role": "user", "content": user_text})
+            _block_followup(chat_id, "acknowledgment")
+            return
 
         # Досье подтягиваем всегда, если ещё нет — в т.ч. когда историю создал CRM-уведомитель.
         if chat_id not in known_users or (
@@ -2954,30 +3116,23 @@ async def _process_dialog(chat_id):
             _is_pure_acknowledgment(user_text)
             or _FOLLOWUP_CLOSED_RE.search(bare_user or "")
             or _CRM_GREETING_ONLY_RE.match(bare_user or "")
+            or all(_is_pure_acknowledgment(part) or _CRM_GREETING_ONLY_RE.match(part)
+                   for part in re.split(r"[.!\n]+\s*", bare_user) if part.strip())
         ):
             logger.info("crm-notify ack/greeting для %s: %r", chat_id, user_text)
             chat_history[chat_id].append({"role": "user", "content": user_payload})
-            if _KAZAKH_CHAR_RE.search(bare_user):
-                ack_reply = "Түсіндім. Егер қате болса немесе сұрақ болса — жазыңыз."
-            else:
-                ack_reply = "Поняла. Если это ошибка или есть вопрос — напишите."
             _block_followup(chat_id, "crm_ack")
-            if await send_whatsapp(chat_id, ack_reply, sanitize_fallback="short"):
-                chat_history[chat_id].append({"role": "assistant", "content": ack_reply})
             return
 
         if chat_id in handoff_completed:
-            if _is_pure_acknowledgment(user_text):
-                logger.info(f"post-handoff ack для {chat_id}: {user_text!r}")
-                chat_history[chat_id].append({"role": "user", "content": user_payload})
-                ack_reply = _post_handoff_ack_reply(user_text)
-                if await send_whatsapp(chat_id, ack_reply, sanitize_fallback="short"):
-                    chat_history[chat_id].append({"role": "assistant", "content": ack_reply})
-                return
-            logger.info(f"post-handoff: новый вопрос от {chat_id}, снимаем флаг handoff")
+            logger.info("post-handoff: новый вопрос от %s", chat_id)
             handoff_completed.pop(chat_id, None)
 
         chat_history[chat_id].append({"role": "user", "content": user_payload})
+        facts = conversation_facts.setdefault(chat_id, {})
+        for message in buffer["messages"]:
+            update_facts(facts, _bare_client_text(message))
+        _save_conversation(chat_id)
 
         # План авто-реактивации: клиент написал — (пере)ставим таймер напоминаний.
         _update_followup_tracking(chat_id, user_text)
@@ -3008,14 +3163,21 @@ async def _process_dialog(chat_id):
                 chat_history[chat_id].append({"role": "system", "content": _CALLBACK_FORCE_DIRECTIVE})
 
         try:
+            if not _outbound_allowed(chat_id):
+                return
             _trim_dialog_history(chat_id)
             response = await openai_client.chat.completions.create(
                 model=OPENAI_MODEL,
-                messages=chat_history[chat_id],
+                messages=chat_history[chat_id] + [{"role": "system", "content":
+                    "Известные факты из сообщений клиента: " + json.dumps(facts, ensure_ascii=False) +
+                    ". Не спрашивай эти сведения повторно. Продолжай с первого недостающего факта. "
+                    "Разряд подтверждает опыт, выбранный филиал подтверждает формат."}],
                 tools=tools,
                 tool_choice="auto",
                 temperature=0.5
             )
+            if not _outbound_allowed(chat_id):
+                return
             msg = response.choices[0].message
             lead_registered_this_turn = False
             callback_sent_this_turn = False
@@ -3029,6 +3191,9 @@ async def _process_dialog(chat_id):
                 # падают 400 (диалог клиента залипает на fallback). Поэтому ответ
                 # гарантируем даже при битых аргументах / неожиданном сбое create_lead.
                 for tool in msg.tool_calls:
+                    if not _outbound_allowed(chat_id):
+                        _repair_dangling_tool_calls(chat_id)
+                        return
                     try:
                         args = json.loads(tool.function.arguments)
                     except (json.JSONDecodeError, TypeError, ValueError) as e:
@@ -3162,7 +3327,27 @@ async def _process_dialog(chat_id):
             else:
                 bot_answer = msg.content
 
-            sanitized_answer = sanitize_bot_outgoing(bot_answer)
+            if not _outbound_allowed(chat_id):
+                return
+            original_answer = sanitize_bot_outgoing(bot_answer)
+            sanitized_answer = remove_answered_questions(original_answer, facts)
+            if sanitized_answer != original_answer:
+                kazakh = bool(_KAZAKH_CHAR_RE.search(bare_user))
+                next_question = ""
+                for key, ru, kk in (
+                    ("audience", "Занятия для ребёнка или для вас?", "Сабақ балаңыз үшін бе, әлде өзіңіз үшін бе?"),
+                    ("age", "Сколько лет ученику?", "Оқушы неше жаста?"),
+                    ("experience", "Уже занимались шахматами или начинаете с нуля?", "Шахмат тәжірибесі бар ма?"),
+                    ("preference", "Какой филиал вам удобен или рассматриваете онлайн?", "Қай филиал ыңғайлы немесе онлайн оқығыңыз келе ме?"),
+                ):
+                    if key not in facts:
+                        next_question = kk if kazakh else ru
+                        break
+                if not next_question and not _already_asked_name:
+                    next_question = "Оқушының аты кім?" if kazakh else "Как зовут ученика?"
+                sanitized_answer = " ".join(p for p in (sanitized_answer, next_question) if p)
+                if not sanitized_answer:
+                    return
 
             # Страховка ТОЛЬКО для действующих учеников: бот пообещал передать /
             # клиент ждёт человека, а tool не вызван → WhatsApp одному управляющему.
@@ -3202,7 +3387,7 @@ async def _process_dialog(chat_id):
 
             if lead_registered_this_turn or callback_sent_this_turn:
                 _mark_handoff_completed(chat_id)
-            if await send_whatsapp(chat_id, sanitized_answer):
+            if _outbound_allowed(chat_id) and await send_whatsapp(chat_id, sanitized_answer):
                 chat_history[chat_id].append({"role": "assistant", "content": sanitized_answer})
 
         except Exception as e:
@@ -3211,7 +3396,8 @@ async def _process_dialog(chat_id):
             # запросы к OpenAI будут падать 400 и диалог залипнет на fallback).
             _repair_dangling_tool_calls(chat_id)
             try:
-                await send_whatsapp(chat_id, _DIALOG_ERROR_FALLBACK)
+                if _outbound_allowed(chat_id):
+                    await send_whatsapp(chat_id, _DIALOG_ERROR_FALLBACK)
             except Exception as send_err:
                 logger.error(f"Не удалось отправить fallback: {send_err}")
 
@@ -3230,15 +3416,19 @@ async def handle_webhook(request: Request):
     if not isinstance(data.get("senderData"), dict) or not isinstance(data.get("messageData"), dict):
         return "ok"
 
-    # Анти-бэклог: не отвечаем на сообщения, накопленные пока бот был выключен.
-    if _should_skip_stale_incoming(data):
-        return "ok"
-
     sender = data.get("senderData", {}).get("chatId")
     if not isinstance(sender, str) or not re.fullmatch(r"[0-9]{10,15}@c\.us", sender):
         return "ok"
 
     msg_data = data.get("messageData") or {}
+    if STOP_CONTACT.search(_extract_main_text(msg_data)):
+        _stop_contact(sender)
+        return "ok"
+    if sender in contact_opt_out or _is_internal_chat(sender):
+        _block_followup(sender, "internal_or_opt_out")
+        return "ok"
+    if _should_skip_stale_incoming(data):
+        return "ok"
     id_message = data.get("idMessage") or msg_data.get("idMessage")
     if id_message:
         dq = seen_incoming_ids[sender]
@@ -3247,6 +3437,8 @@ async def handle_webhook(request: Request):
             return "ok"
         dq.append(id_message)
 
+    incoming_versions[sender] += 1
+    incoming_pending[sender] += 1
     # Acknowledge immediately, including voice messages. One ingress lock per
     # chat preserves voice/text order while other chats remain independent.
     lock = _incoming_locks.setdefault(sender, asyncio.Lock())
@@ -3261,10 +3453,13 @@ async def _receive_incoming(sender, msg_data, lock):
         except Exception:
             logger.exception("Ошибка входящего сообщения %s", sender)
             await send_whatsapp(sender, _DIALOG_ERROR_FALLBACK)
+        finally:
+            incoming_pending[sender] = max(0, incoming_pending[sender] - 1)
 
 
 async def _buffer_incoming(sender, msg_data):
-
+    if sender in contact_opt_out or _is_internal_chat(sender):
+        return "ok"
     text = ""
     msg_type = msg_data.get("typeMessage")
 
@@ -3317,6 +3512,15 @@ async def _buffer_incoming(sender, msg_data):
     if not text:
         return "ok"
 
+    if STOP_CONTACT.search(_bare_client_text(text)):
+        _stop_contact(sender)
+        return "ok"
+    if AUTO_REPLY.search(_bare_client_text(text)):
+        _block_followup(sender, "auto_reply")
+        return "ok"
+    if sender in contact_opt_out:
+        return "ok"
+    incoming_versions[sender] += 1
     logger.info(f"Входящее ({sender}): {text}")
 
     if sender in message_buffers:
@@ -3703,6 +3907,7 @@ def record_crm_notification_in_history(chat_id: str, message: str) -> None:
     # Пометим как known, чтобы AI/фильтры не считали чат новым лидом.
     if chat_id not in known_users:
         known_users[chat_id] = {"phone": clean_phone, "_from_crm_notify": True}
+    _save_conversation(chat_id)
 
 
 def _webhook_test_mode_active() -> bool:
@@ -3942,6 +4147,10 @@ async def _dispatch_moyklass_webhook(
         if not chat_id:
             logger.warning("%s: не удалось нормализовать телефон %r", log_prefix, phone)
             continue
+        if log_prefix == "moyklass-webhook-employee" and not test_mode:
+            internal_chats.add(chat_id)
+            _block_followup(chat_id, "employee_notification")
+            _save_conversation(chat_id)
         # No await between the check and reservation: concurrent webhooks
         # cannot both pass the dedup check while the first HTTP call waits.
         if dedup_key:
@@ -4418,7 +4627,10 @@ def _followup_noon_reached(last_ts: float, now_local: datetime) -> bool:
 def _chat_looks_followup_closed(chat_id: str) -> bool:
     """По истории: заявка уже оформлена / клиент отложил — follow-up не шлём."""
     if (
-        chat_id in followup_blocked
+        chat_id in contact_opt_out
+        or _is_internal_chat(chat_id)
+        or chat_id in followup_sent
+        or chat_id in followup_blocked
         or chat_id in handoff_completed
         or chat_id in session_registered_leads
         or chat_id in known_users
@@ -4442,14 +4654,21 @@ def _chat_looks_followup_closed(chat_id: str) -> bool:
 
 
 async def _send_followup_message(chat_id: str) -> bool:
-    if _chat_looks_followup_closed(chat_id):
-        followups.pop(chat_id, None)
-        logger.info("followup: skip %s — диалог уже закрыт/оформлен", chat_id)
-        return False
-    ok = await send_whatsapp(chat_id, FOLLOWUP_MESSAGE, sanitize=False)
-    if ok and chat_id in chat_history:
-        chat_history[chat_id].append({"role": "assistant", "content": FOLLOWUP_MESSAGE})
-    return ok
+    async with _dialog_lock(chat_id):
+        if _chat_looks_followup_closed(chat_id) or chat_id in message_buffers:
+            return False
+        token = _outbound_context.set((chat_id, incoming_versions[chat_id], "followup"))
+        try:
+            ok = await send_whatsapp(chat_id, FOLLOWUP_MESSAGE, sanitize=False)
+            if ok:
+                followup_sent.add(chat_id)
+                _block_followup(chat_id, "one_reminder_sent")
+                if chat_id in chat_history:
+                    chat_history[chat_id].append({"role": "assistant", "content": FOLLOWUP_MESSAGE})
+                _save_conversation(chat_id)
+            return ok
+        finally:
+            _outbound_context.reset(token)
 
 
 async def _followup_tick() -> None:

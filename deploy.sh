@@ -7,7 +7,7 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 [[ "$REMOTE" =~ ^/[a-zA-Z0-9_./-]+$ ]] || { echo 'Unsupported DEPLOY_DIR'; exit 1; }
 cd "$ROOT"
 REVISION="$(git rev-parse HEAD)"
-FILES=(bot.py attendance_monitor.py runtime_state.py test_pre_deploy_smoke.py test_reliability.py)
+FILES=(bot.py attendance_monitor.py runtime_state.py conversation_memory.py test_pre_deploy_smoke.py test_reliability.py test_conversation.py)
 ARCHIVE="$(mktemp "${TMPDIR:-/tmp}/botnastya-release.XXXXXX")"
 trap 'rm -f "$ARCHIVE"' EXIT
 tar -czf "$ARCHIVE" "${FILES[@]}"
@@ -20,12 +20,12 @@ REMOTE="$1"
 STAGE="$2"
 REVISION="$3"
 PYTHON="$REMOTE/venv/bin/python3"
-FILES=(bot.py attendance_monitor.py runtime_state.py test_pre_deploy_smoke.py test_reliability.py)
+FILES=(bot.py attendance_monitor.py runtime_state.py conversation_memory.py test_pre_deploy_smoke.py test_reliability.py test_conversation.py)
 cd "$STAGE"
 tar -xzf release.tar.gz
 "$PYTHON" -m py_compile "${FILES[@]}"
 "$PYTHON" test_pre_deploy_smoke.py > smoke.log 2>&1 || { cat smoke.log; exit 1; }
-"$PYTHON" -m unittest -v test_reliability > reliability.log 2>&1 || { cat reliability.log; exit 1; }
+"$PYTHON" -m unittest -v test_reliability test_conversation > reliability.log 2>&1 || { cat reliability.log; exit 1; }
 tail -n 2 smoke.log
 tail -n 4 reliability.log
 
