@@ -3,8 +3,8 @@
 
 1) Через ATTENDANCE_UNMARKED_AFTER_MIN после начала урока, если визит не отмечен
    (visit=false, не skip) — сообщение «не пришёл / не отмечен».
-2) При visit=true: если это N-е посещение с начала месяца (по умолчанию 2) —
-   сообщение «в долг».
+2) На N-м посещении с начала месяца (по умолчанию 2) проверяем реальный долг
+   за конкретное занятие. Само количество посещений не означает задолженность.
 
 Безопасность:
 - обрабатываем только уроки, у которых порог (begin+N мин) только что наступил
@@ -21,6 +21,7 @@ import os
 import re
 import time
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Callable, Awaitable, Dict, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
 from runtime_state import write_json_atomic
@@ -138,50 +139,154 @@ def format_debt_message(admin_phone: Optional[str]) -> str:
     )
 
 
-async def user_has_free_or_qosymsha_sub(crm, base_url: str, user_id: int) -> bool:
-    """True если у ученика активный абонемент Қосымша / бесплатный / цена ≤1₸."""
-    headers = await crm._get_headers()
-    if not headers:
-        return False
+def _number(value) -> Decimal:
+    """Missing/invalid money is unknown, never an implicit zero."""
+    if isinstance(value, bool):
+        raise ValueError("boolean amount")
+    result = Decimal(str(value))
+    if not result.is_finite():
+        raise ValueError("non-finite amount")
+    return result
+
+
+def _positive_id(value) -> int:
+    if isinstance(value, bool) or not re.fullmatch(r"[0-9]+", str(value)) or int(value) <= 0:
+        raise ValueError("invalid CRM id")
+    return int(value)
+
+
+def is_unbilled_visit(record: dict) -> bool:
+    # MoyKlass `paid` means CHARGEABLE, not payment received. `bill` is only
+    # populated with includeBills=true; its absence must not mean "unpaid".
+    # https://api.moyklass.com/openapi.json: LessonRecord, hasBills.
+    return (
+        record.get("visit") is True and record.get("paid") is True
+        and record.get("free") is False and record.get("skip") is False
+        and "bill" in record and record["bill"] is None
+    )
+
+
+async def _crm_rows(client, base_url, headers, path, key, params):
+    """Read complete, bounded lists; partial/error responses never prove debt."""
+    rows = []
+    seen = set()
+    expected_total = None
+    for offset in range(0, 2000, 200):
+        response = await client.get(
+            f"{base_url}/{path}", headers=headers,
+            params={**params, "limit": 200, "offset": offset},
+        )
+        response.raise_for_status()
+        data = response.json()
+        batch = data[key]
+        total = data["stats"]["totalItems"]
+        if not isinstance(batch, list) or type(total) is not int or total < 0:
+            raise ValueError("invalid CRM list")
+        if expected_total is not None and total != expected_total:
+            raise ValueError("CRM list changed during verification")
+        expected_total = total
+        for row in batch:
+            identity = _positive_id(row["id"])
+            if identity in seen:
+                raise ValueError("duplicate CRM page/record")
+            seen.add(identity)
+        rows.extend(batch)
+        if len(rows) == total:
+            return rows
+        if len(batch) != 200 or len(rows) > total:
+            raise ValueError("incomplete CRM list")
+    raise ValueError("CRM list exceeds verification limit")
+
+
+async def has_confirmed_lesson_debt(crm, base_url: str, user_id, lesson_id) -> bool:
+    """Fresh evidence for THIS attended lesson, shared by polling and webhooks.
+
+    A billed lesson is covered; an unpaid subscription invoice is a separate
+    payment reminder, not proof of an uncovered lesson. Unknown data fail closed.
+    """
     import httpx
+    reason = "unknown"
     try:
+        uid, lid = _positive_id(user_id), _positive_id(lesson_id)
+        headers = await crm._get_headers()
+        if not headers:
+            raise ValueError("CRM authentication unavailable")
         async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.get(
-                f"{base_url}/userSubscriptions",
-                headers=headers,
-                params={"userId": int(user_id), "limit": 50},
-            )
-            if resp.status_code != 200:
-                logger.warning(
-                    "attendance: userSubscriptions userId=%s -> %s",
-                    user_id, resp.status_code,
-                )
+            records = await _crm_rows(client, base_url, headers, "lessonRecords", "lessonRecords", {
+                "userId": uid, "lessonId": lid, "includeLessons": "true", "includeBills": "true",
+            })
+            if len(records) != 1:
+                reason = "missing_or_ambiguous_record"
                 return False
-            items = resp.json().get("subscriptions") or resp.json().get("userSubscriptions") or []
-            for sub in items:
-                status_id = sub.get("statusId")
-                if status_id is not None and int(status_id) != _ACTIVE_SUB_STATUS:
+            record = records[0]
+            if _positive_id(record.get("userId")) != uid or _positive_id(record.get("lessonId")) != lid:
+                raise ValueError("CRM record identity mismatch")
+            if not is_unbilled_visit(record):
+                reason = "covered_or_not_chargeable_visit"
+                return False
+            lesson = record["lesson"]
+            start = _parse_lesson_dt(lesson.get("date"), lesson.get("beginTime"))
+            if (lesson.get("id") != lid or type(lesson.get("status")) is not int
+                    or lesson["status"] != 1 or not lesson.get("beginTime")
+                    or start is None or start > datetime.now(_SCHOOL_TZ)):
+                reason = "lesson_not_held"
+                return False
+            class_id = _positive_id(lesson.get("classId"))
+            joins = await _crm_rows(client, base_url, headers, "joins", "joins", {
+                "userId": uid, "classId": class_id,
+            })
+            matching = [j for j in joins if j.get("userId") == uid and j.get("classId") == class_id]
+            if not matching or not any(_number(j["stats"]["nonPayedLessons"]) > 0 for j in matching):
+                reason = "no_debt_in_lesson_class"
+                return False
+
+            response = await client.get(f"{base_url}/users/{uid}", headers=headers)
+            response.raise_for_status()
+            user = response.json()
+            if user.get("id") != uid:
+                raise ValueError("CRM user identity mismatch")
+            if _number(user["availableBalance"]) > 0:
+                # Money received but not yet allocated: let the administrator
+                # reconcile it, do not ask the parent to pay again.
+                reason = "unallocated_payment"
+                return False
+
+            subscriptions = await _crm_rows(client, base_url, headers, "userSubscriptions", "subscriptions", {
+                "userId": uid, "includeFamilySubs": "true",
+            })
+            for sub in subscriptions:
+                status = _positive_id(sub["statusId"])
+                if status != _ACTIVE_SUB_STATUS:
                     continue
-                sid = sub.get("subscriptionId")
-                try:
-                    price = float(sub.get("price") if sub.get("price") is not None else 999999)
-                except (TypeError, ValueError):
-                    price = 999999
-                if sid is not None and int(sid) in DEBT_EXCLUDE_SUBSCRIPTION_IDS:
-                    logger.info(
-                        "attendance: skip debt free-sub userId=%s subscriptionId=%s price=%s",
-                        user_id, sid, price,
-                    )
-                    return True
-                if price <= DEBT_EXCLUDE_MAX_PRICE:
-                    logger.info(
-                        "attendance: skip debt low-price userId=%s subscriptionId=%s price=%s",
-                        user_id, sid, price,
-                    )
-                    return True
-    except Exception as e:
-        logger.warning("attendance: free-sub check userId=%s: %s", user_id, e)
-    return False
+                price = _number(sub["price"])
+                if _positive_id(sub["subscriptionId"]) in DEBT_EXCLUDE_SUBSCRIPTION_IDS or price <= _number(DEBT_EXCLUDE_MAX_PRICE):
+                    reason = "free_subscription"
+                    return False
+                # Course/family subscriptions may cover more than one group.
+                relevant = (class_id in sub["classIds"] or sub.get("mainClassId") == class_id or bool(sub.get("courseIds")))
+                if not relevant:
+                    continue
+                begin = datetime.strptime(sub["beginDate"], "%Y-%m-%d").date()
+                end = datetime.strptime(sub["endDate"], "%Y-%m-%d").date() if sub.get("endDate") else None
+                if begin > start.date() or (end and end < start.date() and sub.get("useLeftovers") is not True):
+                    continue
+                stats = sub["stats"]
+                visits = sub["visitCount"]
+                if visits is not None and _number(visits) <= _number(stats["totalVisited"]) + _number(stats["totalBurned"]):
+                    continue
+                # Embedded subscriptions can report payed=0 while totalPayed
+                # contains the payment. Either positive source prevents a false debt.
+                paid = max(_number(sub["payed"]), _number(stats["totalPayed"]))
+                if paid >= price:
+                    reason = "paid_subscription_pending_allocation"
+                    return False
+            reason = "confirmed_unbilled_visit"
+            return True
+    except Exception as exc:
+        reason = f"verification_unavailable:{type(exc).__name__}"
+        return False
+    finally:
+        logger.info("debt-check: userId=%s lessonId=%s result=%s", user_id, lesson_id, reason)
 
 
 async def count_visits_this_month(crm, base_url: str, user_id: int, now: datetime) -> int:
@@ -255,7 +360,7 @@ async def fetch_lesson_records(crm, base_url: str, lesson_id: int) -> List[dict]
             resp = await client.get(
                 f"{base_url}/lessonRecords",
                 headers=headers,
-                params={"lessonId": int(lesson_id), "limit": 200},
+                params={"lessonId": int(lesson_id), "includeBills": "true", "limit": 200},
             )
             if resp.status_code != 200:
                 return []
@@ -292,7 +397,6 @@ async def attendance_tick(
     client_cache: Dict[int, bool] = {}
     phone_cache: Dict[int, Optional[str]] = {}
     trainer_cache: Dict[Tuple[int, int], str] = {}
-    free_sub_cache: Dict[int, bool] = {}
 
     for lesson in lessons:
         lesson_id = lesson.get("id")
@@ -377,18 +481,9 @@ async def attendance_tick(
                 stats["missed_sent"] += 1
 
             # --- monthly debt on 2nd visit ---
-            if in_debt_window and rec.get("visit"):
+            if in_debt_window and is_unbilled_visit(rec):
                 dkey = _month_key(uid, now)
                 if dkey in _debt_sent:
-                    continue
-                if uid not in free_sub_cache:
-                    free_sub_cache[uid] = await user_has_free_or_qosymsha_sub(
-                        crm, base_url, uid,
-                    )
-                if free_sub_cache[uid]:
-                    # Қосымша / бесплатные — не считаем «в долг», сразу в state.
-                    _debt_sent.add(dkey)
-                    stats["skipped"] += 1
                     continue
                 if uid not in visits_cache:
                     visits_cache[uid] = await count_visits_this_month(
@@ -397,10 +492,13 @@ async def attendance_tick(
                 visits = visits_cache[uid]
                 if visits != MONTHLY_DEBT_VISIT_N:
                     continue
+                if (ATTENDANCE_DRY_RUN or ATTENDANCE_SEED_ONLY) and not await has_confirmed_lesson_debt(crm, base_url, uid, lid):
+                    stats["skipped"] += 1
+                    continue
                 admin_phone = await get_admin_phone(uid)
                 msg = format_debt_message(admin_phone)
                 logger.info(
-                    "attendance: DEBT userId=%s visits=%s phone=%s dry=%s seed=%s",
+                    "attendance: DEBT_CANDIDATE userId=%s visits=%s phone=%s dry=%s seed=%s",
                     user_id, visits, phone, ATTENDANCE_DRY_RUN, ATTENDANCE_SEED_ONLY,
                 )
                 if ATTENDANCE_SEED_ONLY:

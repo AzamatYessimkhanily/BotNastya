@@ -2901,7 +2901,7 @@ def _should_skip_stale_incoming(data: dict) -> bool:
     return False
 
 
-async def send_whatsapp(chat_id, text, *, sanitize_fallback: str = "handoff", sanitize: bool = True) -> bool:
+async def send_whatsapp(chat_id, text, *, sanitize_fallback: str = "handoff", sanitize: bool = True, before_send=None) -> bool:
     # Доп. нормализация на случай прямых вызовов (голосовые ошибки и т.д.).
     # sanitize=False — для служебных сообщений сотрудникам (сохраняем формат/переносы).
     # Возвращает True только при подтверждённой отправке (Green API отдал idMessage).
@@ -2919,6 +2919,17 @@ async def send_whatsapp(chat_id, text, *, sanitize_fallback: str = "handoff", sa
 
     if not _outbound_allowed(chat_id):
         return False
+
+    if before_send is not None:
+        # Recheck time-sensitive CRM evidence after the rate limiter has waited.
+        try:
+            if not await before_send():
+                return False
+        except Exception as exc:
+            logger.warning("send_whatsapp: pre-send check failed (%s)", type(exc).__name__)
+            return False
+        if not _outbound_allowed(chat_id):
+            return False
 
     url = f"https://api.green-api.com/waInstance{GREEN_API_ID}/sendMessage/{GREEN_API_TOKEN}"
     try:
@@ -4147,6 +4158,13 @@ async def _dispatch_moyklass_webhook(
     delivered_count = 0
     deduplicated_count = 0
     user_id = obj.get("userId")
+    debt_check = None
+    if event == "sub_lesson_in_debt" and log_prefix != "moyklass-webhook-employee":
+        async def debt_check():
+            return await _attendance_monitor.has_confirmed_lesson_debt(
+                crm, MOYKLASS_BASE_URL, user_id, obj.get("lessonId"),
+            )
+
     for phone in phones:
         dedup_key = _crm_dedup_key(event, user_id, phone, obj)
         if dedup_key and _crm_already_sent(dedup_key):
@@ -4173,7 +4191,12 @@ async def _dispatch_moyklass_webhook(
         if dedup_key:
             _crm_inflight_keys.add(dedup_key)
         try:
-            delivered = await send_whatsapp(chat_id, message)
+            if debt_check is not None:
+                if not await debt_check():
+                    continue
+                delivered = await send_whatsapp(chat_id, message, before_send=debt_check)
+            else:
+                delivered = await send_whatsapp(chat_id, message)
             if not delivered:
                 logger.error("%s: НЕ доставлено %s (см. send_whatsapp выше)", log_prefix, chat_id)
                 continue
