@@ -35,13 +35,13 @@ AUTO_REPLY = re.compile(
 
 QUESTION_FIELDS = {
     'audience': re.compile(r'для\s+кого|для\s+реб[её]нка\s+или|кім\s+үшін', re.I),
-    'age': re.compile(r'сколько\s+лет|како\w*\s+возраст|неше\s+жас', re.I),
-    'experience': re.compile(r'опыт|начинающ|уровень|занимал\w*.*раньше|тәжірибе|бастаушы', re.I),
+    'age': re.compile(r'сколько\s+(?:\w+\s+){0,3}лет|возраст|неше\s+жас', re.I),
+    'experience': re.compile(r'опыт|начинающ|уровень|занимал\w*|играл\w*|разряд|тәжірибе|бастаушы', re.I),
     'preference': re.compile(r'како\w*\s+(?:формат|филиал|вариант)|где.*(?:заним|обуч)|қай\s+филиал', re.I),
 }
 
 
-def update_facts(facts, text):
+def update_facts(facts, text, *, last_question=''):
     """Only client statements; never extract facts from the bot's offered options."""
     low = text.lower().replace('ё', 'е')
     if re.search(r'ребен|сын|доч|балам|балама|балаға', low):
@@ -51,9 +51,18 @@ def update_facts(facts, text):
     age = re.search(r'\b(\d{1,2})\s*(?:лет|год(?:а)?|жас)\b', low)
     if age and not re.search(r'(?:опыт|занима|игра|шахмат|стаж)', low[:age.start()]):
         facts['age'] = age.group(1)
+    elif re.fullmatch(r'\d{1,2}[.!]?', low.strip()) and (
+        QUESTION_FIELDS['age'].search(last_question)
+        or ('audience' in facts and 'age' not in facts
+            and QUESTION_FIELDS['audience'].search(last_question))
+    ):
+        # A number answers an age question, but not a question about rank/time.
+        facts['age'] = low.strip().rstrip('.!')
     rank = re.search(r'\b(?:[1-4iv]+\s*(?:-?й\s+)?разряд\w*|кмс|мастер\s+спорта)\b', low)
     if rank:
         facts['experience'] = rank.group(0) + ' — есть опыт'
+    elif re.search(r'\b(?:есть|имеет)\s+(?:\w+\s+)?разряд', low):
+        facts['experience'] = text.strip() + ' — есть опыт'
     elif re.search(r'нович|начинающ|нет\s+опыта|без\s+опыта|не\s+(?:играл|занимал)|бастаушы', low):
         facts['experience'] = 'начинающий'
     elif re.search(r'(?:имеет|есть)\s+опыт|(?:занима\w*|игра\w*)\s+\d+\s+(?:лет|год|месяц)', low):
@@ -69,9 +78,14 @@ def update_facts(facts, text):
     return facts
 
 
+def has_question(text):
+    return '?' in text or bool(re.search(
+        r'\b(?:подскаж\w*|уточни\w*|напиши\w*|сообщи\w*|скажите)\b', text, re.I))
+
+
 def remove_answered_questions(answer, facts):
     """Drop questions whose answers are already explicitly known; retain useful prose."""
     parts = re.split(r'(?<=[.!?])\s+', answer)
     return ' '.join(part for part in parts if not (
-        '?' in part and any(key in facts and pattern.search(part)
+        has_question(part) and any(key in facts and pattern.search(part)
                             for key, pattern in QUESTION_FIELDS.items())))

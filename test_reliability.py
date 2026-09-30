@@ -49,7 +49,7 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.lookup = self.enterContext(patch.object(bot.crm, 'find_user_smart', AsyncMock(return_value=None)))
         for name in ('chat_history', 'message_buffers', 'known_users', 'client_dossiers', 'last_activity',
                      'followups', 'handoff_completed', 'session_manager_notified', 'seen_incoming_ids',
-                     'crm_notify_recent', 'conversation_facts', 'incoming_versions', 'incoming_pending', '_dialog_locks', '_incoming_locks', '_wa_last_chat_ts'):
+                     'crm_notify_recent', 'conversation_facts', 'incoming_versions', 'incoming_pending', 'latest_incoming_timestamps', '_dialog_locks', '_incoming_locks', '_wa_last_chat_ts'):
             getattr(bot, name).clear()
         for name in ('_crm_sent_keys', '_crm_inflight_keys', 'followup_blocked', 'session_registered_leads', 'contact_opt_out', 'internal_chats', 'followup_sent', 'history_hydrated', '_wa_send_times'):
             getattr(bot, name).clear()

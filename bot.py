@@ -7,7 +7,7 @@ import io
 import logging
 import time
 from contextvars import ContextVar
-from conversation_memory import save_snapshot, load_snapshots, STOP_CONTACT, AUTO_REPLY, update_facts, remove_answered_questions
+from conversation_memory import save_snapshot, load_snapshots, STOP_CONTACT, AUTO_REPLY, update_facts, remove_answered_questions, has_question
 from weakref import WeakValueDictionary
 from collections import defaultdict, deque
 from datetime import date, datetime, timedelta
@@ -129,7 +129,7 @@ _QUANTUM_CONTACT_LINE = (
     f"GM Legends Quantum STEM School: {QUANTUM_MANAGER_NAME} — {QUANTUM_MANAGER_PHONE}"
 )
 
-BUFFER_DELAY = max(1.0, float(os.getenv("BUFFER_DELAY", "4")))
+BUFFER_DELAY = max(1.0, float(os.getenv("BUFFER_DELAY", "8")))
 MOYKLASS_BASE_URL = "https://api.moyklass.com/v1/company"
 MOYKLASS_HTTP_TIMEOUT = 30.0
 # Запись в группу «Учится» — MoyKlass join statusId (для отображения в досье, не для рассылок).
@@ -707,6 +707,7 @@ internal_chats: set = set()
 followup_sent: set = set()
 incoming_versions: Dict[str, int] = defaultdict(int)
 incoming_pending: Dict[str, int] = defaultdict(int)
+latest_incoming_timestamps: Dict[str, int] = {}
 history_hydrated: set = set()
 _outbound_context = ContextVar("outbound_context", default=None)
 
@@ -746,6 +747,18 @@ async def _load_conversations():
                 chat_history[chat_id][0] = {"role": "system", "content": SYSTEM_PROMPT}
             _repair_dangling_tool_calls(chat_id)
         conversation_facts[chat_id] = state.get("facts", {})
+        # Backfill facts newly recognized by this version without replacing
+        # facts already persisted from the full (possibly trimmed) conversation.
+        recovered_facts = {}
+        previous_question = ""
+        for message in state.get("history", []):
+            if message.get("role") == "assistant" and message.get("content"):
+                previous_question = message["content"]
+            elif message.get("role") == "user":
+                update_facts(recovered_facts, _bare_client_text(message.get("content")),
+                             last_question=previous_question)
+        for key, value in recovered_facts.items():
+            conversation_facts[chat_id].setdefault(key, value)
         seen_incoming_ids[chat_id].extend(state.get("incoming_ids", [])[-400:])
         for key, target in (("opt_out", contact_opt_out), ("hydrated", history_hydrated), ("internal", internal_chats),
                             ("followup_sent", followup_sent), ("registered", session_registered_leads)):
@@ -2376,6 +2389,8 @@ _PURE_ACK_PHRASES = frozenset({
 def _bare_client_text(text: str) -> str:
     """Текст клиента без служебных обёрток webhook/буфера."""
     t = (text or "").strip()
+    if t.startswith("[ОПРЕДЕЛИ ЯЗЫК ") and "]\n" in t:
+        t = t.split("]\n", 1)[-1].strip()
     if "[CLIENT_MESSAGE]:" in t:
         t = t.split("[CLIENT_MESSAGE]:", 1)[-1].strip()
     if t.lower().startswith("[голосовое]:"):
@@ -2931,6 +2946,14 @@ async def send_whatsapp(chat_id, text, *, sanitize_fallback: str = "handoff", sa
         if not _outbound_allowed(chat_id):
             return False
 
+    context = _outbound_context.get()
+    if context and context[0] == chat_id and context[2] == "dialog":
+        # Webhooks can lag behind WhatsApp. Check again after any send cooldown,
+        # before committing a response based on an incomplete client reply.
+        await _refresh_pending_incoming(chat_id)
+        if not _outbound_allowed(chat_id):
+            return False
+
     url = f"https://api.green-api.com/waInstance{GREEN_API_ID}/sendMessage/{GREEN_API_TOKEN}"
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -2965,6 +2988,62 @@ async def send_whatsapp(chat_id, text, *, sanitize_fallback: str = "handoff", sa
     return True
 
 # --- 6. ЛОГИКА ДИАЛОГА ---
+async def _refresh_pending_incoming(chat_id):
+    """Best-effort recovery of recent text messages whose webhooks are delayed.
+
+    Journals can also lag; normal webhooks remain the primary input. Never replay
+    old history, other chats, or messages already accepted through either path.
+    """
+    since = latest_incoming_timestamps.get(chat_id)
+    if since is None or not _outbound_allowed(chat_id):
+        return
+    try:
+        url = f"https://api.green-api.com/waInstance{GREEN_API_ID}/getChatHistory/{GREEN_API_TOKEN}"
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            response = await client.post(url, json={"chatId": chat_id, "count": 20})
+        response.raise_for_status()
+        messages = response.json()
+        if not isinstance(messages, list):
+            raise ValueError("Invalid history response")
+    except Exception as error:
+        logger.warning("Fresh history unavailable for %s (%s)", chat_id, type(error).__name__)
+        return
+    if not _outbound_allowed(chat_id):
+        return
+    recovered = 0
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("chatId") != chat_id:
+            continue
+        timestamp = _incoming_message_timestamp(message)
+        if (message.get("type") != "incoming" or message.get("isDeleted")
+                or timestamp is None or timestamp < since
+                or not message.get("idMessage")
+                or message["idMessage"] in seen_incoming_ids[chat_id]):
+            continue
+        if message.get("typeMessage") not in ("textMessage", "extendedTextMessage", "quotedMessage"):
+            continue
+        extended = message.get("extendedTextMessage") or {}
+        text = message.get("textMessage") or (extended.get("text") if isinstance(extended, dict) else "")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        event = {"timestamp": timestamp}
+        if _should_skip_stale_incoming(event):
+            continue
+        if STOP_CONTACT.search(text):
+            _stop_contact(chat_id)
+            return
+        # Share webhook deduplication and the per-chat ingress lock. A webhook
+        # arriving during the request or later cannot queue the same text twice.
+        _queue_incoming(chat_id, {
+            "typeMessage": "textMessage", "textMessageData": {"textMessage": text},
+            "quotedMessage": message.get("quotedMessage"),
+        }, message["idMessage"], timestamp)
+        recovered += 1
+    if recovered:
+        logger.info("dialog: recovered %d delayed incoming message(s) for %s; discarded stale answer",
+                    recovered, chat_id)
+
+
 async def _hydrate_chat_history(chat_id):
     """Read this chat only, once; never send messages or scan unrelated chats.
 
@@ -3002,8 +3081,11 @@ async def _hydrate_chat_history(chat_id):
                 _stop_contact(chat_id)
             if AUTO_REPLY.search(content):
                 _block_followup(chat_id, "historical_auto_reply")
-            update_facts(facts, content)
+            previous_question = next((m["content"] for m in reversed(history) if m["role"] == "assistant"), "")
+            update_facts(facts, content, last_question=previous_question)
             history.append({"role": "user", "content": content})
+            if message.get("idMessage"):
+                seen_incoming_ids[chat_id].append(message["idMessage"])
         elif message.get("type") == "outgoing" and message.get("statusMessage") in ("sent", "delivered", "read"):
             history.append({"role": "assistant", "content": content})
             if content == FOLLOWUP_MESSAGE or content.startswith("Вы ранее интересовались развитием интеллекта через шахматы"):
@@ -3158,8 +3240,10 @@ async def _process_dialog(chat_id):
 
         chat_history[chat_id].append({"role": "user", "content": user_payload})
         facts = conversation_facts.setdefault(chat_id, {})
+        previous_question = next((_history_message_content(m) for m in reversed(chat_history[chat_id])
+                                  if isinstance(m, dict) and m.get("role") == "assistant"), "")
         for message in buffer["messages"]:
-            update_facts(facts, _bare_client_text(message))
+            update_facts(facts, _bare_client_text(message), last_question=previous_question)
         _save_conversation(chat_id)
 
         # План авто-реактивации: клиент написал — (пере)ставим таймер напоминаний.
@@ -3359,7 +3443,7 @@ async def _process_dialog(chat_id):
                 return
             original_answer = sanitize_bot_outgoing(bot_answer)
             sanitized_answer = remove_answered_questions(original_answer, facts)
-            if sanitized_answer != original_answer:
+            if sanitized_answer != original_answer and not has_question(sanitized_answer):
                 kazakh = bool(_KAZAKH_CHAR_RE.search(bare_user))
                 next_question = ""
                 for key, ru, kk in (
@@ -3458,20 +3542,26 @@ async def handle_webhook(request: Request):
     if _should_skip_stale_incoming(data):
         return "ok"
     id_message = data.get("idMessage") or msg_data.get("idMessage")
+    _queue_incoming(sender, msg_data, id_message, _incoming_message_timestamp(data))
+    return "ok"
+
+
+def _queue_incoming(sender, msg_data, id_message, timestamp):
     if id_message:
         dq = seen_incoming_ids[sender]
         if id_message in dq:
             logger.info(f"Повтор webhook idMessage={id_message} для {sender}, пропуск")
-            return "ok"
+            return
         dq.append(id_message)
 
+    if timestamp is not None:
+        latest_incoming_timestamps[sender] = max(timestamp, latest_incoming_timestamps.get(sender, 0))
     incoming_versions[sender] += 1
     incoming_pending[sender] += 1
     # Acknowledge immediately, including voice messages. One ingress lock per
     # chat preserves voice/text order while other chats remain independent.
     lock = _incoming_locks.setdefault(sender, asyncio.Lock())
     _spawn_task(_receive_incoming(sender, msg_data, lock))
-    return "ok"
 
 
 async def _receive_incoming(sender, msg_data, lock):

@@ -1,5 +1,6 @@
 """Customer incident regressions: no real WhatsApp, CRM or model calls."""
 import asyncio
+import httpx
 import time
 import unittest
 from types import SimpleNamespace
@@ -274,6 +275,151 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         for text in ('Аркада или Камал?', 'Не Аркада', 'Можно онлайн?', 'Сколько стоит онлайн?'):
             self.assertNotIn('preference', update_facts({}, text))
         self.assertEqual(update_facts({}, 'Аркада')['preference'], 'Аркада')
+
+    async def test_split_child_and_age_never_asks_age_again(self):
+        bot.chat_history[self.chat] = [{'role': 'assistant', 'content': 'Для кого рассматриваете обучение?'}]
+        bot.message_buffers[self.chat] = {'messages': ['Ребенку', '10 лет']}
+        self.ai.side_effect = [completion('Сколько лет вашему ребёнку?')]
+        await bot.process_dialog(self.chat)
+        self.assertEqual(bot.conversation_facts[self.chat]['age'], '10')
+        self.assertEqual(self.send.call_args.args[1], 'Уже занимались шахматами или начинаете с нуля?')
+
+    async def test_numeric_age_uses_previous_question(self):
+        for question, messages in (
+            ('Сколько лет вашему ребёнку?', ['10']),
+            ('Для кого рассматриваете обучение?', ['Ребенку', '10']),
+            ('Оқушы неше жаста?', ['10']),
+        ):
+            with self.subTest(question=question):
+                bot.conversation_facts[self.chat] = {}
+                bot.chat_history[self.chat] = [{'role': 'assistant', 'content': question}]
+                bot.message_buffers[self.chat] = {'messages': messages}
+                self.ai.side_effect = [completion('Сколько лет вашему ребёнку?')]
+                await bot.process_dialog(self.chat)
+                self.assertEqual(bot.conversation_facts[self.chat]['age'], '10')
+                self.assertNotIn('Сколько лет', self.send.call_args.args[1])
+        for question in ('Какой разряд?', 'Во сколько удобно?', 'Как зовут ребёнка?', ''):
+            self.assertNotIn('age', update_facts({'audience': 'ребёнок'}, '10', last_question=question))
+
+    async def test_upgrade_backfills_numeric_age_and_rank_from_saved_history(self):
+        bot.chat_history[self.chat] = [
+            {'role': 'assistant', 'content': 'Сколько лет вашему ребёнку?'},
+            {'role': 'user', 'content': '[ОПРЕДЕЛИ ЯЗЫК ЭТОГО СООБЩЕНИЯ]\n10'},
+            {'role': 'assistant', 'content': 'Есть ли опыт в шахматах?'},
+            {'role': 'user', 'content': 'Есть разряд, 3 кажется 😂'},
+        ]
+        bot.conversation_facts[self.chat] = {'audience': 'ребёнок'}
+        bot._save_conversation(self.chat)
+        bot.chat_history.clear()
+        bot.conversation_facts.clear()
+        await bot._load_conversations()
+        self.assertEqual(bot.conversation_facts[self.chat]['age'], '10')
+        self.assertIn('есть опыт', bot.conversation_facts[self.chat]['experience'])
+
+    async def test_imported_incoming_is_not_replayed_by_delayed_webhook(self):
+        row = {'chatId': self.chat, 'type': 'incoming', 'typeMessage': 'textMessage',
+               'idMessage': 'imported-age', 'textMessage': '10 лет'}
+        response = SimpleNamespace(raise_for_status=lambda: None, json=lambda: [row])
+        with patch('httpx.AsyncClient.post', AsyncMock(return_value=response)):
+            await HYDRATE(self.chat)
+        await bot.handle_webhook(self.request('10 лет', 'imported-age'))
+        self.assertNotIn(self.chat, bot.message_buffers)
+        self.assertEqual(bot.incoming_versions[self.chat], 0)
+
+    async def test_age_request_without_question_mark_and_remaining_question(self):
+        facts = {'audience': 'ребёнок', 'age': '10'}
+        self.assertEqual(remove_answered_questions('Подскажите, пожалуйста, возраст ребёнка.', facts), '')
+        bot.conversation_facts[self.chat] = facts
+        self.ai.side_effect = [completion('Сколько вашему ребёнку лет? Какой филиал вам удобен?')]
+        self.queue('10 лет')
+        await bot.process_dialog(self.chat)
+        self.assertEqual(self.send.call_args.args[1], 'Какой филиал вам удобен?')
+
+    async def test_rank_in_customer_word_order_prevents_repeating_experience(self):
+        self.ai.side_effect = [completion('Занимался ли ваш ребёнок ранее шахматами или у него есть какой-то разряд?')]
+        bot.conversation_facts[self.chat] = {'audience': 'ребёнок', 'age': '10'}
+        self.queue('Есть разряд, 3 кажется 😂')
+        await bot.process_dialog(self.chat)
+        self.assertIn('есть опыт', bot.conversation_facts[self.chat]['experience'])
+        self.assertIn('Какой филиал', self.send.call_args.args[1])
+
+    async def test_delayed_age_webhook_is_recovered_before_sending_question(self):
+        """Incident: child at :00, age at :04, webhook for age arrives after reply."""
+        now = int(time.time())
+        row = {'chatId': self.chat, 'type': 'incoming', 'typeMessage': 'textMessage',
+               'idMessage': 'delayed-age', 'timestamp': now, 'textMessage': '10 лет'}
+        sent = []
+        done = asyncio.Event()
+        slot = AsyncMock(return_value=True)
+        async def post(url, **kwargs):
+            if '/getChatHistory/' in url:
+                self.assertGreater(slot.await_count, 0)
+                return SimpleNamespace(raise_for_status=lambda: None, json=lambda: [row])
+            self.assertIn('/sendMessage/', url)
+            sent.append(kwargs['json']['message'])
+            done.set()
+            return SimpleNamespace(status_code=200, json=lambda: {'idMessage': 'reply'})
+        self.ai.side_effect = [completion('Сколько лет вашему ребёнку?'), completion('Сколько лет вашему ребёнку?')]
+        with patch.object(bot, 'BUFFER_DELAY', .01), patch.object(bot, 'send_whatsapp', SEND), \
+             patch.object(bot, '_wa_acquire_send_slot', slot), patch('httpx.AsyncClient.post', AsyncMock(side_effect=post)):
+            await bot.handle_webhook(self.request('Ребенку', 'child', timestamp=now - 4))
+            await asyncio.wait_for(done.wait(), timeout=2)
+            await asyncio.gather(*list(bot._background_tasks))
+            # The eventual real webhook must not re-run the dialog.
+            await bot.handle_webhook(self.request('10 лет', 'delayed-age', timestamp=now))
+            self.assertNotIn(self.chat, bot.message_buffers)
+        self.assertEqual(sent, ['Уже занимались шахматами или начинаете с нуля?'])
+        self.assertEqual(self.ai.await_count, 2)
+        self.assertEqual(bot.conversation_facts[self.chat]['age'], '10')
+        user_messages = [m['content'] for m in bot.chat_history[self.chat] if m['role'] == 'user']
+        self.assertEqual(sum('10 лет' in m for m in user_messages), 1)
+
+    async def test_history_refresh_does_not_replay_old_deleted_or_other_chat_messages(self):
+        now = int(time.time())
+        bot.latest_incoming_timestamps[self.chat] = now
+        bot.seen_incoming_ids[self.chat].append('already-seen')
+        base = {'chatId': self.chat, 'type': 'incoming', 'typeMessage': 'textMessage',
+                'idMessage': 'fresh', 'timestamp': now, 'textMessage': '10 лет'}
+        rows = [dict(base, idMessage='already-seen'), dict(base, timestamp=now-1),
+                dict(base, chatId='77005555555@c.us'), dict(base, type='outgoing'),
+                dict(base, isDeleted=True), dict(base, idMessage=None),
+                dict(base, timestamp=None), dict(base, typeMessage='reactionMessage'), None]
+        response = SimpleNamespace(raise_for_status=lambda: None, json=lambda: rows)
+        with patch('httpx.AsyncClient.post', AsyncMock(return_value=response)):
+            await bot._refresh_pending_incoming(self.chat)
+        self.assertNotIn(self.chat, bot.message_buffers)
+        self.assertFalse(bot._background_tasks)
+
+    async def test_history_refresh_stop_request_cancels_reply(self):
+        now = int(time.time())
+        bot.latest_incoming_timestamps[self.chat] = now
+        row = {'chatId': self.chat, 'type': 'incoming', 'typeMessage': 'textMessage',
+               'idMessage': 'stop', 'timestamp': now, 'textMessage': 'Не пишите мне'}
+        response = SimpleNamespace(raise_for_status=lambda: None, json=lambda: [row])
+        token = bot._outbound_context.set((self.chat, 0, 'dialog'))
+        try:
+            with patch('httpx.AsyncClient.post', AsyncMock(return_value=response)) as post, \
+                 patch.object(bot, '_wa_acquire_send_slot', AsyncMock(return_value=True)):
+                self.assertFalse(await SEND(self.chat, 'Сколько лет ребёнку?'))
+                post.assert_awaited_once()
+                self.assertIn('/getChatHistory/', post.call_args.args[0])
+        finally:
+            bot._outbound_context.reset(token)
+        self.assertIn(self.chat, bot.contact_opt_out)
+
+    async def test_history_refresh_failure_still_allows_normal_reply(self):
+        bot.latest_incoming_timestamps[self.chat] = int(time.time())
+        async def post(url, **kwargs):
+            if '/getChatHistory/' in url:
+                raise httpx.ReadTimeout('offline')
+            return SimpleNamespace(status_code=200, json=lambda: {'idMessage': 'reply'})
+        token = bot._outbound_context.set((self.chat, 0, 'dialog'))
+        try:
+            with patch('httpx.AsyncClient.post', AsyncMock(side_effect=post)), \
+                 patch.object(bot, '_wa_acquire_send_slot', AsyncMock(return_value=True)):
+                self.assertTrue(await SEND(self.chat, 'Какой филиал удобен?'))
+        finally:
+            bot._outbound_context.reset(token)
 
 
 if __name__ == '__main__':
