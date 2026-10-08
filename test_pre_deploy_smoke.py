@@ -14,7 +14,7 @@ os.environ["MOYKLASS_API_KEY"] = "smoke"
 # Tests run on the server too: never overwrite its real dedup/block files.
 _STATE_DIR = tempfile.TemporaryDirectory(prefix="botnastya-smoke-")
 for _key in ("FOLLOWUP_BLOCKED_FILE", "CRM_SENT_STATE_FILE", "LEAD_POLL_STATE_FILE",
-             "ATTENDANCE_STATE_FILE", "FAILED_LEADS_FILE", "CONVERSATION_STATE_FILE"):
+             "ATTENDANCE_STATE_FILE", "FAILED_LEADS_FILE", "CONVERSATION_STATE_FILE", "USAGE_STATE_FILE"):
     os.environ[_key] = str(Path(_STATE_DIR.name) / _key)
 
 ROOT = Path(__file__).resolve().parent

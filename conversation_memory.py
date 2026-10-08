@@ -3,6 +3,7 @@ import json
 from contextlib import closing
 import re
 import sqlite3
+from dialog_policy import detect_language
 
 
 def save_snapshot(path, chat_id, payload):
@@ -24,8 +25,9 @@ STOP_CONTACT = re.compile(
     r'присылай(?:те)?|присылать|отправляй(?:те)?|отправлять)\b'
     r'|\bне\s+хочу\s*,?\s*чтобы\s+(?:вы|ты)\s+(?:мне\s+|нам\s+)?(?:писал|звонил|беспокоил)'
     r'|\b(?:перестан\w*|прекрат\w*|хватит)\s+(?:мне\s+|нам\s+)?(?:писать|звонить|рассыл\w*)'
-    r'|\bотпиш\w*|\bотписка\b|\bудал\w*\s+(?:мой\s+(?:номер|контакт)|меня\s+из\s+рассыл\w*)'
-    r'|\bотстан\w*|\b(?:stop|unsubscribe)\b|\bжазба\w*|\bхабарласпа\w*|\bмазалама\w*', re.I)
+    r'|\bотпиши(?:те)?\b|\bотписка\b|\bудал\w*\s+(?:мой\s+(?:номер|контакт)|меня\s+из\s+рассыл\w*)'
+    r'|\bотстан\w*|\b(?:stop|unsubscribe)\b'
+    r'|\b(?:жазба|хабарласпа|мазалама)(?:ңыз(?:дар)?|ңдар)?\b', re.I)
 
 
 AUTO_REPLY = re.compile(
@@ -35,8 +37,8 @@ AUTO_REPLY = re.compile(
 
 QUESTION_FIELDS = {
     'audience': re.compile(r'для\s+кого|для\s+реб[её]нка\s+или|кім\s+үшін', re.I),
-    'age': re.compile(r'сколько\s+(?:\w+\s+){0,3}лет|возраст|неше\s+жас', re.I),
-    'experience': re.compile(r'опыт|начинающ|уровень|занимал\w*|играл\w*|разряд|тәжірибе|бастаушы', re.I),
+    'age': re.compile(r'сколько\s+(?:\w+\s+){0,3}лет|возраст|неше\s+жас|жасы\s+қанша', re.I),
+    'experience': re.compile(r'опыт|начинающ|уровень|занимал\w*|играл\w*|разряд|тәжірибе|бастаушы|айналысқан|деңгей', re.I),
     'preference': re.compile(r'како\w*\s+(?:формат|филиал|вариант)|где.*(?:заним|обуч)|қай\s+филиал', re.I),
 }
 
@@ -44,14 +46,15 @@ QUESTION_FIELDS = {
 def update_facts(facts, text, *, last_question=''):
     """Only client statements; never extract facts from the bot's offered options."""
     low = text.lower().replace('ё', 'е')
+    facts['language'] = detect_language(text, facts.get('language', 'ru'))
     if re.search(r'ребен|сын|доч|балам|балама|балаға', low):
         facts['audience'] = 'ребёнок'
     elif 'для себя' in low or 'өзім' in low:
         facts['audience'] = 'для себя'
-    age = re.search(r'\b(\d{1,2})\s*(?:лет|год(?:а)?|жас)\b', low)
+    age = re.search(r'(?<![\d.,])(\d{1,2}(?:[.,]\d+)?)\s*(?:лет|год(?:а)?|жас)\b', low)
     if age and not re.search(r'(?:опыт|занима|игра|шахмат|стаж)', low[:age.start()]):
         facts['age'] = age.group(1)
-    elif re.fullmatch(r'\d{1,2}[.!]?', low.strip()) and (
+    elif re.fullmatch(r'\d{1,2}(?:[.,]\d+)?[.!]?', low.strip()) and (
         QUESTION_FIELDS['age'].search(last_question)
         or ('audience' in facts and 'age' not in facts
             and QUESTION_FIELDS['audience'].search(last_question))
@@ -67,6 +70,14 @@ def update_facts(facts, text, *, last_question=''):
         facts['experience'] = 'начинающий'
     elif re.search(r'(?:имеет|есть)\s+опыт|(?:занима\w*|игра\w*)\s+\d+\s+(?:лет|год|месяц)', low):
         facts['experience'] = 'есть опыт'
+    elif re.search(r'дома\s+играем|үйде\s+ойнай', low):
+        facts['experience'] = 'играет дома, разряд не указан'
+    elif QUESTION_FIELDS['experience'].search(last_question) and re.fullmatch(r'(?:иа|иә|да|сред|средний|орташа)[.!]?', low.strip()):
+        facts['experience'] = text.strip()
+    if re.search(r'как\s+зовут|имя\s+реб|аты\s+кім|аты\s+қандай', last_question, re.I):
+        if re.fullmatch(r'[А-ЯЁӘІҢҒҮҰҚӨҺA-Z][а-яёәіңғүұқөһa-z-]{1,30}(?:\s+[А-ЯЁӘІҢҒҮҰҚӨҺA-Z][а-яёәіңғүұқөһa-z-]{1,30})?', text.strip()):
+            if low.strip() not in {'спасибо', 'хорошо', 'рахмет', 'рақмет', 'жақсы', 'камал', 'аркада', 'онлайн'}:
+                facts['name'] = text.strip()
     # A question/comparison or negated option is not a chosen branch.
     if '?' not in low and not re.search(r'\b(?:или|либо|не)\b', low):
         branches = [label for pattern, label in (

@@ -17,6 +17,10 @@ from fastapi import FastAPI, HTTPException, Request
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 from runtime_state import write_json_atomic
+from dialog_policy import (LANGUAGE_POLICY, closure_reason, DEFER, EMPLOYMENT, EXTERNAL_REQUEST,
+                           EXTERNAL_OUTPUT, VISIT_NOW, PRICE_QUESTION, external_reply, employment_reply,
+                           deferred_price_reply, confirmed_handoff, polish_kazakh)
+from usage_reporting import UsageLedger
 
 # --- 1. НАСТРОЙКИ ---
 load_dotenv()
@@ -31,8 +35,15 @@ logger = logging.getLogger(__name__)
 GREEN_API_ID = os.getenv("GREEN_API_ID")
 GREEN_API_TOKEN = os.getenv("GREEN_API_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-# Модель OpenAI: по умолчанию gpt-4o-mini (дешевле gpt-4-turbo). Переопределение: OPENAI_MODEL в .env
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+# Explicit .env overrides the economical default. All calls are metered.
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+OPENAI_MAX_COMPLETION_TOKENS = int(os.getenv("OPENAI_MAX_COMPLETION_TOKENS", "600"))
+USAGE_STATE_FILE = os.getenv("USAGE_STATE_FILE", "usage_state.sqlite3")
+DAILY_REPORT_PHONE = os.getenv("DAILY_REPORT_PHONE", "+77779559999")
+DAILY_REPORT_ENABLED = os.getenv("DAILY_REPORT_ENABLED", "1").lower() in ("1", "true", "yes", "on")
+DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "9"))
+if not 0 <= DAILY_REPORT_HOUR <= 23:
+    raise ValueError("DAILY_REPORT_HOUR must be 0..23")
 MOYKLASS_API_KEY = os.getenv("MOYKLASS_API_KEY")
 MOYKLASS_WEBHOOK_SECRET = os.getenv("MOYKLASS_WEBHOOK_SECRET", "")
 # Клиентские CRM→WhatsApp: по умолчанию ВЫКЛ (жалобы на рассылку). Включить: MOYKLASS_CLIENT_WEBHOOKS_ENABLED=1
@@ -291,8 +302,7 @@ _SYSTEM_PROMPT_TEMPLATE = """
 ═══════════════════════════════════════
 - КОРОТКО. Одно сообщение — одна мысль. Максимум 3–4 предложения.
 - Пиши как живой человек в WhatsApp — без формальных блоков, без длинных списков.
-- Всегда отвечай на том же языке, на котором написал клиент в последнем сообщении (казахский -> казахский, русский -> русский).
-- Определяй язык по самому тексту клиента каждый раз заново, без опоры на заранее заданные ключевые слова.
+- Отвечай на языке клиента; короткие ответы, числа и имена сохраняют язык диалога. Явная просьба сменить язык имеет приоритет.
 - Если клиент просит "қазақша/казакша/казахша" или пишет, что не понимает русский, НЕМЕДЛЕННО переключайся на казахский и продолжай только на казахском.
 - ЗАПРЕЩЕНО писать фразы вроде "я обязан отвечать на русском" или любые объяснения, почему не можешь говорить по-казахски.
 - Никогда не задавай два вопроса в одном сообщении.
@@ -320,7 +330,7 @@ _SYSTEM_PROMPT_TEMPLATE = """
 - Для оформления заявки в CRM используй номер из [ТЕЛЕФОН КЛИЕНТА], если клиент сам не дал другой. Не выдумывай запрос телефона как условие связи в WhatsApp.
 - ЗАПРЕЩЕНО называть точное расписание по дням/времени — только управляющий филиала.
 - ЗАПРЕЩЕНО обещать скидки, акции или конкретные спортивные результаты ("гарантируем разряд за 3 месяца" и т.п.).
-- ЗАПРЕЩЕНО критиковать конкурентов или обсуждать посторонние темы. Исключение: обучение искусственному интеллекту / ИИ / AI — это наш продукт, см. ТИП 11 (сразу контакт Шолпан Жолдыбаевны, без вопросов).
+- ЗАПРЕЩЕНО рекомендовать, перечислять или критиковать конкурентов, давать их адреса/ссылки, отправлять искать другие школы в 2ГИС. Исключение по тематике: обучение ИИ — это наш продукт, см. ТИП 11.
 - ЗАПРЕЩЕНО писать "Новая заявка..." или любой её вариант текстом. Только через функцию register_client_request.
 - ЗАПРЕЩЕНО давать конфиденциальные данные (телефоны других клиентов, расписание тренера и т.д.).
 - ЗАПРЕЩЕНО говорить клиенту, что заявка «не оформлена», «временно недоступна», «техническая ошибка», «технические проблемы», «попробуем позже», «возникла ошибка», «произошла ошибка», «ошибка при регистрации», «ошибка при подключении к системе», «заявка не обработана». Если система прислала handoff — заявка уже зафиксирована, преподнеси это уверенно.
@@ -663,7 +673,7 @@ preference = КОНКРЕТНЫЙ ФИЛИАЛ: "GMCA Аркада", "GMCA Ка�
 SYSTEM_PROMPT = _SYSTEM_PROMPT_TEMPLATE.replace(
     "__QUANTUM_CONTACT_LINE__",
     _QUANTUM_CONTACT_LINE,
-)
+) + LANGUAGE_POLICY
 
 app = FastAPI()
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=45.0, max_retries=1)
@@ -710,11 +720,42 @@ incoming_pending: Dict[str, int] = defaultdict(int)
 latest_incoming_timestamps: Dict[str, int] = {}
 history_hydrated: set = set()
 _outbound_context = ContextVar("outbound_context", default=None)
+pending_answers: Dict[str, dict] = {}
+
+
+def _ledger():
+    return UsageLedger(USAGE_STATE_FILE, json.loads(os.getenv("OPENAI_PRICES_JSON", "{}")))
+
+
+def _record_event(kind, chat_id, identity=None):
+    try:
+        _ledger().event(kind, chat_id, identity)
+    except Exception:
+        logger.exception("usage: failed to persist activity %s", kind)
+
+
+def _record_usage(response, chat_id, operation, model=OPENAI_MODEL, status="ok"):
+    try:
+        _ledger().record(response, chat=chat_id, operation=operation, model=model, status=status)
+    except Exception:
+        logger.exception("usage: failed to persist API usage")
+
+
+async def _chat_completion(chat_id, operation, **kwargs):
+    try:
+        response = await openai_client.chat.completions.create(
+            model=OPENAI_MODEL, max_completion_tokens=OPENAI_MAX_COMPLETION_TOKENS, **kwargs)
+    except BaseException:
+        # Timeouts/cancellations can still be billed: unknown cost, not zero.
+        _record_usage(None, chat_id, operation, status="error")
+        raise
+    _record_usage(response, chat_id, operation)
+    return response
 
 
 def _is_internal_chat(chat_id):
     phones = list(BRANCH_PHONES.values()) + [p for _, p in BRANCH_MANAGERS.values()]
-    phones += [NEW_LEAD_ADMIN_PHONE] + os.getenv("INTERNAL_PHONES", "").split(",")
+    phones += [NEW_LEAD_ADMIN_PHONE, DAILY_REPORT_PHONE] + os.getenv("INTERNAL_PHONES", "").split(",")
     return chat_id in internal_chats or chat_id in {phone_to_chat_id(p.strip()) for p in phones if p.strip()}
 
 
@@ -733,6 +774,8 @@ def _save_conversation(chat_id):
         "handoff": handoff_completed.get(chat_id), "registered": chat_id in session_registered_leads,
         "crm_notice": crm_notify_recent.get(chat_id), "last_activity": last_activity.get(chat_id),
         "manager_notified": session_manager_notified.get(chat_id),
+        "pending_answer": pending_answers.get(chat_id),
+        "followup_blocked": chat_id in followup_blocked,
     })
 
 
@@ -747,6 +790,8 @@ async def _load_conversations():
                 chat_history[chat_id][0] = {"role": "system", "content": SYSTEM_PROMPT}
             _repair_dangling_tool_calls(chat_id)
         conversation_facts[chat_id] = state.get("facts", {})
+        if state.get("pending_answer"):
+            pending_answers[chat_id] = state["pending_answer"]
         # Backfill facts newly recognized by this version without replacing
         # facts already persisted from the full (possibly trimmed) conversation.
         recovered_facts = {}
@@ -759,6 +804,9 @@ async def _load_conversations():
                              last_question=previous_question)
         for key, value in recovered_facts.items():
             conversation_facts[chat_id].setdefault(key, value)
+        # Earlier integer-only parsing read «4,5 года» as «5 года».
+        if re.fullmatch(r'\d{1,2}[.,]\d+', recovered_facts.get("age", "")):
+            conversation_facts[chat_id]["age"] = recovered_facts["age"]
         seen_incoming_ids[chat_id].extend(state.get("incoming_ids", [])[-400:])
         for key, target in (("opt_out", contact_opt_out), ("hydrated", history_hydrated), ("internal", internal_chats),
                             ("followup_sent", followup_sent), ("registered", session_registered_leads)):
@@ -771,10 +819,16 @@ async def _load_conversations():
         if state.get("crm_notice"):
             known_users[chat_id] = {"phone": chat_id.split("@")[0], "_from_crm_notify": True}
     _load_followup_blocked()
+    # Persist closures from older histories on upgrade, even if they were not
+    # among the last eight messages or follow-up happened to be disabled.
+    for chat_id, state in load_snapshots(CONVERSATION_STATE_FILE):
+        if state.get("followup_blocked") or _policy_closes_history(chat_id):
+            _block_followup(chat_id, "restored_closed_dialog")
 
 
 def _stop_contact(chat_id):
     contact_opt_out.add(chat_id)
+    pending_answers.pop(chat_id, None)
     incoming_versions[chat_id] += 1
     pending = message_buffers.pop(chat_id, None)
     if pending and pending.get("timer"):
@@ -802,7 +856,7 @@ last_activity: Dict[str, float] = {}
 
 # Анти-зацикливание на вопросе об имени ребёнка: детектим, что бот УЖЕ спрашивал имя,
 # и жёстко запрещаем переспрашивать (модель одним промптом это правило игнорирует).
-_NAME_ASK_RE = re.compile(r"как\s+зовут|зовут\s+ваш|имя\s+ваш|имя\s+реб", re.IGNORECASE)
+_NAME_ASK_RE = re.compile(r"как\s+зовут|зовут\s+ваш|имя\s+ваш|имя\s+реб|аты\s+кім|аты\s+қандай", re.IGNORECASE)
 _NAME_GUARD_DIRECTIVE = (
     "СИСТЕМНОЕ: Имя ребёнка/клиента уже запрашивалось в этом диалоге. "
     "НЕ спрашивай имя снова ни при каких условиях. Если в последнем сообщении клиент "
@@ -2347,6 +2401,8 @@ _HANDOFF_MARKERS = (
     "передал управляющ",
     "өтінішті рәсімдедім",
     "өтінішті рәсімдеді",
+    "өтінішіңізді рәсімдедім",
+    "филиал басшысы жақын арада сізбен хабарласады",
     "басқарушымен байланысады",
 )
 
@@ -2490,7 +2546,7 @@ def _repair_dangling_tool_calls(chat_id: str) -> None:
             i += 1
 
 
-def _trim_dialog_history(chat_id: str, keep: int = 60) -> None:
+def _trim_dialog_history(chat_id: str, keep: int = 30) -> None:
     """Keep complete recent turns and system context, including paired tools."""
     _repair_dangling_tool_calls(chat_id)
     history = chat_history[chat_id]
@@ -2698,6 +2754,7 @@ async def _ensure_manager_callback(chat_id: str, reason: str = "") -> bool:
         return False
 
     session_manager_notified[chat_id] = time.time()
+    _record_event("callback", chat_id)
     if filial_id is not None:
         _remember_session_branch(chat_id, filial_id=filial_id, client_name=client_name)
     logger.info(
@@ -2714,6 +2771,10 @@ def _update_followup_tracking(chat_id: str, user_text: str) -> None:
     кто явно отказался, снимаем — им реактивация не нужна. Запись = логическое
     завершение обрабатывается отдельно в _mark_handoff_completed.
     """
+    reason = closure_reason(_bare_client_text(user_text), facts=conversation_facts.get(chat_id))
+    if reason:
+        _block_followup(chat_id, reason)
+        return
     if not FOLLOWUP_ENABLED:
         return
     if _chat_looks_followup_closed(chat_id):
@@ -2985,6 +3046,12 @@ async def send_whatsapp(chat_id, text, *, sanitize_fallback: str = "handoff", sa
             _wa_trip_flood_pause("body without idMessage")
         return False
     _wa_mark_sent_ok()
+    kind = "service"
+    if context and context[0] == chat_id:
+        kind = "followup" if context[2] == "followup" else "reply"
+    if chat_id == phone_to_chat_id(DAILY_REPORT_PHONE):
+        kind = "report"
+    _record_event(kind, chat_id, "outgoing:" + str(body["idMessage"]))
     return True
 
 # --- 6. ЛОГИКА ДИАЛОГА ---
@@ -3111,7 +3178,7 @@ async def process_dialog(chat_id):
         logger.exception("Ошибка обработки диалога %s", chat_id)
         _repair_dangling_tool_calls(chat_id)
         if _outbound_allowed(chat_id):
-            await send_whatsapp(chat_id, _DIALOG_ERROR_FALLBACK)
+            await _deliver_dialog_answer(chat_id, _dialog_error_text(chat_id))
     finally:
         try:
             _save_conversation(chat_id)
@@ -3249,6 +3316,29 @@ async def _process_dialog(chat_id):
         # План авто-реактивации: клиент написал — (пере)ставим таймер напоминаний.
         _update_followup_tracking(chat_id, user_text)
 
+        if EMPLOYMENT.search(bare_user):
+            await _deliver_dialog_answer(chat_id, employment_reply(facts.get("language")))
+            return
+        price_answer = deferred_price_reply(facts, bare_user)
+        if price_answer:
+            await _deliver_dialog_answer(chat_id, price_answer)
+            return
+
+        # A known age restriction and requests for other clubs do not need a
+        # paid model call and must never create a lead or start a sales loop.
+        age_reason = closure_reason(facts=facts)
+        if age_reason == "under_age" and re.search(
+                r'\d|почти|попробуем|попробовать|байқап|көрейік', bare_user, re.I):
+            answer = ("Біз балаларды 5 жастан бастап қабылдаймыз. Балаңыз 5 жасқа толғанда хабарласа аласыз."
+                      if facts.get("language") == "kk" else
+                      "Мы принимаем детей с 5 лет. Будем рады вашему обращению, когда ребёнку исполнится 5.")
+            await _deliver_dialog_answer(chat_id, answer)
+            return
+        if EXTERNAL_REQUEST.search(bare_user):
+            _block_followup(chat_id, "unsupported_service")
+            await _deliver_dialog_answer(chat_id, external_reply(facts.get("language")))
+            return
+
         # Детерминированная защита от зацикливания на имени: если бот уже спрашивал имя,
         # вставляем жёсткую директиву — переспрашивать нельзя, надо оформлять заявку.
         _already_asked_name = any(
@@ -3278,15 +3368,17 @@ async def _process_dialog(chat_id):
             if not _outbound_allowed(chat_id):
                 return
             _trim_dialog_history(chat_id)
-            response = await openai_client.chat.completions.create(
-                model=OPENAI_MODEL,
+            response = await _chat_completion(chat_id, "dialog",
                 messages=chat_history[chat_id] + [{"role": "system", "content":
                     "Известные факты из сообщений клиента: " + json.dumps(facts, ensure_ascii=False) +
-                    ". Не спрашивай эти сведения повторно. Продолжай с первого недостающего факта. "
-                    "Разряд подтверждает опыт, выбранный филиал подтверждает формат."}],
+                    ". Не спрашивай эти сведения повторно. Ответь на вопросы, которые клиент действительно задал. "
+                    "Не упоминай визит сегодня, если об этом не спрашивали. Никогда не подтверждай время визита самостоятельно. "
+                    "После отказа или «посоветуюсь» не задавай вопросов. "
+                    "Язык ответа: " + ("казахский" if facts.get("language") == "kk" else "русский") +
+                    ". Имена сохраняй точно. Разряд подтверждает опыт, выбранный филиал — формат."}],
                 tools=tools,
                 tool_choice="auto",
-                temperature=0.5
+                temperature=0.2
             )
             if not _outbound_allowed(chat_id):
                 return
@@ -3334,6 +3426,14 @@ async def _process_dialog(chat_id):
                         continue
 
                     if tool.function.name == "register_client_request":
+                        if DEFER.search(bare_user) or closure_reason(facts=facts) == "under_age":
+                            result_text = (
+                                "СИСТЕМНОЕ: Заявку не создавать: клиент отложил решение или младше 5 лет. "
+                                "Ответь на вопросы клиента о ценах/условиях без оформления и без новых вопросов."
+                            )
+                            chat_history[chat_id].append({"role": "tool", "tool_call_id": tool.id,
+                                                        "name": tool.function.name, "content": result_text})
+                            continue
                         phone_to_save = args.get("client_phone")
                         if not phone_to_save or "не указа" in phone_to_save.lower():
                             phone_to_save = chat_id.split("@")[0]
@@ -3354,6 +3454,8 @@ async def _process_dialog(chat_id):
                                 preference=preference,
                             )
                             lead_registered_this_turn |= "ЗАЯВКА ОФОРМЛЕНА В CRM" in result_text
+                            if "ЗАЯВКА ОФОРМЛЕНА В CRM" in result_text:
+                                _record_event("lead", chat_id)
                         except Exception as e:
                             logger.error(f"create_lead неожиданно упал: {e}")
                             dossier = client_dossiers.get(chat_id) or {}
@@ -3402,6 +3504,8 @@ async def _process_dialog(chat_id):
                                     matched_key=dossier.get("matched_key") or _matched_key_from_text(user_text),
                                 )
                                 callback_sent_this_turn |= "MGR_PHONE=" in result_text
+                                if "MGR_PHONE=" in result_text:
+                                    _record_event("callback", chat_id)
                             # Помечаем только если реально ушло (есть MGR_PHONE).
                             if "MGR_PHONE=" in result_text:
                                 session_manager_notified[chat_id] = time.time()
@@ -3432,19 +3536,42 @@ async def _process_dialog(chat_id):
 
                 if lead_registered_this_turn or callback_sent_this_turn:
                     _mark_handoff_completed(chat_id)
-                final = await openai_client.chat.completions.create(
-                    model=OPENAI_MODEL, messages=chat_history[chat_id]
-                )
-                bot_answer = final.choices[0].message.content
+                bot_answer = None
+                visit_now = bool(VISIT_NOW.search(bare_user))
+                if lead_registered_this_turn and (
+                    not has_question(bare_user) or (visit_now and not PRICE_QUESTION.search(bare_user))
+                ):
+                    for result in tool_results.values():
+                        bot_answer = confirmed_handoff(result, facts.get("language"), visit_now)
+                        if bot_answer:
+                            break
+                if bot_answer is None:
+                    final = await _chat_completion(chat_id, "tool_result",
+                        messages=chat_history[chat_id] + [{"role": "system", "content":
+                            "Ответь только на вопросы, которые клиент действительно задал. "
+                            "Не упоминай визит сегодня, если о нём не спрашивали; никогда не подтверждай время визита самостоятельно. "
+                            "При успешной заявке подтверди её и укажи имя/контакт управляющего из результата функции. Язык: " +
+                            ("казахский" if facts.get("language") == "kk" else "русский") +
+                            ". На казахском используй «өтінішіңізді рәсімдедім» только при успешной регистрации."}],
+                        temperature=0.2,
+                    )
+                    bot_answer = final.choices[0].message.content
             else:
                 bot_answer = msg.content
 
             if not _outbound_allowed(chat_id):
                 return
+            if facts.get("language") == "kk" and bot_answer:
+                bot_answer = polish_kazakh(bot_answer)
+            if EXTERNAL_OUTPUT.search(bot_answer or ""):
+                bot_answer = external_reply(facts.get("language"))
+                _block_followup(chat_id, "external_recommendation_blocked")
             original_answer = sanitize_bot_outgoing(bot_answer)
             sanitized_answer = remove_answered_questions(original_answer, facts)
-            if sanitized_answer != original_answer and not has_question(sanitized_answer):
-                kazakh = bool(_KAZAKH_CHAR_RE.search(bare_user))
+            if (sanitized_answer != original_answer and not has_question(sanitized_answer)
+                    and not _chat_looks_followup_closed(chat_id)
+                    and not closure_reason(bare_user, original_answer, facts)):
+                kazakh = facts.get("language") == "kk"
                 next_question = ""
                 for key, ru, kk in (
                     ("audience", "Занятия для ребёнка или для вас?", "Сабақ балаңыз үшін бе, әлде өзіңіз үшін бе?"),
@@ -3481,7 +3608,7 @@ async def _process_dialog(chat_id):
             if callback_attempted_this_turn and not callback_sent_this_turn and _bot_promises_manager(sanitized_answer):
                 sanitized_answer = (
                     "Сұрауды жіберу әлі расталмады. Қай филиалда оқитыныңызды нақтылай аласыз ба?"
-                    if _KAZAKH_CHAR_RE.search(bare_user) else
+                    if facts.get("language") == "kk" else
                     "Пока не удалось подтвердить передачу запроса. Уточните, пожалуйста, ваш филиал."
                 )
 
@@ -3493,14 +3620,16 @@ async def _process_dialog(chat_id):
             ):
                 sanitized_answer = (
                     "Өтініштің рәсімделгені әлі расталмады. Қай филиалға жазылғыңыз келеді?"
-                    if _KAZAKH_CHAR_RE.search(bare_user) else
+                    if facts.get("language") == "kk" else
                     "Оформление заявки пока не подтверждено. Уточните, пожалуйста, в какой филиал хотите записаться?"
                 )
 
             if lead_registered_this_turn or callback_sent_this_turn:
                 _mark_handoff_completed(chat_id)
-            if _outbound_allowed(chat_id) and await send_whatsapp(chat_id, sanitized_answer):
-                chat_history[chat_id].append({"role": "assistant", "content": sanitized_answer})
+            reason = closure_reason(bare_user, sanitized_answer, facts)
+            if reason:
+                _block_followup(chat_id, reason)
+            await _deliver_dialog_answer(chat_id, sanitized_answer)
 
         except Exception as e:
             logger.error(f"Ошибка AI: {e}")
@@ -3509,9 +3638,105 @@ async def _process_dialog(chat_id):
             _repair_dangling_tool_calls(chat_id)
             try:
                 if _outbound_allowed(chat_id):
-                    await send_whatsapp(chat_id, _DIALOG_ERROR_FALLBACK)
+                    await _deliver_dialog_answer(chat_id, _dialog_error_text(chat_id))
             except Exception as send_err:
                 logger.error(f"Не удалось отправить fallback: {send_err}")
+
+def _dialog_error_text(chat_id):
+    if conversation_facts.get(chat_id, {}).get("language") == "kk":
+        return "Кешіріңіз, сұрағыңызды қайта жаза аласыз ба?"
+    return _DIALOG_ERROR_FALLBACK
+
+
+async def _deliver_dialog_answer(chat_id, text):
+    """Persist the completed answer before attempting delivery; no new AI calls on retry."""
+    if not text or not _outbound_allowed(chat_id):
+        return False
+    entry = {"text": text, "created": time.time(), "retry_at": time.time(), "attempts": 0}
+    pending_answers[chat_id] = entry
+    _save_conversation(chat_id)
+    return await _attempt_pending_answer(chat_id, entry)
+
+
+async def _attempt_pending_answer(chat_id, entry):
+    if not _outbound_allowed(chat_id):
+        return False
+    try:
+        sent = await send_whatsapp(chat_id, entry["text"])
+    except Exception:
+        logger.exception("reply: delivery failed")
+        sent = False
+    if pending_answers.get(chat_id) is not entry:
+        return sent
+    if sent:
+        chat_history.setdefault(chat_id, []).append({"role": "assistant", "content": entry["text"]})
+        pending_answers.pop(chat_id, None)
+    elif not _outbound_allowed(chat_id):
+        pending_answers.pop(chat_id, None)
+    else:
+        entry["attempts"] += 1
+        entry["retry_at"] = time.time() + min(3600, 60 * 2 ** min(entry["attempts"], 6))
+        _record_event("reply_failed", chat_id)
+    _save_conversation(chat_id)
+    return sent
+
+
+async def _retry_pending_answers():
+    for chat_id, entry in list(pending_answers.items())[:20]:
+        if chat_id in contact_opt_out or _is_internal_chat(chat_id) or time.time() - entry["created"] > 86400:
+            pending_answers.pop(chat_id, None)
+            _record_event("reply_expired", chat_id)
+            _save_conversation(chat_id)
+            continue
+        if entry["retry_at"] > time.time() or chat_id in message_buffers or incoming_pending[chat_id]:
+            continue
+        async with _dialog_lock(chat_id):
+            if pending_answers.get(chat_id) is not entry or chat_id in message_buffers:
+                continue
+            token = _outbound_context.set((chat_id, incoming_versions[chat_id], "dialog"))
+            try:
+                await _attempt_pending_answer(chat_id, entry)
+            finally:
+                _outbound_context.reset(token)
+
+
+async def _daily_report_tick(now=None):
+    if not DAILY_REPORT_ENABLED:
+        return
+    ledger = _ledger()
+    for day in ledger.due_days(now or datetime.now(_SCHOOL_TZ), DAILY_REPORT_HOUR):
+        text = ledger.report_text(day)
+        if not ledger.claim_report(day):
+            continue
+        sent = False
+        try:
+            sent = await send_whatsapp(phone_to_chat_id(DAILY_REPORT_PHONE), text, sanitize=False)
+        finally:
+            ledger.finish_report(day, sent)
+
+
+async def _maintenance_loop(kind):
+    while True:
+        try:
+            if kind == "reports":
+                await _daily_report_tick()
+            else:
+                await _retry_pending_answers()
+        except Exception:
+            logger.exception("maintenance: %s", kind)
+        await asyncio.sleep(60)
+
+
+@app.on_event("startup")
+async def _start_reporting_and_retries():
+    # Validate persistent accounting before accepting any paid requests.
+    _ledger().started_at()
+    if DAILY_REPORT_ENABLED:
+        if not phone_to_chat_id(DAILY_REPORT_PHONE):
+            raise ValueError("Invalid DAILY_REPORT_PHONE")
+        _spawn_task(_maintenance_loop("reports"))
+    _spawn_task(_maintenance_loop("replies"))
+
 
 # --- 7. ВЕБХУК ---
 @app.post("/webhook")
@@ -3553,6 +3778,9 @@ def _queue_incoming(sender, msg_data, id_message, timestamp):
             logger.info(f"Повтор webhook idMessage={id_message} для {sender}, пропуск")
             return
         dq.append(id_message)
+
+    _record_event("incoming", sender, "incoming:" + sender + ":" + str(id_message) if id_message else None)
+    pending_answers.pop(sender, None)
 
     if timestamp is not None:
         latest_incoming_timestamps[sender] = max(timestamp, latest_incoming_timestamps.get(sender, 0))
@@ -3602,9 +3830,14 @@ async def _buffer_incoming(sender, msg_data):
 
             audio_file = io.BytesIO(audio_bytes)
             audio_file.name = "voice.ogg"
-            transcription = await openai_client.audio.transcriptions.create(
-                model="whisper-1", file=audio_file
-            )
+            try:
+                transcription = await openai_client.audio.transcriptions.create(
+                    model="whisper-1", file=audio_file, response_format="verbose_json"
+                )
+            except BaseException:
+                _record_usage(None, sender, "voice", model="whisper-1", status="error")
+                raise
+            _record_usage(transcription, sender, "voice", model="whisper-1")
             text = f"[Голосовое]: {transcription.text}"
             logger.info(f"ГС распознано: {text}")
         except Exception as e:
@@ -3639,6 +3872,7 @@ async def _buffer_incoming(sender, msg_data):
     if sender in contact_opt_out:
         return "ok"
     incoming_versions[sender] += 1
+    pending_answers.pop(sender, None)
     logger.info(f"Входящее ({sender}): {text}")
 
     if sender in message_buffers:
@@ -4767,6 +5001,8 @@ def _chat_looks_followup_closed(chat_id: str) -> bool:
         or chat_id in crm_notify_recent
     ):
         return True
+    if _policy_closes_history(chat_id):
+        return True
     history = chat_history.get(chat_id) or []
     for msg in history[-8:]:
         content = _history_message_content(msg)
@@ -4783,18 +5019,33 @@ def _chat_looks_followup_closed(chat_id: str) -> bool:
     return False
 
 
+def _policy_closes_history(chat_id):
+    if closure_reason(facts=conversation_facts.get(chat_id)):
+        return True
+    for message in chat_history.get(chat_id, []):
+        role = message.get("role") if isinstance(message, dict) else getattr(message, "role", None)
+        text = _history_message_content(message)
+        if role == "assistant" and closure_reason(answer=text):
+            return True
+        if role == "user" and closure_reason(user_text=_bare_client_text(text)):
+            return True
+    return False
+
+
 async def _send_followup_message(chat_id: str) -> bool:
     async with _dialog_lock(chat_id):
-        if _chat_looks_followup_closed(chat_id) or chat_id in message_buffers:
+        if _chat_looks_followup_closed(chat_id) or chat_id in message_buffers or chat_id in pending_answers:
             return False
         token = _outbound_context.set((chat_id, incoming_versions[chat_id], "followup"))
         try:
-            ok = await send_whatsapp(chat_id, FOLLOWUP_MESSAGE, sanitize=False)
+            reminder = ("Шахмат сабақтары туралы сұрақтарыңыз қалды ма?"
+                        if conversation_facts.get(chat_id, {}).get("language") == "kk" else FOLLOWUP_MESSAGE)
+            ok = await send_whatsapp(chat_id, reminder, sanitize=False)
             if ok:
                 followup_sent.add(chat_id)
                 _block_followup(chat_id, "one_reminder_sent")
                 if chat_id in chat_history:
-                    chat_history[chat_id].append({"role": "assistant", "content": FOLLOWUP_MESSAGE})
+                    chat_history[chat_id].append({"role": "assistant", "content": reminder})
                 _save_conversation(chat_id)
             return ok
         finally:

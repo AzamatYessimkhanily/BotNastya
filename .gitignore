@@ -19,3 +19,5 @@ bot.py.bak*
 .deployed-revision
 
 conversation_state.sqlite3*
+usage_state.sqlite3*
+evaluation_usage.sqlite3*
