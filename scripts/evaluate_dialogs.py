@@ -24,6 +24,14 @@ async def evaluate(args):
     from usage_reporting import UsageLedger
     ledger = UsageLedger(args.usage_file)
     cases = [
+        ('self_unknown', {}, 'Для кого рассматриваете обучение — для ребёнка или для себя?',
+         ['Для себя'], ['лет'], ['для взрослых', 'только индивидуальные']),
+        ('self_minor', {'audience': 'для себя'}, 'Для взрослых только индивидуальные занятия от 7 000 тг. Какой формат удобнее?',
+         ['Мне 13 есть 3тий разряд'], ['35 000', 'групп'], ['для взрослых', 'только индивидуальные', 'вашего ребёнка']),
+        ('self_minor_kk', {'audience': 'для себя', 'language': 'kk'}, 'Қай филиал ыңғайлы?',
+         ['Мен 13 жастамын, 3 разряд. Бағасы қанша?'], ['35 000', 'топ'], ['ересектер', 'тек жеке']),
+        ('self_adult', {}, 'Сколько лет ученику?',
+         ['Для себя, мне 18, 3 разряд. Сколько стоят занятия?'], ['7 000'], ['35 000']),
         ('kk_name', {'language': 'kk', 'audience': 'ребёнок', 'age': '9', 'experience': 'орташа', 'preference': 'Камал'},
          'Балаңыздың аты кім?', ['Адай', 'Қазір баруға бола ма?'], ['рәсім', 'уақыт'], []),
         ('kk_short', {'language': 'kk', 'audience': 'ребёнок', 'age': '9', 'experience': 'орташа'},
@@ -39,6 +47,10 @@ async def evaluate(args):
         ('ru_lead', {'language': 'ru', 'age': '8', 'experience': 'начинающий', 'preference': 'Камал'},
          'Как зовут ребёнка?', ['Марат'], ['Шолпан'], []),
     ]
+    if args.case:
+        cases = [case for case in cases if case[0] in args.case]
+        if len(cases) != len(set(args.case)):
+            raise ValueError('Unknown evaluation case')
     results = []
     real_http_send = bot.httpx.AsyncClient.send
 
@@ -92,4 +104,5 @@ if __name__ == '__main__':
     parser.add_argument('--env-file', required=True)
     parser.add_argument('--model', default='gpt-4.1-mini')
     parser.add_argument('--usage-file', default='evaluation_usage.sqlite3')
+    parser.add_argument('--case', action='append', help='Run only the named case; repeat for several cases')
     asyncio.run(evaluate(parser.parse_args()))

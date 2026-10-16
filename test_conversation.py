@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 import test_reliability as reliability
 from test_reliability import bot, completion, tool
 from conversation_memory import STOP_CONTACT, update_facts, remove_answered_questions
+from dialog_policy import chess_rank, guard_student_options, deferred_price_reply
 
 SEND = bot.send_whatsapp
 HYDRATE = bot._hydrate_chat_history
@@ -26,6 +27,32 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
             'timestamp': timestamp or int(time.time()), 'senderData': {'chatId': self.chat},
             'messageData': {'typeMessage': 'textMessage', 'textMessageData': {'textMessage': text}},
         }))
+
+    async def test_green_api_host_override_applies_to_send_and_both_history_requests(self):
+        base = 'https://instance.api.greenapi.com'
+        urls = []
+        async def respond(url, **kwargs):
+            urls.append(url)
+            body = {'idMessage': 'host-check'} if '/sendMessage/' in url else []
+            return httpx.Response(200, json=body, request=httpx.Request('POST', url))
+        with patch.object(bot, 'GREEN_API_URL', base), \
+             patch.object(bot, '_wa_acquire_send_slot', AsyncMock(return_value=True)), \
+             patch('httpx.AsyncClient.post', AsyncMock(side_effect=respond)):
+            await HYDRATE(self.chat)
+            bot.latest_incoming_timestamps[self.chat] = int(time.time())
+            await bot._refresh_pending_incoming(self.chat)
+            self.assertTrue(await SEND(self.chat, 'Ответ клиенту', sanitize=False))
+        prefix = base + '/waInstance' + bot.GREEN_API_ID
+        self.assertEqual(urls, [prefix + '/' + method + '/' + bot.GREEN_API_TOKEN
+                               for method in ('getChatHistory', 'getChatHistory', 'sendMessage')])
+
+    async def test_send_timeout_logs_exception_type_without_credentials(self):
+        with patch.object(bot, '_wa_acquire_send_slot', AsyncMock(return_value=True)), \
+             patch('httpx.AsyncClient.post', AsyncMock(side_effect=httpx.ConnectTimeout('secret-token'))), \
+             self.assertLogs(bot.logger, level='ERROR') as logs:
+            self.assertFalse(await SEND(self.chat, 'Ответ клиенту', sanitize=False))
+        self.assertIn('ConnectTimeout', '\n'.join(logs.output))
+        self.assertNotIn('secret-token', '\n'.join(logs.output))
 
     async def test_stop_is_silent_and_survives_restart(self):
         bot.followups[self.chat] = {'stage': 0}
@@ -174,6 +201,123 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         prompt = str(self.ai.call_args.kwargs['messages'])
         self.assertIn('есть опыт', prompt)
         self.assertIn('Аркада', prompt)
+
+    async def test_self_is_not_adult_and_screenshot_minor_gets_group(self):
+        # Deliberately reproduce both incorrect model replies from the screenshot.
+        self.ai.side_effect = [
+            completion('Для взрослых только индивидуальные занятия от 7 000 тг за урок.'),
+            completion('С 3 разрядом доступны индивидуальные занятия в GMCA Аркада или Камал. Уроки от 7 000 тг за час.'),
+        ]
+        self.queue('Для себя')
+        await bot.process_dialog(self.chat)
+        self.assertIn('Сколько лет', self.send.call_args.args[1])
+        self.assertNotIn('взросл', self.send.call_args.args[1])
+        self.assertNotIn('age', bot.conversation_facts[self.chat])
+        self.queue('Мне 13 есть 3тий разряд')
+        await bot.process_dialog(self.chat)
+        facts = bot.conversation_facts[self.chat]
+        self.assertEqual(facts['age'], '13')
+        self.assertEqual(chess_rank(facts['experience']), 3)
+        answer = self.send.call_args.args[1]
+        for expected in ('групповые', '35 000', '1,5', '7 000', 'Аркада', 'Камал'):
+            self.assertIn(expected, answer)
+        self.assertNotIn('взросл', answer)
+        self.assertNotIn('вашего ребёнка', answer)
+        self.assertIn('Категория ученика: ребёнок', str(self.ai.call_args.kwargs['messages']))
+
+    async def test_minor_age_and_rank_recovered_after_upgrade(self):
+        bot.chat_history[self.chat] = [
+            {'role': 'user', 'content': 'Для себя'},
+            {'role': 'assistant', 'content': 'Для взрослых только индивидуальные.'},
+            {'role': 'user', 'content': 'Мне 13 есть 3тий разряд'},
+            {'role': 'assistant', 'content': 'Какой филиал удобнее?'},
+        ]
+        bot.conversation_facts[self.chat] = {'audience': 'для себя', 'experience': 'Мне 13 есть 3тий разряд — есть опыт'}
+        bot._save_conversation(self.chat)
+        bot.chat_history.clear()
+        bot.conversation_facts.clear()
+        await bot._load_conversations()
+        self.assertEqual(bot.conversation_facts[self.chat]['age'], '13')
+        self.ai.side_effect = [completion('Индивидуальные занятия в Камал стоят от 7 000 тг.')]
+        self.queue('Камал')
+        await bot.process_dialog(self.chat)
+        self.assertIn('35 000', self.send.call_args.args[1])
+        self.assertIn('групповые', self.send.call_args.args[1])
+
+    async def test_kazakh_self_minor_gets_group(self):
+        self.ai.side_effect = [completion('Ересектер үшін тек жеке сабақтар бар.'),
+                               completion('Жеке сабақ бір сағат үшін 7 000 теңгеден басталады.')]
+        for text in ('Өзім үшін', 'Мен 13 жастамын, 3 разряд'):
+            self.queue(text)
+            await bot.process_dialog(self.chat)
+        answer = self.send.call_args.args[1]
+        self.assertEqual(bot.conversation_facts[self.chat]['age'], '13')
+        for expected in ('топтық', '35 000', '1,5', '7 000'):
+            self.assertIn(expected, answer)
+        self.assertNotIn('Ересектер', answer)
+
+    async def test_child_explicit_individual_choice_survives_next_turn(self):
+        bot.conversation_facts[self.chat] = {'audience': 'для себя', 'age': '13', 'experience': '3 разряд'}
+        self.ai.side_effect = [completion('Какой филиал вам удобен?'),
+                               completion('Для взрослых индивидуальные занятия в Камал — от 7 000 тг за час.')]
+        for text in ('Хочу индивидуальные', 'Камал'):
+            self.queue(text)
+            await bot.process_dialog(self.chat)
+        self.assertEqual(bot.conversation_facts[self.chat]['lesson_format'], 'индивидуально')
+        self.assertNotIn('групп', self.send.call_args.args[1])
+        self.assertIn('7 000', self.send.call_args.args[1])
+        self.assertNotIn('взросл', self.send.call_args.args[1])
+
+    async def test_adult_18_keeps_individual_format(self):
+        self.ai.side_effect = [completion('Для взрослых только индивидуальные занятия от 7 000 тг за час.')]
+        self.queue('Для себя, мне 18, 3 разряд')
+        await bot.process_dialog(self.chat)
+        self.assertIn('7 000', self.send.call_args.args[1])
+        self.assertNotIn('35 000', self.send.call_args.args[1])
+        self.assertIn('Категория ученика: взрослый', str(self.ai.call_args.kwargs['messages']))
+
+    def test_age_without_units_and_rank_spellings(self):
+        for text in ('Мне 13', 'Мне 13.', 'Мне 13 лет', 'мне 13 есть 3тий разряд',
+                     'Ребёнку 13', 'Сыну 13 лет', 'Дочери 13', 'Мен 13 жастамын',
+                     'Менің жасым 13', 'Мен 13-темін'):
+            with self.subTest(text=text):
+                self.assertEqual(update_facts({}, text).get('age'), '13')
+        for text in ('3тий разряд', '3-й разряд', '3й разряд', '3 разряд', 'III разряд', '3-го разряда'):
+            with self.subTest(text=text):
+                self.assertEqual(chess_rank(update_facts({}, text)['experience']), 3)
+        for text in ('Мне 13:00 удобно', 'Мне 3-й разряд', 'Мне 13 месяцев',
+                     'Играю 3 года', 'Занимаюсь шахматами 13 лет', 'Мне 13000 дорого',
+                     '13', '13-14 лет', 'Мне 13-14 удобно'):
+            with self.subTest(text=text):
+                self.assertNotIn('age', update_facts({}, text))
+
+    def test_parent_age_does_not_replace_pupil_age(self):
+        for text in ('Мне 35 лет, ребёнку 13 лет', 'Ребёнку 13 лет, мне 35 лет'):
+            with self.subTest(text=text):
+                facts = update_facts({}, text)
+                self.assertEqual(facts['age'], '13')
+                update_facts(facts, 'Мне 35 лет')
+                self.assertEqual(facts['age'], '13')
+                update_facts(facts, 'Теперь для себя')
+                self.assertNotIn('age', facts)
+                update_facts(facts, 'Мне 35')
+                self.assertEqual(facts['age'], '35')
+        facts = update_facts({}, 'Балам 13 жаста')
+        update_facts(facts, 'Ақылдасып, өзім хабарласамын')
+        self.assertEqual(facts['age'], '13')
+        self.assertEqual(facts['audience'], 'ребёнок')
+
+    def test_group_tariffs_and_no_beginner_price_for_unknown_rank(self):
+        for rank, price in ((1, '40 000'), (2, '40 000'), (3, '35 000'), (4, '30 000')):
+            facts = {'age': '13', 'experience': f'{rank} разряд'}
+            self.assertIn(price, guard_student_options('Доступны только индивидуальные занятия.', facts, 'Мне 13'))
+        answer = guard_student_options('Доступны индивидуальные занятия от 7 000 тг.', {'age': '13'}, 'Мне 13')
+        self.assertIn('групповые', answer)
+        self.assertNotIn('30 000', answer)
+        facts = {'audience': 'для себя', 'age': '18', 'preference': 'Камал', 'experience': '3 разряд'}
+        answer = deferred_price_reply(facts, 'Сколько стоят занятия? Я подумаю')
+        self.assertIn('7 000', answer)
+        self.assertNotIn('35 000', answer)
 
     async def test_history_and_facts_survive_timeout_and_restart(self):
         bot.chat_history[self.chat] = [{'role': 'system', 'content': bot.SYSTEM_PROMPT},

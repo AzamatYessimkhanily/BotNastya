@@ -19,7 +19,8 @@ from dotenv import load_dotenv
 from runtime_state import write_json_atomic
 from dialog_policy import (LANGUAGE_POLICY, closure_reason, DEFER, EMPLOYMENT, EXTERNAL_REQUEST,
                            EXTERNAL_OUTPUT, VISIT_NOW, PRICE_QUESTION, external_reply, employment_reply,
-                           deferred_price_reply, confirmed_handoff, polish_kazakh)
+                           deferred_price_reply, confirmed_handoff, polish_kazakh,
+                           qualification_directive, guard_student_options)
 from usage_reporting import UsageLedger
 
 # --- 1. НАСТРОЙКИ ---
@@ -34,6 +35,9 @@ logger = logging.getLogger(__name__)
 
 GREEN_API_ID = os.getenv("GREEN_API_ID")
 GREEN_API_TOKEN = os.getenv("GREEN_API_TOKEN")
+# Prefer the instance apiUrl from the Green API console when explicitly set.
+# The legacy api.green-api.com host can time out while this official host works.
+GREEN_API_URL = (os.getenv("GREEN_API_URL", "").strip() or "https://api.greenapi.com").rstrip("/")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # Explicit .env overrides the economical default. All calls are metered.
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
@@ -154,7 +158,7 @@ SESSION_TIMEOUT = 5 * 60 * 60
 # --- Авто-реактивация «спящих» лидов ---
 # Если диалог с потенциальным клиентом не дошёл до логического завершения
 # (не записался и не отказался) и клиент замолчал — бот сам напоминает о себе:
-# Одно напоминание через FOLLOWUP_SILENCE_SECONDS молчания (по умолчанию 2 часа).
+# Одно напоминание через FOLLOWUP_SILENCE_SECONDS после доставки ответа (по умолчанию 2 часа).
 # Если пропустили окно — на следующий день после FOLLOWUP_NEXT_DAY_HOUR.
 # Отправку помним постоянно. Действующим ученикам и закрытым чатам не пишем.
 FOLLOWUP_ENABLED = os.getenv("FOLLOWUP_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
@@ -310,6 +314,9 @@ _SYSTEM_PROMPT_TEMPLATE = """
 - Перед каждым ответом прочитай историю: свои вопросы, сообщения клиента и известные факты.
 - Короткое сообщение часто отвечает на предыдущий вопрос. «Аркада» — выбранный филиал; «4 разряд» — опытный шахматист. Не переспрашивай известное.
 - Несколько сообщений клиента подряд — один ответ. Учитывай все детали, спрашивай только недостающие.
+- «Для себя» / «өзім үшін» означает, что пишет сам ученик, а НЕ что он взрослый. Если возраст неизвестен, сначала спроси, сколько лет ученику. «Мне 13» — это возраст, даже без слова «лет».
+- Возраст определяет категорию: младше 18 лет — ребёнок/подросток; с 18 лет — взрослый. После уточнения возраста сразу пересмотри прежний сценарий, даже если уже ошибочно предложил взрослые занятия.
+- Детям с 5 лет предлагай групповые занятия по уровню и индивидуальные как дополнительный вариант. Не ограничивай ребёнка индивидуальными без его явного выбора. Если ребёнок пишет сам, обращайся к нему, а не к родителю.
 - «Окей», «хорошо», «спасибо» после завершения вопроса не начинают новый опрос. Не продолжай продажи на автоответы организаций.
 - Не давить. Уровень напора — 5/10. Мягко направляй к следующему шагу.
 - После двух безрезультатных попыток продвинуть диалог (клиент не отвечает или игнорирует вопрос) — напиши: "Если будут вопросы — пишите в любое время, всегда рада помочь 😊" и больше не настаивай. Это правило НЕ применяется, если клиент ещё не выбрал филиал или не дал имя ребёнка — в этом случае одну попытку сделай.
@@ -357,10 +364,10 @@ _SYSTEM_PROMPT_TEMPLATE = """
 → Предложи бесплатный пробный урок.
 → Если 13+ лет без опыта — мягко предупреди, что первое время будет в группе с младшими, но обычно за 2–3 месяца догоняет; постараемся перевести быстрее.
 
-ТИП 2 — Родитель, ребёнок с низким/средним уровнем (4 разряд и ниже)
+ТИП 2 — Ребёнок с низким/средним уровнем (пишет родитель или сам ученик)
 → 5 разряд = выдуманный, считай как новичок.
 → 4 разряд, нет разряда → GMCA или онлайн; школьный — только если ученик этой школы.
-→ 3 разряд → GMCA Аркада или Камал.
+→ 3 разряд → групповые GMCA Аркада или Камал: 35 000 тг/мес, 3 раза в неделю по 1,5 часа. Индивидуальные — дополнительный вариант от 7 000 тг/час.
 → Пробный урок: только при опыте менее 6 месяцев или без разряда.
 
 ТИП 3 — Родитель, ребёнок с высоким уровнем (2 разряд и выше)
@@ -370,7 +377,7 @@ _SYSTEM_PROMPT_TEMPLATE = """
 → Пробный урок НЕ предлагать.
 → Если ни один адрес не подходит → онлайн.
 
-ТИП 4 — Взрослый ученик (сам хочет учиться)
+ТИП 4 — Взрослый ученик (подтверждён возраст от 18 лет)
 → Только индивидуальные занятия (очно или онлайн), от 7 000 тг/урок.
 → Пробного урока нет.
 → Направляй только в GMCA (Аркада, Камал или онлайн). Школьные кружки — не предлагать.
@@ -440,7 +447,7 @@ _SYSTEM_PROMPT_TEMPLATE = """
 9. После успешной регистрации: передай контакт управляющего и попрощайся.
 
 ДЛЯ ВЗРОСЛЫХ:
-1. Приветствие + уточнение, что сам хочет учиться.
+1. Приветствие + возраст ученика, если ещё неизвестен. «Для себя» без возраста недостаточно для взрослого сценария. Если младше 18 лет — детский сценарий с группами по уровню.
 2. Имя.
 3. Сообщи: только индивидуально, от 7 000 тг/урок (очно или онлайн).
 4. Ссылка на карту или уточни онлайн → "Какой формат удобнее — GMCA Аркада, Камал или онлайн?"
@@ -778,6 +785,7 @@ def _save_conversation(chat_id):
         "crm_notice": crm_notify_recent.get(chat_id), "last_activity": last_activity.get(chat_id),
         "manager_notified": session_manager_notified.get(chat_id),
         "pending_answer": pending_answers.get(chat_id),
+        "followup": followups.get(chat_id),
         "followup_blocked": chat_id in followup_blocked,
     })
 
@@ -827,6 +835,8 @@ async def _load_conversations():
     for chat_id, state in load_snapshots(CONVERSATION_STATE_FILE):
         if state.get("followup_blocked") or _policy_closes_history(chat_id):
             _block_followup(chat_id, "restored_closed_dialog")
+        elif state.get("followup") and not _chat_looks_followup_closed(chat_id):
+            followups[chat_id] = state["followup"]
 
 
 def _stop_contact(chat_id):
@@ -869,9 +879,9 @@ _NAME_GUARD_DIRECTIVE = (
 )
 # Чат, где заявка уже передана управляющему — не повторять handoff на «хорошо/спасибо»
 handoff_completed: Dict[str, float] = {}
-# Авто-реактивация: chat_id -> {"last_client_ts": float, "stage": int}.
-# stage: 0 — ещё не напоминали, 1 — отправлен follow-up «через 2 часа»,
-#        2 — отправлен follow-up «на следующий день в 12:00» (цепочка завершена).
+# Авто-реактивация сохраняется в снимке диалога. last_reply_ts=None — ждём
+# доставки ответа; после неё отсчитываем молчание. Одно напоминание на контакт.
+# stage оставлен для совместимости с прежним планировщиком.
 followups: Dict[str, dict] = {}
 # Чаты, где в текущей сессии УЖЕ оформлена заявка (лид записан). Реактивацию им
 # больше не шлём, даже если клиент продолжил переписку (тогда handoff_completed
@@ -2808,8 +2818,10 @@ def _update_followup_tracking(chat_id: str, user_text: str) -> None:
         if re.search(r"до\s*свидан|пока\b|қош\s+болыңыз|сау\s+болыңыз", bare, re.I):
             _block_followup(chat_id, "goodbye")
         return
-    # Клиент активен: (пере)ставим таймер, цепочку напоминаний начинаем заново.
-    followups[chat_id] = {"last_client_ts": time.time(), "stage": 0}
+    # Сначала сохраняем намерение напомнить. Таймер начнётся после доставки
+    # ответа, в том числе если она состоится после рестарта/сетевого сбоя.
+    followups[chat_id] = {"last_client_ts": time.time(), "last_reply_ts": None, "stage": 0}
+    _save_conversation(chat_id)
 
 
 def sanitize_bot_outgoing(text: Optional[str], *, fallback: str = "handoff") -> str:
@@ -3018,12 +3030,13 @@ async def send_whatsapp(chat_id, text, *, sanitize_fallback: str = "handoff", sa
         if not _outbound_allowed(chat_id):
             return False
 
-    url = f"https://api.green-api.com/waInstance{GREEN_API_ID}/sendMessage/{GREEN_API_TOKEN}"
+    url = f"{GREEN_API_URL}/waInstance{GREEN_API_ID}/sendMessage/{GREEN_API_TOKEN}"
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(url, json={"chatId": chat_id, "message": text})
     except Exception as e:
-        logger.error("send_whatsapp: сетевая ошибка при отправке %s: %s", chat_id, e)
+        # Timeout messages can be empty; exception text may contain the API token.
+        logger.error("send_whatsapp: сетевая ошибка при отправке %s (%s)", chat_id, type(e).__name__)
         return False
 
     if resp.status_code != 200:
@@ -3068,7 +3081,7 @@ async def _refresh_pending_incoming(chat_id):
     if since is None or not _outbound_allowed(chat_id):
         return
     try:
-        url = f"https://api.green-api.com/waInstance{GREEN_API_ID}/getChatHistory/{GREEN_API_TOKEN}"
+        url = f"{GREEN_API_URL}/waInstance{GREEN_API_ID}/getChatHistory/{GREEN_API_TOKEN}"
         async with httpx.AsyncClient(timeout=3.0) as client:
             response = await client.post(url, json={"chatId": chat_id, "count": 20})
         response.raise_for_status()
@@ -3122,7 +3135,7 @@ async def _hydrate_chat_history(chat_id):
     if chat_id in history_hydrated or chat_id in chat_history:
         return
     try:
-        url = f"https://api.green-api.com/waInstance{GREEN_API_ID}/getChatHistory/{GREEN_API_TOKEN}"
+        url = f"{GREEN_API_URL}/waInstance{GREEN_API_ID}/getChatHistory/{GREEN_API_TOKEN}"
         async with httpx.AsyncClient(timeout=8.0) as client:
             response = await client.post(url, json={"chatId": chat_id, "count": 60})
         response.raise_for_status()
@@ -3378,7 +3391,8 @@ async def _process_dialog(chat_id):
                     "Не упоминай визит сегодня, если об этом не спрашивали. Никогда не подтверждай время визита самостоятельно. "
                     "После отказа или «посоветуюсь» не задавай вопросов. "
                     "Язык ответа: " + ("казахский" if facts.get("language") == "kk" else "русский") +
-                    ". Имена сохраняй точно. Разряд подтверждает опыт, выбранный филиал — формат."}],
+                    ". Имена сохраняй точно. Разряд подтверждает опыт, выбранный филиал — формат. " +
+                    qualification_directive(facts)}],
                 tools=tools,
                 tool_choice="auto",
                 temperature=0.2
@@ -3555,7 +3569,8 @@ async def _process_dialog(chat_id):
                             "Не упоминай визит сегодня, если о нём не спрашивали; никогда не подтверждай время визита самостоятельно. "
                             "При успешной заявке подтверди её и укажи имя/контакт управляющего из результата функции. Язык: " +
                             ("казахский" if facts.get("language") == "kk" else "русский") +
-                            ". На казахском используй «өтінішіңізді рәсімдедім» только при успешной регистрации."}],
+                            ". На казахском используй «өтінішіңізді рәсімдедім» только при успешной регистрации. " +
+                            qualification_directive(facts)}],
                         temperature=0.2,
                     )
                     bot_answer = final.choices[0].message.content
@@ -3569,6 +3584,10 @@ async def _process_dialog(chat_id):
             if EXTERNAL_OUTPUT.search(bot_answer or ""):
                 bot_answer = external_reply(facts.get("language"))
                 _block_followup(chat_id, "external_recommendation_blocked")
+            if (bot_answer and chat_id not in known_users and not lead_registered_this_turn
+                    and not callback_sent_this_turn and not DEFER.search(bare_user)
+                    and not closure_reason(bare_user, bot_answer, facts)):
+                bot_answer = guard_student_options(bot_answer, facts, bare_user)
             original_answer = sanitize_bot_outgoing(bot_answer)
             sanitized_answer = remove_answered_questions(original_answer, facts)
             if (sanitized_answer != original_answer and not has_question(sanitized_answer)
@@ -3674,6 +3693,17 @@ async def _attempt_pending_answer(chat_id, entry):
     if sent:
         chat_history.setdefault(chat_id, []).append({"role": "assistant", "content": entry["text"]})
         pending_answers.pop(chat_id, None)
+        if FOLLOWUP_ENABLED and not _chat_looks_followup_closed(chat_id):
+            if chat_id not in followups:
+                # An answer queued by an older version can be delivered after
+                # upgrade. Only this actual delivery can start its reminder;
+                # loading historical conversations alone never starts one.
+                last_user = next((_history_message_content(m) for m in reversed(chat_history[chat_id])
+                                  if isinstance(m, dict) and m.get("role") == "user"), "")
+                if last_user:
+                    _update_followup_tracking(chat_id, last_user)
+            if chat_id in followups:
+                followups[chat_id]["last_reply_ts"] = time.time()
     elif not _outbound_allowed(chat_id):
         pending_answers.pop(chat_id, None)
     else:
@@ -5035,8 +5065,12 @@ def _policy_closes_history(chat_id):
     return False
 
 
-async def _send_followup_message(chat_id: str) -> bool:
+async def _send_followup_message(chat_id: str, *, expected_plan=None) -> bool:
     async with _dialog_lock(chat_id):
+        # A fresh answer may have reset the timer while this tick waited for
+        # the dialog lock. Never send using the previous conversation's due time.
+        if expected_plan is not None and followups.get(chat_id) != expected_plan:
+            return False
         if _chat_looks_followup_closed(chat_id) or chat_id in message_buffers or chat_id in pending_answers:
             return False
         token = _outbound_context.set((chat_id, incoming_versions[chat_id], "followup"))
@@ -5056,6 +5090,8 @@ async def _send_followup_message(chat_id: str) -> bool:
 
 
 async def _followup_tick() -> None:
+    if not FOLLOWUP_ENABLED:
+        return
     now = time.time()
     now_local = datetime.now(_SCHOOL_TZ)
     quiet = _followup_in_quiet_hours(now_local)
@@ -5070,27 +5106,29 @@ async def _followup_tick() -> None:
             or _chat_looks_followup_closed(chat_id)
         ):
             followups.pop(chat_id, None)
+            _save_conversation(chat_id)
             continue
-        last_ts = st.get("last_client_ts", now)
+        last_ts = st.get("last_reply_ts", st.get("last_client_ts"))
+        if last_ts is None:
+            continue
         stage = st.get("stage", 0)
         silence = now - last_ts
 
-        # Follow-up #2: на следующий день в 12:00 — завершает цепочку.
+        # Если окно пропущено — то же единственное напоминание на следующий день.
         if stage <= 1 and not quiet and _followup_noon_reached(last_ts, now_local):
-            if await _send_followup_message(chat_id):
+            if await _send_followup_message(chat_id, expected_plan=dict(st)):
                 logger.info(
-                    "followup: #2 (след. день %02d:00) отправлен %s",
+                    "followup: напоминание (след. день %02d:00) отправлено %s",
                     FOLLOWUP_NEXT_DAY_HOUR, chat_id,
                 )
                 followups.pop(chat_id, None)
             continue
 
-        # Follow-up #1: через N часов молчания (не в тихие часы).
+        # Через N часов после доставки ответа (не в тихие часы).
         if stage == 0 and silence >= FOLLOWUP_SILENCE_SECONDS and not quiet:
-            if await _send_followup_message(chat_id):
-                st["stage"] = 1
+            if await _send_followup_message(chat_id, expected_plan=dict(st)):
                 logger.info(
-                    "followup: #1 (молчание %dч) отправлен %s",
+                    "followup: напоминание (молчание %dч) отправлено %s",
                     FOLLOWUP_SILENCE_SECONDS // 3600, chat_id,
                 )
 

@@ -1,7 +1,7 @@
 """Conservative dialog rules independent of model wording."""
 import re
 
-KAZAKH = re.compile(r'[әіңғүұқөһ]|\b(?:салем|рахмет|балам|казакша|казахша|казак|бола\s+ма|барамыз|неше)\b', re.I)
+KAZAKH = re.compile(r'[әіңғүұқөһ]|\b(?:салем|рахмет|балам|казакша|казахша|казак|бола\s+ма|барамыз|неше|жастамын|жасым)\b', re.I)
 RUSSIAN = re.compile(r'\b(?:здравствуйте|скажите|подскажите|реб[её]нок|реб[её]нка|сколько|хочу|можно|пожалуйста|интересует|напишите|цена|ценам|стоимость)\b', re.I)
 DEFER = re.compile(r'посоветуюсь|подумаю|сам[аи]?\s+(?:напиш|свяж)|(?:потом|позже)\s+(?:напиш|отпиш)|отпишусь|кеңесіп|ақылдасып|ойланайын|өзім\s+хабарлас', re.I)
 EMPLOYMENT = re.compile(r'трудоустрой|ваканси|нужны\s+(?:ли\s+)?тренер|работ\w*\s+тренер|тренер\w*\s+жұмыс|жаттықтырушы\w*\s+(?:керек|қажет)|жұмысқа\s+орналас', re.I)
@@ -39,6 +39,97 @@ def detect_language(text, previous='ru'):
     return previous
 
 
+def chess_rank(text):
+    rank = re.search(r'\b([1-5]|iv|iii|ii|i)\s*(?:[-–]?(?:й|ый|ий|тий|го))?\s*разряд\w*\b', text, re.I)
+    if not rank:
+        return None
+    value = rank.group(1).lower()
+    return int(value) if value.isdigit() else {'i': 1, 'ii': 2, 'iii': 3, 'iv': 4}[value]
+
+
+def student_age(facts):
+    try:
+        age = float(str(facts.get('age', '')).replace(',', '.'))
+        return age if 0 <= age < 100 else None
+    except ValueError:
+        return None
+
+
+def qualification_directive(facts):
+    age = student_age(facts)
+    if age is None:
+        return ('Возраст ученика неизвестен. «Для себя» НЕ означает взрослый. '
+                'Перед выбором детского/взрослого сценария уточни возраст ученика; '
+                'не утверждай, что доступны только индивидуальные занятия.')
+    if age >= 18:
+        return 'Категория ученика: взрослый (возраст подтверждён). Только индивидуальные занятия от 7 000 тг/час.'
+    return ('Категория ученика: ребёнок, даже если пишет сам и сказал «для себя». '
+            'Возраст клиента важнее прежних предположений и ответов бота о взрослых. '
+            'Предлагай детские группы по разряду и индивидуальные как вариант. '
+            'Для 3 разряда: GMCA Аркада/Камал, группа 35 000 тг/месяц, 3 раза в неделю по 1,5 часа. '
+            'Не ограничивай ребёнка индивидуальными без его явного выбора; '
+            'если пишет сам, обращайся к нему, не спрашивай о «вашем ребёнке». '
+            'Минимальный возраст для занятий — 5 лет.')
+
+
+def child_lesson_options(facts):
+    """Grounded fallback when a minor was offered only the adult format."""
+    kk = facts.get('language') == 'kk'
+    exp = facts.get('experience', '')
+    rank = chess_rank(exp)
+    master = bool(re.search(r'мастер\s+спорта', exp, re.I))
+    kms = bool(re.search(r'кмс', exp, re.I))
+    branch = 'GMCA Аркада' if kms or master else 'GMCA Аркада / Камал'
+    if facts.get('preference') == 'онлайн':
+        branch = 'онлайн'
+    price, hours = ('35 000', '1,5') if rank == 3 else ('40 000', '2') if rank in (1, 2) or kms else ('30 000', '1')
+    known_level = rank is not None or kms or bool(re.search(r'начинающ|нович|бастаушы', exp, re.I))
+    if kk:
+        group = (f'{branch}: топтық сабақ — айына {price} теңге, аптасына 3 рет, әр сабақ {hours} сағат.'
+                 if known_level and not master else f'{branch}: деңгейіңізге сәйкес топтық сабақтар бар.')
+        individual = ' Жеке сабақ та бар — бір сағат үшін 7 000 теңгеден басталады.'
+        question = (' Шахматтағы деңгейіңіз немесе разрядыңыз қандай?' if not exp else
+                    ' Сізге қай филиал ыңғайлы?' if not facts.get('preference') else '')
+    else:
+        group = (f'В {branch} доступны групповые занятия — {price} тг в месяц, 3 раза в неделю по {hours} ч.'
+                 if known_level and not master else f'В {branch} доступны групповые занятия по уровню ученика.')
+        individual = ' Также можно заниматься индивидуально — от 7 000 тг за час.'
+        question = (' Какой у ученика опыт или разряд?' if not exp else
+                    ' Какой филиал вам удобнее?' if not facts.get('preference') else '')
+    return group + individual + question
+
+
+def guard_student_options(answer, facts, user_text):
+    """Do not let an earlier adult assumption hide a child's group option."""
+    age = student_age(facts)
+    adult = bool(re.search(r'для\s+взросл|вы\s+взросл|ересектер', answer, re.I))
+    individual = bool(re.search(r'индивидуал|жеке\s+сабақ', answer, re.I))
+    group = bool(re.search(r'групп|топтық|топта', answer, re.I))
+    exclusive = bool(re.search(r'(?:только|лишь)\s+индивидуал|тек\s+жеке|'
+                              r'групп\w*\s+(?:занят\w*\s+)?(?:нет|не\s+(?:подход|доступ|предусмотр))|'
+                              r'топтық\s+сабақ\w*\s+жоқ', answer, re.I))
+    self_intro = bool(re.fullmatch(r'\s*(?:для\s+(?:себя|меня)|өзім(?:е|\s+үшін)?)[.!]?\s*', user_text, re.I))
+    if age is None and (self_intro or adult or exclusive or (facts.get('audience') == 'для себя' and individual and not group)):
+        question = ('Оқушы неше жаста? Жасына қарай сабақ түрлерін ұсынамын.' if facts.get('language') == 'kk'
+                    else 'Сколько лет ученику? Подскажу подходящие варианты занятий по возрасту.')
+        if individual and PRICE_QUESTION.search(user_text):
+            price = ('Жеке сабақ — бір сағат үшін 7 000 теңгеден басталады. ' if facts.get('language') == 'kk'
+                     else 'Индивидуальные занятия — от 7 000 тг за час. ')
+            return price + question
+        return question
+    if age is not None and 5 <= age < 18:
+        requested_individual = facts.get('lesson_format') == 'индивидуально' or bool(
+            re.search(r'индивидуал|жеке\s+сабақ', user_text, re.I)
+            and not re.search(r'групп|топтық|\bне\b', user_text, re.I))
+        offer = bool(re.search(r'доступ|можно|предлаг|подойд|подход|стоят|стоим|тг|теңге|\bбар\b', answer, re.I))
+        if adult and requested_individual:
+            return ('Жеке сабақ — бір сағат үшін 7 000 теңгеден басталады.' if facts.get('language') == 'kk'
+                    else 'Индивидуальные занятия — от 7 000 тг за час.')
+        if adult or (not requested_individual and (exclusive or (individual and not group and offer))):
+            return child_lesson_options(facts)
+    return answer
+
+
 def closure_reason(user_text='', answer='', facts=None):
     if EMPLOYMENT.search(user_text):
         return 'employment'
@@ -71,13 +162,15 @@ def deferred_price_reply(facts, text):
     if not DEFER.search(text) or not PRICE_QUESTION.search(text) or facts.get('preference') not in ('Камал', 'Аркада', 'онлайн'):
         return None
     kk = facts.get('language') == 'kk'
-    if re.search(r'индивидуал|жеке', text, re.I):
+    age = student_age(facts)
+    if age is None and facts.get('audience') == 'для себя':
+        return None
+    if (age is not None and age >= 18) or facts.get('lesson_format') == 'индивидуально' or re.search(r'индивидуал|жеке', text, re.I):
         return ('Жеке сабақтың бағасы — бір сағат үшін 7 000 теңгеден басталады. Ақылдасып, шешім қабылдаған соң хабарласа аласыз.'
                 if kk else 'Индивидуальные занятия — от 7 000 тг за урок длительностью один час. Напишите, когда примете решение.')
     # Do not infer a rank from an unqualified «средний».
     exp = facts.get('experience', '')
-    rank = re.search(r'\b([1-4])\s*(?:-?й\s+)?разряд', exp, re.I)
-    rank = int(rank.group(1)) if rank else None
+    rank = chess_rank(exp)
     price, hours = ('35 000', '1,5') if rank == 3 else ('40 000', '2') if rank in (1, 2) or re.search(r'кмс', exp, re.I) else ('30 000', '1')
     qualifier_kk = '' if rank or re.search(r'кмс', exp, re.I) else 'бастаушыларға арналған '
     qualifier_ru = '' if rank or re.search(r'кмс', exp, re.I) else 'для начинающих '

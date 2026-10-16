@@ -159,6 +159,124 @@ class IncidentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.send.await_count, 2)
         self.assertEqual(self.send.call_args_list[0].args, self.send.call_args_list[1].args)
 
+    async def followup_at(self, when):
+        with patch.object(bot.time, 'time', return_value=when.timestamp()), \
+             patch.object(bot, 'datetime', wraps=datetime) as dt:
+            dt.now.return_value = when
+            await bot._followup_tick()
+
+    async def test_2gis_delayed_reply_then_restart_keeps_one_reminder(self):
+        morning = datetime(2026, 10, 12, 7, 50, tzinfo=bot._SCHOOL_TZ)
+        delivered = morning.replace(hour=17, minute=57)
+        self.ai.side_effect = [completion('Здравствуйте. Для кого рассматриваете обучение — для ребёнка или для себя?')]
+        self.send.return_value = False
+        with patch.object(bot.time, 'time', return_value=morning.timestamp()):
+            self.queue('Здравствуйте! Пишу из приложения 2ГИС.')
+            await bot.process_dialog(self.chat)
+        self.assertIsNone(bot.followups[self.chat]['last_reply_ts'])
+        await self.followup_at(morning + timedelta(hours=2))
+        self.assertEqual(self.send.await_count, 1)
+
+        bot.followups.clear()
+        bot.pending_answers.clear()
+        await bot._load_conversations()
+        self.assertIn(self.chat, bot.followups)
+        self.send.return_value = True
+        with patch.object(bot.time, 'time', return_value=delivered.timestamp()):
+            await bot._retry_pending_answers()
+        self.assertEqual(bot.followups[self.chat]['last_reply_ts'], delivered.timestamp())
+        bot.followups.clear()
+        await bot._load_conversations()
+        await self.followup_at(delivered + timedelta(hours=2, seconds=-1))
+        self.assertEqual(self.send.await_count, 2)
+        await self.followup_at(delivered + timedelta(hours=2))
+        self.assertEqual(self.send.await_count, 3)
+        self.assertEqual(self.send.call_args.args[1], bot.FOLLOWUP_MESSAGE)
+        self.assertNotIn(self.chat, bot.followups)
+
+        bot.followup_sent.clear()
+        bot.followup_blocked.clear()
+        await bot._load_conversations()
+        await self.followup_at(delivered + timedelta(days=1))
+        self.assertEqual(self.send.await_count, 3)
+        self.ai.assert_awaited_once()
+
+    async def test_failed_reminder_remains_due_after_restart(self):
+        now = datetime(2026, 10, 12, 15, tzinfo=bot._SCHOOL_TZ)
+        bot.chat_history[self.chat] = [{'role': 'user', 'content': 'Цена?'}]
+        bot.followups[self.chat] = {'last_client_ts': now.timestamp() - 7300,
+                                   'last_reply_ts': now.timestamp() - 7200, 'stage': 0}
+        bot._save_conversation(self.chat)
+        self.send.return_value = False
+        await self.followup_at(now)
+        bot.followups.clear()
+        await bot._load_conversations()
+        self.send.return_value = True
+        await self.followup_at(now + timedelta(minutes=5))
+        self.assertEqual(self.send.await_count, 2)
+        self.assertIn(self.chat, bot.followup_sent)
+
+    async def test_restored_reminder_respects_quiet_hours_and_disabled_worker(self):
+        now = datetime(2026, 10, 12, 21, tzinfo=bot._SCHOOL_TZ)
+        bot.chat_history[self.chat] = [{'role': 'user', 'content': 'Цена?'}]
+        bot.followups[self.chat] = {'last_client_ts': now.timestamp() - 7300,
+                                   'last_reply_ts': now.timestamp() - 7200, 'stage': 0}
+        bot._save_conversation(self.chat)
+        bot.followups.clear()
+        await bot._load_conversations()
+        await self.followup_at(now)
+        self.send.assert_not_awaited()
+        with patch.object(bot, 'FOLLOWUP_ENABLED', False):
+            await self.followup_at(now + timedelta(hours=12))
+        self.send.assert_not_awaited()
+        await self.followup_at(now + timedelta(hours=12))
+        self.send.assert_awaited_once()
+
+    async def test_closed_or_historical_chat_is_not_enrolled_on_restart(self):
+        bot.chat_history[self.chat] = [
+            {'role': 'user', 'content': 'Здравствуйте! Пишу из приложения 2ГИС.'},
+            {'role': 'assistant', 'content': 'Для кого рассматриваете обучение?'},
+        ]
+        bot.last_activity[self.chat] = time.time() - 86400
+        bot._save_conversation(self.chat)
+        await bot._load_conversations()
+        self.assertNotIn(self.chat, bot.followups)
+        bot._update_followup_tracking(self.chat, 'Здравствуйте')
+        bot.chat_history[self.chat].append({'role': 'user', 'content': 'Посоветуюсь и отпишусь'})
+        bot._save_conversation(self.chat)
+        bot.followups.clear()
+        await bot._load_conversations()
+        self.assertNotIn(self.chat, bot.followups)
+        self.assertTrue(bot._chat_looks_followup_closed(self.chat))
+
+    async def test_legacy_pending_answer_delivery_starts_reminder(self):
+        bot.chat_history[self.chat] = [{'role': 'user', 'content': 'Здравствуйте! Пишу из приложения 2ГИС.'}]
+        now = datetime(2026, 10, 12, 17, 57, tzinfo=bot._SCHOOL_TZ)
+        bot.pending_answers[self.chat] = {'text': 'Для кого рассматриваете обучение?',
+            'created': now.timestamp() - 3600, 'retry_at': now.timestamp() - 1, 'attempts': 1}
+        bot._save_conversation(self.chat)
+        bot.pending_answers.clear()
+        await bot._load_conversations()
+        self.assertNotIn(self.chat, bot.followups)
+        with patch.object(bot.time, 'time', return_value=now.timestamp()):
+            await bot._retry_pending_answers()
+        self.assertEqual(bot.followups[self.chat]['last_reply_ts'], now.timestamp())
+        self.send.assert_awaited_once()
+
+    async def test_reminder_waiting_for_dialog_rechecks_changed_timer(self):
+        now = datetime(2026, 10, 12, 15, tzinfo=bot._SCHOOL_TZ)
+        bot.chat_history[self.chat] = [{'role': 'user', 'content': 'Цена?'}]
+        bot.followups[self.chat] = {'last_client_ts': now.timestamp() - 7300,
+                                   'last_reply_ts': now.timestamp() - 7200, 'stage': 0}
+        async with bot._dialog_lock(self.chat):
+            tick = asyncio.create_task(self.followup_at(now))
+            await asyncio.sleep(0)
+            bot._update_followup_tracking(self.chat, 'Для ребёнка')
+            await bot._deliver_dialog_answer(self.chat, 'Сколько лет ребёнку?')
+        await tick
+        self.send.assert_awaited_once()
+        self.assertNotIn(self.chat, bot.followup_sent)
+
     async def test_new_message_and_optout_cancel_pending_reply(self):
         self.send.return_value = False
         await bot._deliver_dialog_answer(self.chat, 'Старый ответ')
