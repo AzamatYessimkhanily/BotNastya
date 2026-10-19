@@ -20,7 +20,8 @@ from runtime_state import write_json_atomic
 from dialog_policy import (LANGUAGE_POLICY, closure_reason, DEFER, EMPLOYMENT, EXTERNAL_REQUEST,
                            EXTERNAL_OUTPUT, VISIT_NOW, PRICE_QUESTION, external_reply, employment_reply,
                            deferred_price_reply, confirmed_handoff, polish_kazakh,
-                           qualification_directive, guard_student_options)
+                           qualification_directive, guard_student_options,
+                           reports_existing_student, TRAINER_CONTACT, SUPPORT_SALES_REPLY)
 from usage_reporting import UsageLedger
 
 # --- 1. НАСТРОЙКИ ---
@@ -787,6 +788,10 @@ def _save_conversation(chat_id):
         "pending_answer": pending_answers.get(chat_id),
         "followup": followups.get(chat_id),
         "followup_blocked": chat_id in followup_blocked,
+        "known_user": {k: v for k, v in known_users.get(chat_id, {}).items()
+                       if k in ("id", "name", "phone", "clientStateId", "_from_crm_notify")},
+        "dossier": client_dossiers.get(chat_id),
+        "crm_lookup": crm_lookup_state.get(chat_id),
     })
 
 
@@ -801,6 +806,12 @@ async def _load_conversations():
                 chat_history[chat_id][0] = {"role": "system", "content": SYSTEM_PROMPT}
             _repair_dangling_tool_calls(chat_id)
         conversation_facts[chat_id] = state.get("facts", {})
+        if state.get("known_user"):
+            known_users[chat_id] = state["known_user"]
+        if state.get("dossier"):
+            client_dossiers[chat_id] = state["dossier"]
+        if state.get("crm_lookup"):
+            crm_lookup_state[chat_id] = state["crm_lookup"]
         if state.get("pending_answer"):
             pending_answers[chat_id] = state["pending_answer"]
         # Backfill facts newly recognized by this version without replacing
@@ -827,7 +838,11 @@ async def _load_conversations():
                             ("last_activity", last_activity), ("manager_notified", session_manager_notified)):
             if state.get(key):
                 target[chat_id] = state[key]
-        if state.get("crm_notice"):
+        legacy_student = state.get("crm_notice") or any(
+            m.get("role") == "system" and (m.get("content") or "").startswith("[СИСТЕМНОЕ ДОСЬЕ КЛИЕНТА]")
+            for m in state.get("history", []))
+        if (legacy_student and chat_id not in known_users
+                and crm_lookup_state.get(chat_id, {}).get("status") != "not_student"):
             known_users[chat_id] = {"phone": chat_id.split("@")[0], "_from_crm_notify": True}
     _load_followup_blocked()
     # Persist closures from older histories on upgrade, even if they were not
@@ -865,6 +880,7 @@ message_buffers: Dict[str, Dict] = {}
 known_users: Dict[str, dict] = {}
 # Досье действующего ученика по chat_id (имя, филиал и т.д.) — для request_manager_callback.
 client_dossiers: Dict[str, dict] = {}
+crm_lookup_state: Dict[str, dict] = {}
 last_activity: Dict[str, float] = {}
 
 # Анти-зацикливание на вопросе об имени ребёнка: детектим, что бот УЖЕ спрашивал имя,
@@ -1076,6 +1092,10 @@ def _extract_quoted_text(msg_data: dict) -> str:
     return quoted.get("text", "") or ""
 
 # --- 3. CRM МОДУЛЬ ---
+class CRMUnavailable(RuntimeError):
+    """Lookup failed; this is not evidence that a student does not exist."""
+
+
 class MoyKlassCRM:
     _TOKEN_TTL = 3300  # секунд (~55 мин), обновляем до истечения часа
 
@@ -1100,15 +1120,15 @@ class MoyKlassCRM:
                         self.token_fetched_at = time.time()
                         logger.info("CRM: Токен получен/обновлён")
                     else:
-                        logger.error(f"Auth Error: {resp.status_code} {resp.text}")
+                        logger.error("CRM auth: HTTP %s", resp.status_code)
                         return None
                 except Exception as e:
-                    logger.error(f"Connection Error: {e}")
+                    logger.error("CRM auth: %s", type(e).__name__)
                     return None
         return {"x-access-token": self.token, "Content-Type": "application/json"}
 
     async def get_schedule(self, user_id, headers):
-        schedule_text = "Нет ближайших уроков."
+        schedule_text = "Расписание пока не получено."
         try:
             async with httpx.AsyncClient(timeout=MOYKLASS_HTTP_TIMEOUT) as client:
                 teachers_map = {}
@@ -1130,6 +1150,7 @@ class MoyKlassCRM:
                 resp = await client.get(f"{MOYKLASS_BASE_URL}/lessonRecords", headers=headers, params=params)
                 if resp.status_code == 200:
                     records = resp.json().get("lessonRecords", [])
+                    schedule_text = "Нет ближайших уроков."
                     if records:
                         lessons_list = []
                         for rec in records:
@@ -1419,7 +1440,7 @@ class MoyKlassCRM:
     async def find_user_smart(self, phone):
         headers = await self._get_headers()
         if not headers:
-            return None
+            raise CRMUnavailable("auth")
 
         clean = re.sub(r"[^\d]", "", phone)
         target_tail = clean[-10:] if len(clean) >= 10 else clean
@@ -1438,9 +1459,24 @@ class MoyKlassCRM:
                         params={"phone": p, "includeJoins": "true"},
                     )
 
+                    if resp.status_code == 401:
+                        # A revoked/expired token must not look like an empty search.
+                        if self.token == headers.get("x-access-token"):
+                            self.token = None
+                        headers = await self._get_headers()
+                        if not headers:
+                            raise CRMUnavailable("auth_refresh")
+                        resp = await client.get(
+                            f"{MOYKLASS_BASE_URL}/users", headers=headers,
+                            params={"phone": p, "includeJoins": "true"})
+                    if resp.status_code != 200:
+                        raise CRMUnavailable("users_http_" + str(resp.status_code))
+
                     if resp.status_code == 200:
                         data = resp.json()
-                        users = data.get("users", [])
+                        users = data["users"]
+                        if not isinstance(users, list):
+                            raise ValueError("Invalid users response")
                         if users:
                             user = next((u for u in users if self._phone_tail_matches(
                                 u.get("phone"), target_tail
@@ -1453,37 +1489,64 @@ class MoyKlassCRM:
                             user_id = user['id']
                             logger.info(f"НАЙДЕН КЛИЕНТ: {user['name']} (ID {user_id})")
 
-                            groups_text = "Нет активных групп"
                             active_filial_id = next(iter(user.get("filials") or []), None)
-                            joins = user.get("joins", [])
-
-                            if joins:
-                                active_groups = []
-                                for join in joins[-2:]:
-                                    c_name = await self.get_class_name(join['classId'], headers)
-                                    status = "Активен" if join['statusId'] == 2 else "Архив"
-                                    active_groups.append(f"{c_name} ({status})")
-                                    if join['statusId'] == 2 and join.get('filialId'):
-                                        active_filial_id = join['filialId']
-                                if active_groups:
-                                    groups_text = ", ".join(active_groups)
-
-                            schedule_text = await self.get_schedule(user_id, headers)
 
                             dossier = {
                                 "id": user_id,
                                 "name": user['name'],
-                                "groups": groups_text,
-                                "schedule": schedule_text,
-                                "balance": user.get('balans', 0),
+                                "groups": "Группы пока не получены",
+                                "schedule": "Расписание пока не получено",
+                                "balance": user.get('balans'),
                                 "filial_id": active_filial_id
                             }
                             return {"user": user, "dossier": dossier}
-                except Exception:
-                    pass
+                except CRMUnavailable:
+                    raise
+                except Exception as error:
+                    logger.warning("CRM phone lookup: %s", type(error).__name__)
+                    raise CRMUnavailable(type(error).__name__) from error
 
         logger.info(f"Клиент не найден (проверено {len(phones_to_try)} вар).")
         return None
+
+    async def enrich_student_dossier(self, user, dossier):
+        headers = await self._get_headers()
+        if not headers:
+            raise CRMUnavailable("auth")
+        active_groups = []
+        for join in [j for j in (user.get('joins') or []) if j.get('statusId') == 2][-2:]:
+            active_groups.append(await self.get_class_name(join['classId'], headers))
+            if join.get('filialId'):
+                dossier['filial_id'] = join['filialId']
+        dossier['groups'] = ', '.join(active_groups) or 'Нет активных групп'
+        dossier['schedule'] = await self.get_schedule(user['id'], headers)
+
+    async def get_student_trainers(self, user_id):
+        """Only teachers attached to this student's upcoming lessons, never a default."""
+        headers = await self._get_headers()
+        if not headers:
+            raise CRMUnavailable("auth")
+        today = datetime.now(_SCHOOL_TZ).date()
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{MOYKLASS_BASE_URL}/lessonRecords", headers=headers,
+                params={"userId": user_id, "date": [today.isoformat(), (today + timedelta(days=7)).isoformat()],
+                        "includeLessons": "true", "limit": 30, "sort": "date"})
+            response.raise_for_status()
+            teacher_ids = set()
+            for record in response.json()["lessonRecords"]:
+                # Defend against ignored API filters as with phone lookup.
+                if record.get("userId") != user_id:
+                    continue
+                lesson = record.get("lesson") or {}
+                if not today.isoformat() <= str(lesson.get("date", ""))[:10] <= (today + timedelta(days=7)).isoformat():
+                    continue
+                teacher_ids.update(lesson.get("teacherIds") or [])
+            if not teacher_ids:
+                return []
+            response = await client.get(f"{MOYKLASS_BASE_URL}/managers", headers=headers)
+            response.raise_for_status()
+            return [{"name": m["name"], "phone": m["phone"]} for m in response.json()
+                    if m.get("id") in teacher_ids and m.get("name") and phone_to_chat_id(m.get("phone"))]
 
     async def get_user_phone_by_id(self, user_id: int) -> Optional[str]:
         user = await self.get_user_by_id(user_id)
@@ -2798,7 +2861,7 @@ def _update_followup_tracking(chat_id: str, user_text: str) -> None:
         followups.pop(chat_id, None)
         return
     # Действующий ученик — «так и не записались» к нему неприменимо.
-    if chat_id in known_users:
+    if _student_support(chat_id):
         _block_followup(chat_id, "known_user")
         return
     # Ответ на недавнее CRM-уведомление (посещаемость/долг) — не новый лид.
@@ -3202,6 +3265,123 @@ async def process_dialog(chat_id):
             _outbound_context.reset(token)
 
 
+def _student_support(chat_id):
+    facts = conversation_facts.get(chat_id, {})
+    return chat_id in known_users or bool(facts.get("student_reported")) or facts.get("support_request") == "trainer"
+
+
+async def _refresh_student_context(chat_id):
+    """Refresh CRM independently of durable identity; outages preserve prior evidence."""
+    previous = crm_lookup_state.get(chat_id, {})
+    ttl = 60 if previous.get("status") == "unavailable" else 300 if previous.get("status") == "not_found" else SESSION_TIMEOUT
+    if time.time() - previous.get("checked_at", 0) < ttl:
+        return
+    try:
+        found = await asyncio.wait_for(crm.find_user_smart(chat_id.split("@")[0]), timeout=8.0)
+    except (CRMUnavailable, asyncio.TimeoutError) as error:
+        crm_lookup_state[chat_id] = {"status": "unavailable", "checked_at": time.time()}
+        logger.warning("CRM dialog lookup unavailable for %s (%s); retaining identity", chat_id, type(error).__name__)
+        return
+    if not found:
+        # A previous notification/verified match still matters if a phone was edited.
+        crm_lookup_state[chat_id] = {"status": "not_found", "checked_at": time.time()}
+        return
+    user, dossier = found["user"], found["dossier"]
+    try:
+        client_state = await asyncio.wait_for(crm._get_client_state_id(), timeout=2.0)
+    except asyncio.TimeoutError:
+        client_state = None
+    if client_state is not None and user.get("clientStateId") is not None and user["clientStateId"] != client_state:
+        known_users.pop(chat_id, None)
+        client_dossiers.pop(chat_id, None)
+        crm_lookup_state[chat_id] = {"status": "not_student", "checked_at": time.time()}
+        return
+    # A matched phone verifies the identity even when the status service is down.
+    # The prompt distinguishes that from confirmed current enrollment.
+    known_users[chat_id] = user
+    client_dossiers[chat_id] = dossier
+    crm_lookup_state[chat_id] = {"status": "found", "checked_at": time.time(),
+                               "enrollment_confirmed": client_state is not None and user.get("clientStateId") == client_state}
+    _block_followup(chat_id, "crm_client")
+    # Commit the phone match before any optional requests or their timeouts.
+    _save_conversation(chat_id)
+    try:
+        await asyncio.wait_for(crm.enrich_student_dossier(user, dossier), timeout=3.0)
+    except Exception as error:
+        logger.warning("CRM dossier enrichment: %s", type(error).__name__)
+
+
+def _student_dialog_directive(chat_id):
+    facts = conversation_facts.get(chat_id, {})
+    if not _student_support(chat_id):
+        return qualification_directive(facts)
+    dossier = client_dossiers.get(chat_id, {})
+    lookup = crm_lookup_state.get(chat_id, {})
+    fresh = lookup.get("status") == "found" and time.time() - lookup.get("checked_at", 0) < SESSION_TIMEOUT
+    context = {k: dossier[k] for k in ("name", "filial_id") if k in dossier}
+    if fresh:
+        context.update({k: dossier[k] for k in ("groups", "schedule", "balance") if dossier.get(k) is not None})
+    return (
+        "РЕЖИМ ПОДДЕРЖКИ УЧЕНИКА. Есть связь со школой, заявление об обучении либо запрос контакта тренера. "
+        "Отвечай на его вопрос. НЕ запускай подбор обучения, НЕ уточняй возраст, опыт, "
+        "для кого обучение или какой филиал удобнее, НЕ предлагай тарифы без вопроса о стоимости. "
+        "НЕ вызывай register_client_request. Для передачи вопроса человеку используй request_manager_callback. "
+        "Если филиал неизвестен, спроси, в каком филиале УЖЕ занимаются. "
+        "Слова клиента об обучении и имя сами по себе НЕ подтверждают его связь с карточкой CRM. "
+        "Не раскрывай чужие данные, не выдумывай имя/телефон тренера, расписание или баланс. "
+        "При недоступности CRM продолжай поддержку; это не означает, что клиент новый. "
+        "Подтверждённая по номеру информация: " + json.dumps(context, ensure_ascii=False) +
+        ". Текущее обучение подтверждено CRM: " + str(bool(fresh and lookup.get("enrollment_confirmed"))) +
+        ". Если нет свежего расписания, не называй дату/время из старой переписки."
+    )
+
+
+def _student_support_fallback(chat_id):
+    facts = conversation_facts.get(chat_id, {})
+    dossier = client_dossiers.get(chat_id, {})
+    branch = dossier.get("filial_id") or _guess_filial_from_text(facts.get("preference", ""))
+    name, phone = crm._pick_manager_info(branch, dossier.get("matched_key") or _matched_key_from_text(facts.get("preference", "")))
+    if name and phone:
+        return (f"Сабағыңыз бойынша көмектесемін. Филиал басшысы {name}: {phone}. Қандай сұрағыңыз бар?"
+                if facts.get("language") == "kk" else
+                f"Помогу по вашим занятиям. Управляющий вашего филиала — {name}, {phone}. Что нужно уточнить?")
+    return ("Сабағыңыз бойынша көмектесемін. Қай филиалда оқисыз?" if facts.get("language") == "kk" else
+            "Помогу по вашим занятиям. Подскажите, в каком филиале вы занимаетесь?")
+
+
+async def _student_trainer_reply(chat_id):
+    """Deterministic answer to the screenshot request; no model-invented contacts."""
+    facts = conversation_facts.get(chat_id, {})
+    dossier = client_dossiers.get(chat_id, {})
+    trainers = []
+    if (chat_id in known_users and dossier.get("id")
+            and crm_lookup_state.get(chat_id, {}).get("status") != "not_found"):
+        cached_at = dossier.get("trainers_checked_at", 0)
+        if time.time() - cached_at < 3600:
+            trainers = dossier.get("trainers", [])
+        else:
+            try:
+                trainers = await asyncio.wait_for(crm.get_student_trainers(dossier["id"]), timeout=6.0)
+                dossier.update(trainers=trainers, trainers_checked_at=time.time())
+            except Exception as error:
+                logger.warning("Trainer lookup unavailable for %s (%s)", chat_id, type(error).__name__)
+    if trainers:
+        contacts = "; ".join(f"{t['name']} — {t['phone']}" for t in trainers)
+        facts.pop("support_request", None)
+        return ("Алдағы сабақтарыңыздың жаттықтырушылары: " if facts.get("language") == "kk" else
+                "Тренер ваших ближайших занятий: " if len(trainers) == 1 else "Тренеры ваших ближайших занятий: ") + contacts + "."
+    branch = dossier.get("filial_id") or _guess_filial_from_text(facts.get("preference", ""))
+    name, phone = crm._pick_manager_info(branch, dossier.get("matched_key") or _matched_key_from_text(facts.get("preference", "")))
+    if name and phone:
+        facts.pop("support_request", None)
+        return (f"Жаттықтырушының байланысын қазір нақтылай алмадым. Филиал басшысы {name} көмектеседі: {phone}."
+                if facts.get("language") == "kk" else
+                f"Сейчас не удалось уточнить контакт тренера. С этим поможет управляющий вашего филиала — {name}: {phone}.")
+    return ("Жаттықтырушының байланысын нақтылау үшін қай филиалда оқитыныңызды айтыңызшы."
+            if facts.get("language") == "kk" else
+            "Подскажите, в каком филиале вы занимаетесь, чтобы я помогла уточнить контакт тренера.")
+
+
 async def _process_dialog(chat_id):
     async with _dialog_lock(chat_id):
         buffer = message_buffers.pop(chat_id, None)
@@ -3223,11 +3403,8 @@ async def _process_dialog(chat_id):
         await _hydrate_chat_history(chat_id)
         if chat_id in contact_opt_out or _is_internal_chat(chat_id):
             return
-        # A timeout refreshes the CRM dossier, never erases the conversation.
+        # Expiry triggers a refresh, never erases a verified identity.
         current_time = time.time()
-        if current_time - last_activity.get(chat_id, current_time) > SESSION_TIMEOUT:
-            known_users.pop(chat_id, None)
-            client_dossiers.pop(chat_id, None)
         last_activity[chat_id] = current_time
 
         if chat_id not in chat_history:
@@ -3248,48 +3425,12 @@ async def _process_dialog(chat_id):
             _block_followup(chat_id, "acknowledgment")
             return
 
-        # Досье подтягиваем всегда, если ещё нет — в т.ч. когда историю создал CRM-уведомитель.
-        if chat_id not in known_users or (
-            isinstance(known_users.get(chat_id), dict)
-            and known_users[chat_id].get("_from_crm_notify")
-        ):
-            phone = chat_id.split("@")[0]
-            found = await crm.find_user_smart(phone)
-            if found:
-                user_obj = found["user"]
-                dossier = found["dossier"]
-                known_users[chat_id] = user_obj
-                client_dossiers[chat_id] = dossier
-                _block_followup(chat_id, "crm_client")
-
-                mgr_contact = ""
-                if dossier["filial_id"] and dossier["filial_id"] in BRANCH_PHONES:
-                    mgr_contact = f"Его менеджер: {BRANCH_PHONES[dossier['filial_id']]}."
-
-                already_has_dossier = any(
-                    isinstance(m, dict)
-                    and m.get("role") == "system"
-                    and "[СИСТЕМНОЕ ДОСЬЕ КЛИЕНТА]" in (m.get("content") or "")
-                    for m in chat_history[chat_id]
-                )
-                if not already_has_dossier:
-                    inject_msg = (
-                        f"[СИСТЕМНОЕ ДОСЬЕ КЛИЕНТА]\n"
-                        f"Имя: {dossier['name']}\n"
-                        f"Группы: {dossier['groups']}\n"
-                        f"Ближайшие уроки: {dossier['schedule']}\n"
-                        f"Баланс: {dossier['balance']}\n"
-                        f"{mgr_contact}\n"
-                        f"ИНСТРУКЦИЯ: Это действующий ученик! НЕ СПРАШИВАЙ ИМЯ И ТЕЛЕФОН.\n"
-                        f"1. Поздоровайся по имени.\n"
-                        f"2. Если есть урок в поле 'Ближайшие уроки', ОБЯЗАТЕЛЬНО скажи: 'Ждем вас [Дата/Время] на уроке с [Имя преподавателя]'.\n"
-                        f"3. Если нет — спроси, чем помочь.\n"
-                        f"4. Жалоба / «никто не отвечает» / просьба связаться / операционный вопрос "
-                        f"(оплата, перенос, визит на занятие) — СНАЧАЛА вызови request_manager_callback, "
-                        f"ПОТОМ подтверди клиенту. Нельзя обещать передачу без вызова функции."
-                    )
-                    chat_history[chat_id].append({"role": "system", "content": inject_msg})
-                    logger.info(f"Загружено досье: {dossier['name']}")
+        await _refresh_student_context(chat_id)
+        # Old snapshots may contain obsolete schedule/balance instructions. The
+        # current support directive below supplies only the verified fresh data.
+        chat_history[chat_id] = [m for m in chat_history[chat_id] if not (
+            isinstance(m, dict) and m.get("role") == "system"
+            and (m.get("content") or "").startswith("[СИСТЕМНОЕ ДОСЬЕ КЛИЕНТА]"))]
 
         user_payload = (
             "[ОПРЕДЕЛИ ЯЗЫК ЭТОГО СООБЩЕНИЯ КЛИЕНТА САМОСТОЯТЕЛЬНО "
@@ -3327,15 +3468,48 @@ async def _process_dialog(chat_id):
                                   if isinstance(m, dict) and m.get("role") == "assistant"), "")
         for message in buffer["messages"]:
             update_facts(facts, _bare_client_text(message), last_question=previous_question)
+        if (chat_id not in known_users and re.search(
+                r'(?:еще\s+|ещё\s+|пока\s+)?не\s+(?:учимся|учится|занимаемся|ходим)|'
+                r'^нет\b.{0,30}(?:запис|пока|еще|ещё)', bare_user, re.I)):
+            facts.pop("student_reported", None)
+            facts.pop("support_request", None)
+        if TRAINER_CONTACT.search(bare_user):
+            facts["support_request"] = "trainer"
+        if _student_support(chat_id):
+            _block_followup(chat_id, "student_support")
         _save_conversation(chat_id)
 
         # План авто-реактивации: клиент написал — (пере)ставим таймер напоминаний.
         _update_followup_tracking(chat_id, user_text)
 
+        student_support = _student_support(chat_id)
+        if (not student_support and crm_lookup_state.get(chat_id, {}).get("status") == "unavailable"
+                and _CRM_GREETING_ONLY_RE.fullmatch(bare_user.strip())):
+            await _deliver_dialog_answer(chat_id, "Сәлеметсіз бе! Қалай көмектесе аламын?"
+                if facts.get("language") == "kk" else "Здравствуйте! Чем могу помочь?")
+            return
+        if student_support:
+            if not facts.get("support_request") and reports_existing_student(bare_user):
+                for previous in reversed(chat_history[chat_id][-10:]):
+                    if previous.get("role") == "user" and TRAINER_CONTACT.search(previous.get("content") or ""):
+                        facts["support_request"] = "trainer"
+                        break
+            if (TRAINER_CONTACT.search(bare_user) or (facts.get("support_request") == "trainer"
+                    and not has_question(bare_user))):
+                await _deliver_dialog_answer(chat_id, await _student_trainer_reply(chat_id))
+                return
+            if _CRM_GREETING_ONLY_RE.fullmatch(bare_user.strip()):
+                await _deliver_dialog_answer(chat_id, "Сәлеметсіз бе! Сабақтарыңыз бойынша қалай көмектесе аламын?"
+                    if facts.get("language") == "kk" else "Здравствуйте! Чем могу помочь по вашим занятиям?")
+                return
+            if reports_existing_student(bare_user) and not has_question(bare_user):
+                await _deliver_dialog_answer(chat_id, _student_support_fallback(chat_id))
+                return
+
         if EMPLOYMENT.search(bare_user):
             await _deliver_dialog_answer(chat_id, employment_reply(facts.get("language")))
             return
-        price_answer = deferred_price_reply(facts, bare_user)
+        price_answer = None if student_support else deferred_price_reply(facts, bare_user)
         if price_answer:
             await _deliver_dialog_answer(chat_id, price_answer)
             return
@@ -3343,7 +3517,7 @@ async def _process_dialog(chat_id):
         # A known age restriction and requests for other clubs do not need a
         # paid model call and must never create a lead or start a sales loop.
         age_reason = closure_reason(facts=facts)
-        if age_reason == "under_age" and re.search(
+        if age_reason == "under_age" and not student_support and re.search(
                 r'\d|почти|попробуем|попробовать|байқап|көрейік', bare_user, re.I):
             answer = ("Біз балаларды 5 жастан бастап қабылдаймыз. Балаңыз 5 жасқа толғанда хабарласа аласыз."
                       if facts.get("language") == "kk" else
@@ -3371,7 +3545,7 @@ async def _process_dialog(chat_id):
             chat_history[chat_id].append({"role": "system", "content": _NAME_GUARD_DIRECTIVE})
 
         # Действующий ученик + вопрос, который должен закрыть человек → жёстко требуем tool-call.
-        if chat_id in known_users and _client_needs_human(user_text):
+        if student_support and _client_needs_human(user_text):
             _cb_guard_present = any(
                 isinstance(m, dict) and m.get("role") == "system"
                 and m.get("content") == _CALLBACK_FORCE_DIRECTIVE
@@ -3392,8 +3566,8 @@ async def _process_dialog(chat_id):
                     "После отказа или «посоветуюсь» не задавай вопросов. "
                     "Язык ответа: " + ("казахский" if facts.get("language") == "kk" else "русский") +
                     ". Имена сохраняй точно. Разряд подтверждает опыт, выбранный филиал — формат. " +
-                    qualification_directive(facts)}],
-                tools=tools,
+                    _student_dialog_directive(chat_id)}],
+                tools=[t for t in tools if not student_support or t["function"]["name"] != "register_client_request"],
                 tool_choice="auto",
                 temperature=0.2
             )
@@ -3443,6 +3617,11 @@ async def _process_dialog(chat_id):
                         continue
 
                     if tool.function.name == "register_client_request":
+                        if student_support:
+                            result_text = "РЕЖИМ ПОДДЕРЖКИ: новую заявку не создавать. Ответь на вопрос ученика; при необходимости request_manager_callback."
+                            chat_history[chat_id].append({"role": "tool", "tool_call_id": tool.id,
+                                                        "name": tool.function.name, "content": result_text})
+                            continue
                         if DEFER.search(bare_user) or closure_reason(facts=facts) == "under_age":
                             result_text = (
                                 "СИСТЕМНОЕ: Заявку не создавать: клиент отложил решение или младше 5 лет. "
@@ -3570,7 +3749,7 @@ async def _process_dialog(chat_id):
                             "При успешной заявке подтверди её и укажи имя/контакт управляющего из результата функции. Язык: " +
                             ("казахский" if facts.get("language") == "kk" else "русский") +
                             ". На казахском используй «өтінішіңізді рәсімдедім» только при успешной регистрации. " +
-                            qualification_directive(facts)}],
+                            _student_dialog_directive(chat_id)}],
                         temperature=0.2,
                     )
                     bot_answer = final.choices[0].message.content
@@ -3584,13 +3763,16 @@ async def _process_dialog(chat_id):
             if EXTERNAL_OUTPUT.search(bot_answer or ""):
                 bot_answer = external_reply(facts.get("language"))
                 _block_followup(chat_id, "external_recommendation_blocked")
-            if (bot_answer and chat_id not in known_users and not lead_registered_this_turn
+            if (bot_answer and not student_support and not lead_registered_this_turn
                     and not callback_sent_this_turn and not DEFER.search(bare_user)
                     and not closure_reason(bare_user, bot_answer, facts)):
                 bot_answer = guard_student_options(bot_answer, facts, bare_user)
+            if student_support and SUPPORT_SALES_REPLY.search(bot_answer or "") and not PRICE_QUESTION.search(bare_user):
+                bot_answer = _student_support_fallback(chat_id)
             original_answer = sanitize_bot_outgoing(bot_answer)
             sanitized_answer = remove_answered_questions(original_answer, facts)
             if (sanitized_answer != original_answer and not has_question(sanitized_answer)
+                    and not student_support
                     and not _chat_looks_followup_closed(chat_id)
                     and not closure_reason(bare_user, original_answer, facts)):
                 kazakh = facts.get("language") == "kk"
@@ -3618,7 +3800,7 @@ async def _process_dialog(chat_id):
                 not lead_registered_this_turn
                 and not callback_sent_this_turn
                 and not callback_attempted_this_turn
-                and chat_id in known_users
+                and student_support
                 and (
                     _client_needs_human(user_text)
                     or _bot_promises_manager(sanitized_answer or "")
@@ -3641,6 +3823,7 @@ async def _process_dialog(chat_id):
                 and chat_id not in session_registered_leads
             ):
                 sanitized_answer = (
+                    _student_support_fallback(chat_id) if student_support else
                     "Өтініштің рәсімделгені әлі расталмады. Қай филиалға жазылғыңыз келеді?"
                     if facts.get("language") == "kk" else
                     "Оформление заявки пока не подтверждено. Уточните, пожалуйста, в какой филиал хотите записаться?"
@@ -5030,7 +5213,7 @@ def _chat_looks_followup_closed(chat_id: str) -> bool:
         or chat_id in followup_blocked
         or chat_id in handoff_completed
         or chat_id in session_registered_leads
-        or chat_id in known_users
+        or _student_support(chat_id)
         or chat_id in crm_notify_recent
     ):
         return True
@@ -5099,7 +5282,7 @@ async def _followup_tick() -> None:
         # Действующий ученик, уже завершённая или оформленная заявка — снимаем.
         if (
             chat_id in followup_blocked
-            or chat_id in known_users
+            or _student_support(chat_id)
             or chat_id in handoff_completed
             or chat_id in session_registered_leads
             or chat_id in crm_notify_recent

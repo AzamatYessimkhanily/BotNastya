@@ -3,7 +3,7 @@ import json
 from contextlib import closing
 import re
 import sqlite3
-from dialog_policy import detect_language, chess_rank
+from dialog_policy import detect_language, chess_rank, reports_existing_student
 
 
 def save_snapshot(path, chat_id, payload):
@@ -81,6 +81,8 @@ def update_facts(facts, text, *, last_question=''):
     """Only client statements; never extract facts from the bot's offered options."""
     low = text.lower().replace('ё', 'е')
     facts['language'] = detect_language(text, facts.get('language', 'ru'))
+    if reports_existing_student(text):
+        facts['student_reported'] = True
     audience = 'ребёнок' if re.search(CHILD, low) else 'для себя' if SELF_REQUEST.search(low) else None
     if audience and audience != facts.get('audience'):
         if facts.get('audience'):

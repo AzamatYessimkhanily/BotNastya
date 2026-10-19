@@ -1,5 +1,6 @@
 """Screenshot regressions and accounting/report delivery checks; no network."""
 import asyncio
+import httpx
 from datetime import date, datetime, timedelta
 from pathlib import Path
 import tempfile
@@ -11,7 +12,7 @@ from unittest.mock import AsyncMock, patch
 import test_reliability as reliability
 from test_reliability import bot, completion, tool
 from conversation_memory import update_facts, STOP_CONTACT
-from dialog_policy import detect_language, closure_reason, polish_kazakh
+from dialog_policy import detect_language, closure_reason, polish_kazakh, reports_existing_student
 from usage_reporting import UsageLedger, TZ
 
 
@@ -335,6 +336,229 @@ class IncidentTests(unittest.IsolatedAsyncioTestCase):
             await bot._daily_report_tick(now)
             await bot._daily_report_tick(now)
         self.assertEqual(self.send.await_count, 2)
+
+
+class StudentSupportTests(unittest.IsolatedAsyncioTestCase):
+    enterContext = reliability.ReliabilityTests.enterContext
+    setUp = reliability.ReliabilityTests.setUp
+    asyncTearDown = reliability.ReliabilityTests.asyncTearDown
+    queue = reliability.ReliabilityTests.queue
+
+    def remember_student(self):
+        bot.known_users[self.chat] = {'id': 42, 'name': 'Тест Ученик', 'phone': '77001234567', 'clientStateId': 5}
+        bot.client_dossiers[self.chat] = {'id': 42, 'name': 'Тест Ученик', 'filial_id': 42763,
+                                        'schedule': 'Устаревшее расписание', 'balance': 12345}
+        bot.crm_lookup_state[self.chat] = {'status': 'found', 'checked_at': time.time() - bot.SESSION_TIMEOUT - 1}
+
+    def test_self_report_does_not_match_prospective_or_former_students(self):
+        for text in ('Наш ребенок обучается у Вас', 'Мы у вас учимся', 'Мы ходим к вам',
+                     'Ребёнок занимается у вас', 'Мы ваши ученики', 'Балам сізде оқиды', 'Біз сіздерде оқимыз'):
+            self.assertTrue(reports_existing_student(text), text)
+        for text in ('Мы ещё не учимся у вас', 'Мы не у вас учимся', 'Хотим у вас учиться',
+                     'У вас можно учиться?', 'Раньше занимались у вас', 'Балам сізде оқымайды'):
+            self.assertFalse(reports_existing_student(text), text)
+
+    async def test_expired_identity_survives_restart_and_crm_outage(self):
+        self.remember_student()
+        bot.last_activity[self.chat] = time.time() - bot.SESSION_TIMEOUT - 1
+        bot._save_conversation(self.chat)
+        for state in (bot.known_users, bot.client_dossiers, bot.crm_lookup_state, bot.chat_history):
+            state.clear()
+        await bot._load_conversations()
+        self.lookup.side_effect = bot.CRMUnavailable('auth')
+        self.queue('Здравствуйте')
+        await bot.process_dialog(self.chat)
+        self.assertIn('по вашим занятиям', self.send.call_args.args[1])
+        self.assertEqual(bot.client_dossiers[self.chat]['id'], 42)
+        self.assertTrue(bot._student_support(self.chat))
+        self.assertIn(self.chat, bot.followup_blocked)
+        self.ai.assert_not_awaited()
+        directive = bot._student_dialog_directive(self.chat)
+        self.assertNotIn('Устаревшее расписание', directive)
+        self.assertNotIn('12345', directive)
+
+    async def test_old_crm_notice_screenshot_survives_timeout(self):
+        bot.record_crm_notification_in_history(self.chat, 'Ученик не пришёл на урок. Свяжитесь с тренером.')
+        bot.crm_notify_recent[self.chat] = time.time() - 7 * 86400
+        bot.last_activity[self.chat] = time.time() - 7 * 86400
+        self.lookup.side_effect = bot.CRMUnavailable('auth')
+        for text in ('Здравствуйте', 'Можно номер и имя тренера', 'Наш ребенок обучается у Вас', 'Тест Ученик, 9 лет'):
+            self.queue(text)
+            await bot.process_dialog(self.chat)
+        self.ai.assert_not_awaited()
+        self.lookup.assert_awaited_once()  # outage backoff
+        for call in self.send.call_args_list:
+            self.assertNotRegex(call.args[1].lower(), r'возраст|сколько лет|35 000|для кого|записаться')
+        self.assertIn('филиале вы занимаетесь', self.send.call_args.args[1])
+
+    async def test_trainer_request_from_unknown_phone_never_starts_sales(self):
+        self.queue('Можно номер и имя тренера')
+        await bot.process_dialog(self.chat)
+        self.assertIn('филиале вы занимаетесь', self.send.call_args.args[1])
+        self.assertNotIn(self.chat, bot.known_users)
+        self.ai.assert_not_awaited()
+
+    async def test_self_report_from_other_phone_is_persisted_without_binding_identity(self):
+        self.queue('Наш ребенок обучается у Вас')
+        await bot.process_dialog(self.chat)
+        bot.conversation_facts.clear()
+        await bot._load_conversations()
+        self.assertTrue(bot._student_support(self.chat))
+        self.assertNotIn(self.chat, bot.known_users)
+        self.assertNotIn(self.chat, bot.client_dossiers)
+        self.assertTrue(bot._chat_looks_followup_closed(self.chat))
+
+    async def test_sales_reply_and_registration_tool_are_blocked_for_support(self):
+        bot.conversation_facts[self.chat] = {'student_reported': True, 'language': 'ru'}
+        self.ai.side_effect = [completion(calls=[tool('register_client_request', {'preference': 'Камал'})]),
+                               completion('Сколько лет вашему ребёнку?')]
+        with patch.object(bot.crm, 'create_lead', AsyncMock()) as create:
+            self.queue('Вопрос по оплате')
+            await bot.process_dialog(self.chat)
+            create.assert_not_awaited()
+        self.assertNotIn('Сколько лет', self.send.call_args.args[1])
+        request = self.ai.call_args_list[0].kwargs
+        self.assertEqual([t['function']['name'] for t in request['tools']], ['request_manager_callback'])
+        for call in self.ai.call_args_list:
+            self.assertIn('РЕЖИМ ПОДДЕРЖКИ', call.kwargs['messages'][-1]['content'])
+            self.assertNotIn('Предлагай детские группы', call.kwargs['messages'][-1]['content'])
+
+    async def test_verified_trainer_is_returned_without_ai(self):
+        self.remember_student()
+        self.lookup.side_effect = bot.CRMUnavailable('auth')
+        with patch.object(bot.crm, 'get_student_trainers', AsyncMock(return_value=[
+                {'name': 'Тест Тренер', 'phone': '77000000001'}])) as trainers:
+            self.queue('Можно номер и имя тренера')
+            await bot.process_dialog(self.chat)
+            trainers.assert_awaited_once_with(42)
+        self.assertIn('Тест Тренер — 77000000001', self.send.call_args.args[1])
+        self.ai.assert_not_awaited()
+
+    async def test_trainer_outage_offers_verified_branch_manager(self):
+        self.remember_student()
+        self.lookup.side_effect = bot.CRMUnavailable('auth')
+        with patch.object(bot.crm, 'get_student_trainers', AsyncMock(side_effect=bot.CRMUnavailable('auth'))):
+            self.queue('Можно номер и имя тренера')
+            await bot.process_dialog(self.chat)
+        answer = self.send.call_args.args[1]
+        self.assertIn(bot.BRANCH_PHONES[42763], answer)
+        self.assertIn('управляющий', answer)
+        self.assertNotIn('свяжется', answer)
+
+    async def test_new_lead_status_is_not_current_student(self):
+        self.lookup.return_value = {'user': {'id': 42, 'clientStateId': 99}, 'dossier': {'id': 42}}
+        self.ai.side_effect = [completion('Для ребёнка или для себя?')]
+        with patch.object(bot.crm, '_get_client_state_id', AsyncMock(return_value=5)):
+            self.queue('Хочу записаться')
+            await bot.process_dialog(self.chat)
+        self.assertFalse(bot._student_support(self.chat))
+        self.assertEqual(bot.crm_lookup_state[self.chat]['status'], 'not_student')
+        self.ai.assert_awaited_once()
+
+    async def test_fresh_inactive_status_replaces_cached_student_after_restart(self):
+        self.remember_student()
+        bot.crm_notify_recent[self.chat] = time.time() - 7 * 86400
+        self.lookup.return_value = {'user': {'id': 42, 'clientStateId': 99}, 'dossier': {'id': 42}}
+        with patch.object(bot.crm, '_get_client_state_id', AsyncMock(return_value=5)):
+            await bot._refresh_student_context(self.chat)
+        bot._save_conversation(self.chat)
+        await bot._load_conversations()
+        self.assertFalse(bot._student_support(self.chat))
+
+    async def test_prompt_marker_is_not_a_dossier_and_actual_dossier_reaches_model(self):
+        # The old detector found the marker inside SYSTEM_PROMPT and skipped
+        # injecting the actual matched student's details into the model.
+        self.assertIn('[СИСТЕМНОЕ ДОСЬЕ КЛИЕНТА]', bot.SYSTEM_PROMPT)
+        bot.chat_history[self.chat] = [{'role': 'system', 'content': bot.SYSTEM_PROMPT}]
+        bot._save_conversation(self.chat)
+        await bot._load_conversations()
+        self.assertNotIn(self.chat, bot.known_users)
+        self.lookup.return_value = {
+            'user': {'id': 42, 'name': 'Тест Ученик', 'clientStateId': 5},
+            'dossier': {'id': 42, 'name': 'Тест Ученик', 'filial_id': 42763, 'schedule': 'Свежий урок'}}
+        self.ai.side_effect = [completion('Ваш урок указан в расписании.')]
+        with patch.object(bot.crm, '_get_client_state_id', AsyncMock(return_value=5)):
+            self.queue('Когда следующий урок?')
+            await bot.process_dialog(self.chat)
+        messages = self.ai.call_args.kwargs['messages']
+        self.assertEqual(messages[0]['content'], bot.SYSTEM_PROMPT)
+        self.assertIn('Тест Ученик', messages[-1]['content'])
+        self.assertIn('Свежий урок', messages[-1]['content'])
+        self.assertNotIn('Предлагай детские группы', messages[-1]['content'])
+
+    async def test_phone_lookup_errors_are_not_empty_searches(self):
+        crm = bot.MoyKlassCRM('fake')
+        for status in (403, 429, 500):
+            response = httpx.Response(status, json={}, request=httpx.Request('GET', 'https://example.test/users'))
+            with patch.object(crm, '_get_headers', AsyncMock(return_value={'x-access-token': 'fake'})), \
+                 patch('httpx.AsyncClient.get', AsyncMock(return_value=response)):
+                with self.assertRaises(bot.CRMUnavailable):
+                    await crm.find_user_smart('77001234567')
+        with patch.object(crm, '_get_headers', AsyncMock(return_value=None)):
+            with self.assertRaises(bot.CRMUnavailable):
+                await crm.find_user_smart('77001234567')
+
+    async def test_expired_token_is_refreshed_before_phone_search(self):
+        crm = bot.MoyKlassCRM('fake')
+        user = {'id': 42, 'name': 'Тест', 'phone': '77001234567', 'filials': [42763]}
+        responses = [SimpleNamespace(status_code=401), SimpleNamespace(status_code=200, json=lambda: {'users': [user]})]
+        with patch.object(crm, '_get_headers', AsyncMock(return_value={'x-access-token': 'fake'})) as auth, \
+             patch('httpx.AsyncClient.get', AsyncMock(side_effect=responses)):
+            found = await crm.find_user_smart('77001234567')
+        self.assertEqual(found['dossier']['id'], 42)
+        self.assertEqual(auth.await_count, 2)
+
+    async def test_enrichment_timeout_does_not_discard_saved_identity(self):
+        self.lookup.return_value = {'user': {'id': 42, 'name': 'Тест', 'clientStateId': 5},
+                                    'dossier': {'id': 42, 'name': 'Тест', 'filial_id': 42763}}
+        with patch.object(bot.crm, '_get_client_state_id', AsyncMock(return_value=5)), \
+             patch.object(bot.crm, 'enrich_student_dossier', AsyncMock(side_effect=asyncio.TimeoutError)):
+            await bot._refresh_student_context(self.chat)
+        bot.known_users.clear()
+        bot.client_dossiers.clear()
+        await bot._load_conversations()
+        self.assertEqual(bot.known_users[self.chat]['id'], 42)
+        self.assertEqual(bot.client_dossiers[self.chat]['filial_id'], 42763)
+
+    async def test_unknown_contact_gets_neutral_greeting_during_crm_outage(self):
+        self.lookup.side_effect = bot.CRMUnavailable('auth')
+        self.queue('Здравствуйте')
+        await bot.process_dialog(self.chat)
+        self.assertEqual(self.send.call_args.args[1], 'Здравствуйте! Чем могу помочь?')
+        self.ai.assert_not_awaited()
+
+    async def test_prospect_can_correct_trainer_support_assumption(self):
+        self.queue('Можно номер тренера')
+        await bot.process_dialog(self.chat)
+        self.ai.side_effect = [completion('Занятия для ребёнка или для вас?')]
+        self.queue('Нет, мы ещё не учимся, хотим записаться')
+        await bot.process_dialog(self.chat)
+        self.assertFalse(bot._student_support(self.chat))
+        self.ai.assert_awaited_once()
+
+    async def test_unrelated_phone_is_not_bound(self):
+        crm = bot.MoyKlassCRM('fake')
+        response = SimpleNamespace(status_code=200, json=lambda: {'users': [
+            {'id': 7, 'name': 'Другой', 'phone': '77007654321'}]})
+        with patch.object(crm, '_get_headers', AsyncMock(return_value={'x-access-token': 'fake'})), \
+             patch('httpx.AsyncClient.get', AsyncMock(return_value=response)):
+            self.assertIsNone(await crm.find_user_smart('77001234567'))
+
+    async def test_trainer_lookup_excludes_another_students_records(self):
+        crm = bot.MoyKlassCRM('fake')
+        today = datetime.now(TZ).date().isoformat()
+        records = {'lessonRecords': [
+            {'userId': 42, 'lesson': {'date': today, 'teacherIds': [10]}},
+            {'userId': 99, 'lesson': {'date': today, 'teacherIds': [20]}},
+            {'userId': 42, 'lesson': {'date': '2000-01-01', 'teacherIds': [20]}}]}
+        managers = [{'id': 10, 'name': 'Верный', 'phone': '77000000001'},
+                    {'id': 20, 'name': 'Чужой', 'phone': '77000000002'}]
+        responses = [httpx.Response(200, json=value, request=httpx.Request('GET', 'https://example.test'))
+                     for value in (records, managers)]
+        with patch.object(crm, '_get_headers', AsyncMock(return_value={'x-access-token': 'fake'})), \
+             patch('httpx.AsyncClient.get', AsyncMock(side_effect=responses)):
+            found = await crm.get_student_trainers(42)
+        self.assertEqual(found, [{'name': 'Верный', 'phone': '77000000001'}])
 
 
 class LedgerTests(unittest.TestCase):

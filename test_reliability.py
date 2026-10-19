@@ -47,7 +47,7 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.send = self.enterContext(patch.object(bot, 'send_whatsapp', AsyncMock(return_value=True)))
         self.hydrate = self.enterContext(patch.object(bot, '_hydrate_chat_history', AsyncMock()))
         self.lookup = self.enterContext(patch.object(bot.crm, 'find_user_smart', AsyncMock(return_value=None)))
-        for name in ('chat_history', 'message_buffers', 'known_users', 'client_dossiers', 'last_activity',
+        for name in ('chat_history', 'message_buffers', 'known_users', 'client_dossiers', 'crm_lookup_state', 'last_activity',
                      'followups', 'pending_answers', 'handoff_completed', 'session_manager_notified', 'seen_incoming_ids',
                      'crm_notify_recent', 'conversation_facts', 'incoming_versions', 'incoming_pending', 'latest_incoming_timestamps', '_dialog_locks', '_incoming_locks', '_wa_last_chat_ts'):
             getattr(bot, name).clear()
