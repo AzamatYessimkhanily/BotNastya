@@ -9,10 +9,10 @@ cd "$ROOT"
 REVISION="$(git rev-parse HEAD)"
 MODEL="${DEPLOY_OPENAI_MODEL:-}"
 [[ "$MODEL" =~ ^[a-zA-Z0-9._-]*$ ]] || { echo 'Unsupported model name'; exit 1; }
-FILES=(bot.py attendance_monitor.py runtime_state.py conversation_memory.py dialog_policy.py usage_reporting.py test_pre_deploy_smoke.py test_reliability.py test_conversation.py test_debt_notifications.py test_incidents.py)
+FILES=(bot.py attendance_monitor.py runtime_state.py conversation_memory.py dialog_policy.py usage_reporting.py campaigns.py campaign_import.py manage_campaigns.py campaign_gm_intellect.json test_pre_deploy_smoke.py test_reliability.py test_conversation.py test_debt_notifications.py test_incidents.py test_branch_routing.py test_campaigns.py)
 ARCHIVE="$(mktemp "${TMPDIR:-/tmp}/botnastya-release.XXXXXX")"
 trap 'rm -f "$ARCHIVE"' EXIT
-tar -czf "$ARCHIVE" "${FILES[@]}"
+COPYFILE_DISABLE=1 tar -czf "$ARCHIVE" "${FILES[@]}"
 REVISION="$REVISION-$(shasum -a 256 "$ARCHIVE" | cut -c1-12)"
 STAGE="$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" 'mktemp -d /tmp/botnastya-release.XXXXXXXX')"
 [[ "$STAGE" =~ ^/tmp/botnastya-release\.[a-zA-Z0-9]+$ ]] || exit 1
@@ -24,12 +24,16 @@ STAGE="$2"
 REVISION="$3"
 MODEL="${4:-}"
 PYTHON="$REMOTE/venv/bin/python3"
-FILES=(bot.py attendance_monitor.py runtime_state.py conversation_memory.py dialog_policy.py usage_reporting.py test_pre_deploy_smoke.py test_reliability.py test_conversation.py test_debt_notifications.py test_incidents.py)
+FILES=(bot.py attendance_monitor.py runtime_state.py conversation_memory.py dialog_policy.py usage_reporting.py campaigns.py campaign_import.py manage_campaigns.py campaign_gm_intellect.json test_pre_deploy_smoke.py test_reliability.py test_conversation.py test_debt_notifications.py test_incidents.py test_branch_routing.py test_campaigns.py)
 cd "$STAGE"
 tar -xzf release.tar.gz
-"$PYTHON" -m py_compile "${FILES[@]}"
+PY_FILES=()
+for file in "${FILES[@]}"; do
+    if [[ "$file" == *.py ]]; then PY_FILES+=("$file"); fi
+done
+"$PYTHON" -m py_compile "${PY_FILES[@]}"
 "$PYTHON" test_pre_deploy_smoke.py > smoke.log 2>&1 || { cat smoke.log; exit 1; }
-"$PYTHON" -m unittest -v test_reliability test_conversation test_debt_notifications test_incidents > reliability.log 2>&1 || { cat reliability.log; exit 1; }
+"$PYTHON" -m unittest -v test_reliability test_conversation test_debt_notifications test_incidents test_branch_routing test_campaigns > reliability.log 2>&1 || { cat reliability.log; exit 1; }
 tail -n 2 smoke.log
 tail -n 4 reliability.log
 

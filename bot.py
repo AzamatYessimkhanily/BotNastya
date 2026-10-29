@@ -13,6 +13,7 @@ from collections import defaultdict, deque
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional
+from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
@@ -21,8 +22,10 @@ from dialog_policy import (LANGUAGE_POLICY, closure_reason, DEFER, EMPLOYMENT, E
                            EXTERNAL_OUTPUT, VISIT_NOW, PRICE_QUESTION, external_reply, employment_reply,
                            deferred_price_reply, confirmed_handoff, polish_kazakh,
                            qualification_directive, guard_student_options,
-                           reports_existing_student, TRAINER_CONTACT, SUPPORT_SALES_REPLY)
+                           reports_existing_student, TRAINER_CONTACT, SUPPORT_SALES_REPLY,
+                           SCHOOL_ADMIN, SCHOOL_59, school_admin_reply, mentioned_courses)
 from usage_reporting import UsageLedger
+from campaigns import CampaignStore, dialog_context as campaign_dialog_context
 
 # --- 1. НАСТРОЙКИ ---
 load_dotenv()
@@ -47,6 +50,8 @@ USAGE_STATE_FILE = os.getenv("USAGE_STATE_FILE", "usage_state.sqlite3")
 DAILY_REPORT_PHONE = os.getenv("DAILY_REPORT_PHONE", "+77779559999")
 DAILY_REPORT_ENABLED = os.getenv("DAILY_REPORT_ENABLED", "1").lower() in ("1", "true", "yes", "on")
 DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "9"))
+CAMPAIGNS_ENABLED = os.getenv("CAMPAIGNS_ENABLED", "0").lower() in ("1", "true", "yes")
+CAMPAIGN_STATE_FILE = os.getenv("CAMPAIGN_STATE_FILE", "campaigns.sqlite3")
 if not 0 <= DAILY_REPORT_HOUR <= 23:
     raise ValueError("DAILY_REPORT_HOUR must be 0..23")
 MOYKLASS_API_KEY = os.getenv("MOYKLASS_API_KEY")
@@ -138,12 +143,7 @@ _SCHOOL_TZ = ZoneInfo("Asia/Almaty")
 # По умолчанию ВЫКЛ в коде; на сервере включаем ATTENDANCE_MONITOR_ENABLED=1 + тест-номер.
 import attendance_monitor as _attendance_monitor  # noqa: E402
 
-# Контакт Quantum STEM: при необходимости переопределить через QUANTUM_MANAGER_PHONE / QUANTUM_MANAGER_NAME в .env
-QUANTUM_MANAGER_NAME = os.getenv("QUANTUM_MANAGER_NAME", "Запись на кружки школы")
-QUANTUM_MANAGER_PHONE = os.getenv("QUANTUM_MANAGER_PHONE", "+7 708 809 9840")
-_QUANTUM_CONTACT_LINE = (
-    f"GM Legends Quantum STEM School: {QUANTUM_MANAGER_NAME} — {QUANTUM_MANAGER_PHONE}"
-)
+_QUANTUM_CONTACT_LINE = "Quantum STEM School: запись через администрацию школы."
 
 BUFFER_DELAY = max(1.0, float(os.getenv("BUFFER_DELAY", "8")))
 MOYKLASS_BASE_URL = "https://api.moyklass.com/v1/company"
@@ -152,8 +152,8 @@ MOYKLASS_HTTP_TIMEOUT = 30.0
 ACTIVE_JOIN_STATUS_ID = 2
 _CLIENT_STATE_ID_ENV = os.getenv("MOYKLASS_CLIENT_STATE_ID", "").strip()
 MOYKLASS_CLIENT_STATE_ID = int(_CLIENT_STATE_ID_ENV) if _CLIENT_STATE_ID_ENV.isdigit() else None
-LEAD_CLASS_ID = int(os.getenv("LEAD_CLASS_ID", "341820"))
-MANAGER_ID = int(os.getenv("MANAGER_ID", "98753"))
+# Leads are user cards and tasks, not enrollment in a shared teaching group.
+# The legacy LEAD_CLASS_ID belonged to Arkada and contaminated other branches.
 SESSION_TIMEOUT = 5 * 60 * 60
 
 # --- Авто-реактивация «спящих» лидов ---
@@ -173,13 +173,6 @@ FOLLOWUP_MESSAGE = os.getenv("FOLLOWUP_MESSAGE", "").strip() or (
     "Подскажите, нужна ли ещё помощь с выбором занятий?"
 )
 
-# Опциональный statusId для POST /joins. Если не задан — поле не отправляем,
-# MoyKlass сам подставит дефолтный начальный статус. Раньше было хардкод 1,
-# но в этом кабинете statusId=1 стал «end status» (Закрыт/Архив),
-# и MoyKlass отвечает 400 "Status cant be in end statuses".
-_LEAD_STATUS_ID_ENV = os.getenv("LEAD_STATUS_ID", "").strip()
-LEAD_STATUS_ID = int(_LEAD_STATUS_ID_ENV) if _LEAD_STATUS_ID_ENV.isdigit() else None
-
 BRANCH_PHONES = {
     37754: "+7 778 104 8197",       # GMCA Аркада (Аяулым Жумажановна)
     42763: "+7 778 104 8127",       # GMCA Камал (Шолпан Жолдыбаевна)
@@ -189,10 +182,7 @@ BRANCH_PHONES = {
     47033: "+7 771 231 4549",       # Riviera (Томирис)
     54675: "+7 775 254 2671",       # Бокейхан (Айгерим)
     54674: "+7 775 254 2671",       # Байтурсынов (Айгерим)
-    "harmony": "+7 778 200 2088",   # Harmony (Адиль мырза)
     60426: "+7 775 254 2671",       # Steppe/МША (Айгерим)
-    "ngs": "+7 771 857 5505",       # NGS (Ясмин)
-    "quantum": QUANTUM_MANAGER_PHONE,  # Quantum (из .env)
     "рфмш": "+7 771 231 4549",     # РФМШ (Томирис)
     50847: "+7 775 254 2671",       # Онлайн (Айгерим)
     "online": "+7 775 254 2671",    # Онлайн (Айгерим)
@@ -210,12 +200,6 @@ BRANCH_MANAGERS = {
     54674: ("Айгерим Аманжолқызы", "+7 775 254 2671"),
     60426: ("Айгерим Аманжолқызы", "+7 775 254 2671"),
     50847: ("Айгерим Аманжолқызы", "+7 775 254 2671"),
-    "harmony": ("Адиль мырза", "+7 778 200 2088"),
-    "хармони": ("Адиль мырза", "+7 778 200 2088"),
-    "ngs": ("Ясмин", "+7 771 857 5505"),
-    "энджиес": ("Ясмин", "+7 771 857 5505"),
-    "quantum": (QUANTUM_MANAGER_NAME, QUANTUM_MANAGER_PHONE),
-    "квантум": (QUANTUM_MANAGER_NAME, QUANTUM_MANAGER_PHONE),
     "рфмш": ("Томирис Ержанқызы", "+7 771 231 4549"),
     "online": ("Айгерим Аманжолқызы", "+7 775 254 2671"),
     # Без филиала — никому. Ключ default намеренно отсутствует.
@@ -243,6 +227,8 @@ def _new_lead_recipients(filial_id, matched_key: Optional[str] = None) -> List[t
     Филиал не определён / id нет в карте → никому (пустой список).
     НИКОГДА не шлём «общему» номеру и не шлём всем админам сразу.
     """
+    if SCHOOL_ADMIN.search(matched_key or ""):
+        return []
     if matched_key and matched_key in BRANCH_MANAGERS:
         return [BRANCH_MANAGERS[matched_key]]
     if filial_id is not None and filial_id in BRANCH_MANAGERS:
@@ -256,6 +242,15 @@ def _callback_recipients(filial_id, matched_key: Optional[str] = None) -> List[t
     Филиал известен → его управляющий; иначе → никому.
     """
     return _new_lead_recipients(filial_id, matched_key)
+
+
+def _primary_filial(user: dict):
+    """Respect CRM's primary branch; an unordered list isn't a routing choice."""
+    filials = user.get("filials") or []
+    primary = user.get("mainFilialId")
+    if primary in filials:
+        return primary
+    return filials[0] if len(filials) == 1 else None
 
 
 FAILED_LEADS_FILE = os.getenv("FAILED_LEADS_FILE", "failed_leads.jsonl")
@@ -289,18 +284,44 @@ FILIALS_MAP = {
     "бокейхан": 54675, "bokeikhan": 54675, "бокейхана": 54675,
     "мша": 60426, "msha": 60426, "steppe": 60426, "степ": 60426,
     "мугалим": 54672,
-    "harmony": 54672, "хармони": 54672,
-    "ngs": 54672, "энджиес": 54672,
-    "quantum": 54672, "квантум": 54672,
     "рфмш": 54672,
     "лагерь": 51591, "camp": 51591,
     "49а": 61507
 }
 
+SCHOOL_59_FILIAL_ID = int(os.getenv("SCHOOL_59_FILIAL_ID", "0") or "0") or None
+SCHOOL_59_MANAGER_NAME = os.getenv("SCHOOL_59_MANAGER_NAME", "").strip() or "Томирис Ержановна"
+SCHOOL_59_MANAGER_PHONE = os.getenv("SCHOOL_59_MANAGER_PHONE", "").strip() or "+7 771 231 4549"
+BRANCH_MANAGERS["school59"] = (SCHOOL_59_MANAGER_NAME, SCHOOL_59_MANAGER_PHONE)
+BRANCH_PHONES["school59"] = SCHOOL_59_MANAGER_PHONE
+if SCHOOL_59_FILIAL_ID:
+    for alias in ("школа 59", "школа №59", "school 59", "59 мектеп"):
+        FILIALS_MAP[alias] = SCHOOL_59_FILIAL_ID
+    BRANCH_MANAGERS[SCHOOL_59_FILIAL_ID] = BRANCH_MANAGERS["school59"]
+    BRANCH_PHONES[SCHOOL_59_FILIAL_ID] = SCHOOL_59_MANAGER_PHONE
+
 # --- 2. СИСТЕМНЫЙ ПРОМПТ ---
 _SYSTEM_PROMPT_TEMPLATE = """
 Ты — Алия, консультант шахматной академии GMCA и сети шахматных кружков GM Legends в Астане.
 Цель: квалифицировать клиента, найти подходящий формат обучения и либо оформить заявку в CRM, либо дать исчерпывающий ответ и оставить контакт.
+
+АКТУАЛЬНЫЕ НАПРАВЛЕНИЯ И ПРАВИЛА ЗАПИСИ (28.10.2026)
+В GMCA Аркада и GMCA Камал помимо шахмат открыты английский язык и математика.
+В школе №59 также доступны английский язык и математика.
+Заявки школы №59 принимает Томирис Ержановна, +7 771 231 4549. Название в CRM — «Школа номер 59».
+Не объявляй английский и математику доступными в остальных школах или онлайн без подтверждения.
+Для английского/математики выясни курс, возраст, имя и филиал. Не спрашивай шахматный разряд;
+не применяй к ним шахматные ограничения по возрасту, длительности и взрослым.
+Для нескольких курсов сохрани ВСЕ выбранные направления в courses функции register_client_request.
+Если направление не названо и контекст не шахматный, спроси: шахматы, английский или математика?
+
+ИСКЛЮЧЕНИЕ ИЗ ВСЕХ ПРАВИЛ ОБ ОФОРМЛЕНИИ ЗАЯВКИ:
+Harmony, Harmony Global, NGS, Quantum администрируются сотрудниками самих школ.
+Для этих школ не собирай имя/возраст/телефон, не вызывай register_client_request или request_manager_callback,
+не давай прежние контакты наших управляющих и не обещай звонок. Ответ на русском дословно:
+«Для записи на шахматный кружок при данной школе вам необходимо обратиться к администрации школы».
+На казахском дай тот же смысл. На вопросы о стоимости/расписании этих школ направляй в администрацию школы.
+Это правило важнее общих указаний «всегда оформить заявку» ниже.
 
 ═══════════════════════════════════════
 СТИЛЬ ОБЩЕНИЯ — СТРОГО
@@ -524,9 +545,9 @@ GM Legends Binom им. Алтынсарина: Томирис Ержанқызы
 GM Legends Binom им. Кекилбаева: Айгерим Аманжолқызы — +7 775 254 2671
 GM Legends Binom им. Қадыр Мырза Әлі: Айгерим Аманжолқызы — +7 775 254 2671
 GM Legends Riviera International School: Томирис Ержанқызы — +7 771 231 4549
-GM Legends Harmony School: Адиль мырза — +7 778 200 2088
+Harmony и Harmony Global: запись через администрацию школы.
 GM Legends Steppe School / МША: Айгерим Аманжолқызы — +7 775 254 2671
-GM Legends NGS Астана: Ясмин — +7 771 857 5505
+NGS: запись через администрацию школы.
 __QUANTUM_CONTACT_LINE__
 РФМШ: Томирис Ержанқызы — +7 771 231 4549
 Онлайн-обучение: Айгерим Аманжолқызы — +7 775 254 2671
@@ -552,6 +573,8 @@ GM Legends (только для учеников соответствующей 
 📍 Binom им. Қадыр Мырза Әлі (https://go.2gis.com/gKycJ)
 📍 Riviera International School (https://go.2gis.com/cfz56)
 📍 Harmony School
+📍 Harmony Global (запись через администрацию школы)
+📍 Школа №59 (английский и математика)
 📍 International Steppe School of Astana / МША (https://go.2gis.com/hTlBB)
 📍 NGS Астана (https://go.2gis.com/chenD)
 📍 Quantum STEM School (https://go.2gis.com/mwVqn)
@@ -562,6 +585,22 @@ GM Legends (только для учеников соответствующей 
 ═══════════════════════════════════════
 ЦЕНЫ
 ═══════════════════════════════════════
+Новый пакетный прайс GMCA Аркада/Камал (тенге, за весь указанный период):
+• 1 курс — шахматы, математика либо английский: 1 месяц 30 000; 3 месяца 80 000; 6 месяцев 145 000.
+• 2 курса: 1 месяц 55 000; 3 месяца 155 000; 6 месяцев 280 000.
+• 3 курса: 1 месяц 80 000; 3 месяца 220 000; 6 месяцев 405 000.
+Пакет означает количество курсов, не количество посещений в неделю.
+Семейная цена за КАЖДОГО ребёнка в месяц за ОДИН курс: 2 ребёнка — по 25 000; 3 ребёнка — по 20 000.
+Акция «Приведи друга» действует для ПРИГЛАСИВШЕГО: 1 друг — его курс стоит 25 000 за месяц;
+2 друга — 20 000 за месяц за один курс; 3 друга — один месяц в подарок пригласившему.
+Это конечная цена со скидкой, не сумма скидки и не цена для приглашённых друзей.
+Не обещай совмещение акций с пакетами: условия совмещения подтверждает управляющий.
+Эти акции не действуют в BINOM; там сохраняется отдельная семейная скидка 10% ниже.
+Не переноси акции на школу №59 без подтверждения.
+Для продвинутых шахматных групп (3 разряд и выше) действует ДРУГАЯ система скидок:
+администратор филиала рассчитывает её индивидуально. Не применяй к ним этот пакетный прайс
+и семейные/реферальные цены 25 000 / 20 000; базовые шахматные тарифы по разрядам ниже сохраняются.
+
 GMCA (академия), дети, групповые:
 • Новичок / 5 разряд / 4 разряд — 30 000 тг/мес, 3 раза в неделю по 1 ч
 • 3 разряд — 35 000 тг/мес, 3 × 1,5 ч
@@ -572,9 +611,10 @@ GMCA (академия), дети, групповые:
 Онлайн — та же стоимость, что очный GMCA.
 
 GM Legends (школьные кружки; называй только после подтверждения статуса ученика):
-• BINOM им. Қадыр Мырза Әлі (Кадыр Мырза Али), им. Кекилбаева (Кекильбаева) и им. Ы. Алтынсарина — единые тарифы для учеников этих школ: 24 000 тг/мес при занятиях 3 раза в неделю; 18 000 тг/мес при занятиях 2 раза в неделю.
+• Во ВСЕХ BINOM, включая им. Қадыр Мырза Әлі (Кадыр Мырза Али), им. Кекилбаева (Кекильбаева), им. Ы. Алтынсарина, и в школе №59: 24 000 тг/мес при занятиях 3 раза в неделю; 18 000 тг/мес при занятиях 2 раза в неделю.
 • Если в семье обучаются несколько детей в BINOM, скидка 10% предоставляется на КАЖДОГО ребёнка, включая первого: 21 600 тг/мес за каждого при 3 занятиях в неделю или 16 200 тг/мес за каждого при 2 занятиях в неделю.
-• Остальные школы — от 30 000 тг/мес
+• Harmony, Harmony Global, NGS, Quantum: стоимость и запись через администрацию соответствующей школы.
+• Остальные школы, которые ведёт GM Legends, — от 30 000 тг/мес.
 
 Все три перечисленные школы относятся к BINOM. Не применяй к ним тариф «остальные школы — от 30 000» и не называй старую цену «от 20 000». Эти точные тарифы и семейную скидку называй сразу после подтверждения, что ребёнок учится в соответствующей школе; не отправляй к управляющему только для уточнения уже известной цены. Если в истории диалога указана другая цена BINOM, исправь её по этому разделу.
 Различай школьный кружок BINOM и онлайн: указанные тарифы BINOM относятся к школьным кружкам, онлайн — по тарифам GMCA выше. Если клиент спрашивает оба варианта, отдельно укажи стоимость каждого.
@@ -855,6 +895,9 @@ async def _load_conversations():
 
 
 def _stop_contact(chat_id):
+    campaign_store = _campaign_store()
+    if campaign_store:
+        campaign_store.suppress(chat_id.split('@')[0], 'contact_opt_out')
     contact_opt_out.add(chat_id)
     pending_answers.pop(chat_id, None)
     incoming_versions[chat_id] += 1
@@ -1218,16 +1261,14 @@ class MoyKlassCRM:
         """Телефон администратора филиала клиента (BRANCH_PHONES по filial_id).
 
         Для клиентских уведомлений: номер должен быть админа того филиала, где
-        учится клиент. Филиал берём из user.filials; если не нашли — пустая строка
+        учится клиент. Используем mainFilialId или единственный филиал; иначе пустая строка
         (не подставляем «общий» номер тренера/чужого менеджера).
         """
         filial_id = None
         if user_id is not None:
             user = await self.get_user_by_id(int(user_id))
             if user:
-                filials = user.get("filials") or []
-                if filials:
-                    filial_id = filials[0]
+                filial_id = _primary_filial(user)
         return self._pick_manager_phone(filial_id, None)
 
     async def get_client_trainer_phone(
@@ -1330,111 +1371,30 @@ class MoyKlassCRM:
         )
 
     async def _resolve_manager_id(
-        self,
-        client: httpx.AsyncClient,
-        headers: dict,
-        manager_phone: str,
-        manager_name: Optional[str] = None,
-    ) -> int:
-        """Ищет managerId сначала по последним 10 цифрам телефона, затем по
-        имени менеджера (первое слово, регистронезависимо). Это нужно потому,
-        что в MoyKlass телефон у менеджера может быть записан в другом формате
-        или вообще отсутствовать — тогда матчим по имени."""
-        manager_phone_digits = self._digits(manager_phone)
+        self, client: httpx.AsyncClient, headers: dict, manager_phone: str,
+        manager_name: Optional[str] = None, filial_id: Optional[int] = None,
+    ) -> Optional[int]:
+        """Resolve one branch employee; never assign an unrelated default owner."""
         try:
             resp = await client.get(f"{MOYKLASS_BASE_URL}/managers", headers=headers)
-            if resp.status_code != 200:
-                logger.warning(f"_resolve_manager_id: GET /managers -> {resp.status_code}")
-                return MANAGER_ID
-            managers = resp.json() or []
-
-            if manager_phone_digits:
-                tail = manager_phone_digits[-10:]
-                for manager in managers:
-                    for field in ("phone", "mobilePhone", "phoneNumber", "tel"):
-                        candidate = self._digits(str(manager.get(field, "")))
-                        if candidate and (candidate.endswith(tail) or tail.endswith(candidate[-10:])):
-                            logger.info(
-                                f"_resolve_manager_id: матч по телефону — {manager.get('name')!r} id={manager.get('id')}"
-                            )
-                            return manager.get("id", MANAGER_ID)
-
-            if manager_name:
-                first_word = manager_name.strip().split()[0].lower() if manager_name.strip() else ""
-                if first_word:
-                    for manager in managers:
-                        api_name = (manager.get("name") or "").lower()
-                        if first_word and first_word in api_name:
-                            logger.info(
-                                f"_resolve_manager_id: матч по имени {first_word!r} → {manager.get('name')!r} id={manager.get('id')}"
-                            )
-                            return manager.get("id", MANAGER_ID)
-
-            logger.warning(
-                f"_resolve_manager_id: ни телефон {manager_phone!r}, ни имя {manager_name!r} не нашли в /managers — фоллбэк MANAGER_ID={MANAGER_ID}"
-            )
-        except Exception as e:
-            logger.warning(f"Не удалось определить managerId по телефону {manager_phone}: {e}")
-        return MANAGER_ID
-
-    async def _resolve_initial_status_id(
-        self, client: httpx.AsyncClient, headers: dict
-    ) -> Optional[int]:
-        """Авто-определяет statusId начального лида в MoyKlass. Кэширует.
-
-        MoyKlass требует statusId для POST /joins, но конкретные id зависят от
-        настроек кабинета. Дёргаем /userStatuses, выбираем первый, который НЕ
-        помечен как конечный (isEndStatus). Если ничего не вернулось — возвращаем
-        None, дальнейшая логика попробует /joins без statusId / получит свою ошибку.
-        """
-        cached = getattr(self, "_cached_status_id", "unset")
-        if cached != "unset":
-            return cached
-
-        self._cached_status_id = None  # type: ignore[attr-defined]
-        for path in ("/userStatuses", "/joinStatuses"):
-            try:
-                resp = await client.get(f"{MOYKLASS_BASE_URL}{path}", headers=headers)
-                if resp.status_code != 200:
-                    logger.info(f"_resolve_initial_status_id: GET {path} -> {resp.status_code}")
-                    continue
-                data = resp.json()
-                if isinstance(data, list):
-                    statuses = data
-                elif isinstance(data, dict):
-                    statuses = (
-                        data.get("statuses")
-                        or data.get("userStatuses")
-                        or data.get("joinStatuses")
-                        or data.get("items")
-                        or []
-                    )
-                else:
-                    statuses = []
-                if not statuses:
-                    continue
-                logger.info(
-                    "MoyKlass %s: статусы (id, name, isEnd) = %s",
-                    path,
-                    [(s.get("id"), s.get("name"), s.get("isEndStatus") or s.get("isEnd")) for s in statuses[:20]],
-                )
-                bad_name_markers = ("отказ", "архив", "закрыт", "некачеств", "отмен", "удал")
-                for st in statuses:
-                    if st.get("isEndStatus") or st.get("isEnd"):
-                        continue
-                    name = (st.get("name") or "").lower()
-                    if any(m in name for m in bad_name_markers):
-                        continue
-                    sid = st.get("id")
-                    if sid is not None:
-                        self._cached_status_id = int(sid)  # type: ignore[attr-defined]
-                        logger.info(
-                            f"_resolve_initial_status_id: выбран statusId={sid} ({st.get('name')!r})"
-                        )
-                        return self._cached_status_id
-            except Exception as e:
-                logger.warning(f"_resolve_initial_status_id: исключение на {path}: {e}")
-
+            resp.raise_for_status()
+            managers = [m for m in resp.json() if m.get("id") and m.get("isWork", True)
+                        and not m.get("blocked") and filial_id is not None
+                        and (filial_id in (m.get("filials") or []) or 0 in (m.get("filials") or []))]
+            tail = self._digits(manager_phone)[-10:]
+            matches = [m for m in managers if len(tail) == 10 and any(
+                self._phone_tail_matches(m.get(field), tail)
+                for field in ("phone", "mobilePhone", "phoneNumber", "tel"))]
+            if not matches and manager_name:
+                # Patronymics differ in this CRM; a unique first name within the
+                # verified branch is allowed, never a global first-name match.
+                first = manager_name.strip().split()[0].casefold()
+                matches = [m for m in managers if first in (m.get("name") or "").casefold().split()]
+            if len(matches) == 1:
+                return int(matches[0]["id"])
+        except Exception as exc:
+            logger.warning("Manager resolution failed: %s", type(exc).__name__)
+        logger.warning("No unique manager for filial_id=%s", filial_id)
         return None
 
     async def find_user_smart(self, phone):
@@ -1489,7 +1449,7 @@ class MoyKlassCRM:
                             user_id = user['id']
                             logger.info(f"НАЙДЕН КЛИЕНТ: {user['name']} (ID {user_id})")
 
-                            active_filial_id = next(iter(user.get("filials") or []), None)
+                            active_filial_id = _primary_filial(user)
 
                             dossier = {
                                 "id": user_id,
@@ -1931,20 +1891,42 @@ class MoyKlassCRM:
 
         return enriched
 
-    async def create_lead(self, name, phone, age, experience, preference):
+    async def _resolve_school59_filial(self):
+        """Discover the new branch by its confirmed name, never reuse another ID."""
+        global SCHOOL_59_FILIAL_ID
+        if SCHOOL_59_FILIAL_ID:
+            return SCHOOL_59_FILIAL_ID
+        headers = await self._get_headers()
+        if not headers:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=MOYKLASS_HTTP_TIMEOUT) as client:
+                resp = await client.get(f"{MOYKLASS_BASE_URL}/filials", headers=headers)
+                resp.raise_for_status()
+                matches = [f for f in resp.json() if f.get("status") == "active"
+                           and SCHOOL_59.search(f.get("name") or "")]
+                if len(matches) == 1:
+                    SCHOOL_59_FILIAL_ID = int(matches[0]["id"])
+                    BRANCH_MANAGERS[SCHOOL_59_FILIAL_ID] = BRANCH_MANAGERS["school59"]
+                    BRANCH_PHONES[SCHOOL_59_FILIAL_ID] = SCHOOL_59_MANAGER_PHONE
+                    return SCHOOL_59_FILIAL_ID
+        except Exception as exc:
+            logger.warning("School 59 branch lookup failed: %s", type(exc).__name__)
+        return None
+
+    async def create_lead(self, name, phone, age, experience, preference, courses=""):
         clean_phone = re.sub(r"[^\d]", "", phone)
         wa_link = f"https://wa.me/{clean_phone}"
 
-        filial_id = None
-        matched_key = None
-
-        if preference:
-            branch_lower = preference.lower()
-            for key, f_id in FILIALS_MAP.items():
-                if key in branch_lower:
-                    matched_key = key
-                    filial_id = f_id
-                    break
+        if SCHOOL_ADMIN.search(preference or ""):
+            return "СИСТЕМНОЕ: Не оформляй заявку и не обещай звонок. Ответь: " + school_admin_reply()
+        if SCHOOL_59.search(preference or "") and not await self._resolve_school59_filial():
+            _log_failed_lead({"name": name, "phone": clean_phone, "age": age,
+                              "experience": experience, "preference": preference, "courses": courses},
+                             "school59_route_not_configured")
+            return self._handoff_message(SCHOOL_59_MANAGER_NAME, SCHOOL_59_MANAGER_PHONE, success=False)
+        matched_key = _matched_key_from_text(preference)
+        filial_id = _guess_filial_from_text(preference)
 
         logger.info(f"Выбран филиал: {preference!r} -> ID {filial_id}, matched_key={matched_key!r}")
 
@@ -1956,8 +1938,14 @@ class MoyKlassCRM:
                 "Как только клиент назовёт филиал — сразу вызови register_client_request без дополнительных вопросов."
             )
 
+        if (set(mentioned_courses(courses)) & {"английский", "математика"}
+                and filial_id not in {37754, 42763, SCHOOL_59_FILIAL_ID}):
+            return ("СИСТЕМНОЕ: Заявка не оформлена. Английский и математика подтверждены "
+                    "только в Аркаде, Камале и школе №59. Уточни подходящую площадку; "
+                    "не обещай эти направления онлайн или в других школах.")
+
         age_num = self._extract_age_number(age)
-        if age_num is not None and age_num < 5:
+        if age_num is not None and age_num < 5 and (not courses or "шахматы" in mentioned_courses(courses)):
             return (
                 "СИСТЕМНОЕ СООБЩЕНИЕ: ЗАЯВКУ В CRM НЕ СОЗДАВАЙ. "
                 "Причина: ребенку меньше 5 лет. "
@@ -1972,6 +1960,7 @@ class MoyKlassCRM:
             "age": age,
             "experience": experience,
             "preference": preference,
+            "courses": courses,
             "filial_id": filial_id,
             "manager_name": mgr_name,
             "manager_phone": mgr_phone,
@@ -1997,30 +1986,59 @@ class MoyKlassCRM:
             f"Имя: {name}\n"
             f"Телефон: {phone}\n"
             f"Филиал: {preference}\n"
+            f"Курсы: {courses or 'шахматы'}\n"
             f"Возраст: {age}\n"
             f"Опыт: {experience}\n"
             f"WhatsApp: {wa_link}"
         )
 
         async with httpx.AsyncClient(timeout=MOYKLASS_HTTP_TIMEOUT) as client:
-            manager_id = await self._resolve_manager_id(client, headers, mgr_phone, manager_name=mgr_name)
+            manager_id = await self._resolve_manager_id(client, headers, mgr_phone, manager_name=mgr_name, filial_id=filial_id)
             logger.info(f"create_lead: manager_id={manager_id}, manager_phone={mgr_phone}, manager_name={mgr_name!r}")
 
+            if manager_id is None:
+                _log_failed_lead(lead_payload, "branch_manager_unresolved")
+                return self._handoff_message(mgr_name, mgr_phone, success=False)
+
             user_id = None
-            user_created_in_this_call = False
             found_data = await self.find_user_smart(clean_phone)
 
             if found_data:
                 user_id = found_data["user"]["id"]
                 logger.info(f"create_lead: найден существующий пользователь id={user_id}")
+                # Re-read before patching: preserve legitimate existing branches
+                # and responsible employees; never infer a transfer from a lead.
+                try:
+                    current_resp = await client.get(f"{MOYKLASS_BASE_URL}/users/{user_id}", headers=headers)
+                    current_resp.raise_for_status()
+                    current = current_resp.json()
+                    if current.get("id") != user_id or not self._phone_tail_matches(current.get("phone"), clean_phone[-10:]):
+                        raise ValueError("CRM identity mismatch")
+                    filials = current.get("filials") or []
+                    responsible = current.get("responsibles") or []
+                    patch = {}
+                    if filial_id not in filials:
+                        patch["filials"] = list(dict.fromkeys(filials + [filial_id]))
+                    if manager_id not in responsible:
+                        patch["responsibles"] = list(dict.fromkeys(responsible + [manager_id]))
+                    if patch:
+                        updated = await client.patch(f"{MOYKLASS_BASE_URL}/users/{user_id}", headers=headers, json=patch)
+                        updated.raise_for_status()
+                except Exception as exc:
+                    _log_failed_lead(lead_payload, "existing_user_branch_update_failed")
+                    logger.warning("Existing user routing failed: %s", type(exc).__name__)
+                    return self._handoff_message(mgr_name, mgr_phone, success=False)
                 try:
                     comment_resp = await client.post(
                         f"{MOYKLASS_BASE_URL}/userComments", headers=headers,
                         json={"userId": user_id, "comment": full_text}
                     )
+                    comment_resp.raise_for_status()
                     logger.info(f"create_lead: userComments -> {comment_resp.status_code}")
                 except Exception as e:
                     logger.warning(f"create_lead: userComments исключение: {e}")
+                    _log_failed_lead(lead_payload, "existing_user_comment_failed")
+                    return self._handoff_message(mgr_name, mgr_phone, success=False)
             else:
                 payload = {
                     "name": name,
@@ -2030,6 +2048,7 @@ class MoyKlassCRM:
                 }
                 if filial_id:
                     payload["filials"] = [filial_id]
+                    payload["mainFilialId"] = filial_id
 
                 logger.info(f"create_lead: создаём нового пользователя payload={payload}")
                 try:
@@ -2043,7 +2062,7 @@ class MoyKlassCRM:
                     # помечаем dedup, чтобы lead-poll не продублировал на fallback.
                     await self.notify_new_lead_managers(
                         filial_id, matched_key, name=name, phone=clean_phone,
-                        age=age, experience=experience, preference=preference, wa_link=wa_link,
+                        age=age, experience=experience, preference=preference, wa_link=wa_link, courses=courses,
                     )
                     try:
                         maybe = await self.find_user_smart(clean_phone)
@@ -2061,7 +2080,6 @@ class MoyKlassCRM:
                         _log_failed_lead({**lead_payload, "stage": "users_post_parse", "body": create_resp.text[:500]}, "users_post_parse")
                         return self._handoff_message(mgr_name, mgr_phone, success=False)
 
-                    user_created_in_this_call = True
                     logger.info(
                         "create_lead: POST /users создал клиента id=%s. MoyKlass автоматически "
                         "ставит начальный clientStateId — лид уже виден в CRM в категории 'Новый лид'.",
@@ -2073,8 +2091,10 @@ class MoyKlassCRM:
                             f"{MOYKLASS_BASE_URL}/userComments", headers=headers,
                             json={"userId": user_id, "comment": full_text}
                         )
+                        comment_resp.raise_for_status()
                         logger.info(f"create_lead: userComments -> {comment_resp.status_code}")
                     except Exception as e:
+                        _log_failed_lead({**lead_payload, "user_id": user_id}, "new_user_comment_failed")
                         logger.warning(f"create_lead: userComments исключение: {e}")
                 else:
                     logger.error(f"create_lead: не удалось создать пользователя: {create_resp.status_code} {create_resp.text}")
@@ -2089,60 +2109,9 @@ class MoyKlassCRM:
                 _log_failed_lead({**lead_payload, "stage": "no_user_id"}, "no_user_id")
                 return self._handoff_message(mgr_name, mgr_phone, success=False)
 
-            # statusId: 1) если задан LEAD_STATUS_ID — используем его;
-            #           2) иначе авто-детект через /userStatuses;
-            #           3) если не нашли — не отправляем, _post_join_with_retry
-            #              сам разрулит «end statuses» / «required» через retry.
-            resolved_status_id = LEAD_STATUS_ID
-            if resolved_status_id is None:
-                resolved_status_id = await self._resolve_initial_status_id(client, headers)
-
-            join_payload = {
-                "userId": user_id,
-                "classId": LEAD_CLASS_ID,
-                "comment": full_text,
-                "managerId": manager_id,
-            }
-            if filial_id:
-                join_payload["filialId"] = filial_id
-            if resolved_status_id is not None:
-                join_payload["statusId"] = resolved_status_id
-
-            logger.info(f"create_lead: POST /joins payload={join_payload}")
-            join_resp = await self._post_join_with_retry(client, headers, join_payload)
-
-            if join_resp is None or join_resp.status_code not in [200, 201]:
-                status_code = getattr(join_resp, "status_code", None)
-                body = getattr(join_resp, "text", "") or ""
-                # Если /users в этом же вызове создал нового клиента — лид уже
-                # есть в CRM (MoyKlass проставил начальный clientStateId, лид
-                # виден в категории «Новый лид»). /joins добавляет привязку к
-                # классу, но это бонус, а не сам факт лида. Не падаем клиенту.
-                if user_created_in_this_call:
-                    logger.warning(
-                        "create_lead: /joins не удался (%s: %s), но клиент уже создан через /users "
-                        "и виден как лид в MoyKlass. Считаю заявку успешной.",
-                        status_code, body[:300],
-                    )
-                    _log_failed_lead(
-                        {**lead_payload, "stage": "joins_post_after_users_ok", "user_id": user_id,
-                         "status": status_code, "body": body[:500]},
-                        "joins_failed_but_lead_created",
-                    )
-                    await self.notify_new_lead_managers(
-                        filial_id, matched_key, name=name, phone=clean_phone,
-                        age=age, experience=experience, preference=preference, wa_link=wa_link,
-                    )
-                    _mark_lead_notified(user_id)
-                    return self._handoff_message(mgr_name, mgr_phone, success=True)
-
-                logger.error(f"create_lead: ошибка создания заявки joins: {status_code} {body[:300]}")
-                _log_failed_lead(
-                    {**lead_payload, "stage": "joins_post", "user_id": user_id, "status": status_code, "body": body[:500]},
-                    "joins_post_failed",
-                )
-                return self._handoff_message(mgr_name, mgr_phone, success=False)
-
+            # A new lead is a user card plus a task. Only the branch manager
+            # enrolls the pupil into an actual class. POST /joins ignores filialId
+            # (it is not a Join field) and uses the class's branch instead.
             try:
                 now = datetime.now(_SCHOOL_TZ).strftime("%Y-%m-%d")
                 task_resp = await client.post(f"{MOYKLASS_BASE_URL}/tasks", headers=headers, json={
@@ -2150,13 +2119,15 @@ class MoyKlassCRM:
                     "beginDate": now, "endDate": now,
                     "typeId": 1, "managerId": manager_id
                 })
+                task_resp.raise_for_status()
                 logger.info(f"create_lead: POST /tasks -> {task_resp.status_code}")
             except Exception as e:
+                _log_failed_lead({**lead_payload, "user_id": user_id}, "lead_task_failed")
                 logger.warning(f"create_lead: задача не создана: {e}")
 
             await self.notify_new_lead_managers(
                 filial_id, matched_key, name=name, phone=clean_phone,
-                age=age, experience=experience, preference=preference, wa_link=wa_link,
+                age=age, experience=experience, preference=preference, wa_link=wa_link, courses=courses,
             )
             _mark_lead_notified(user_id)
             logger.info(f"create_lead: УСПЕХ — заявка создана для {name} ({clean_phone}), филиал {filial_id}")
@@ -2174,6 +2145,7 @@ class MoyKlassCRM:
         preference: str,
         wa_link: str,
         source: str = "Бот оформил заявку.",
+        courses: str = "",
     ) -> None:
         """Служебное WhatsApp-уведомление управляющему о новом лиде.
 
@@ -2193,7 +2165,7 @@ class MoyKlassCRM:
         message = build_new_lead_admin_message(
             name=name, phone=phone, age=age,
             experience=experience, preference=preference, wa_link=wa_link,
-            source=source,
+            source=source, courses=courses,
         )
         try:
             delivered = await send_whatsapp(chat_id, message, sanitize=False)
@@ -2222,6 +2194,7 @@ class MoyKlassCRM:
         preference: str,
         wa_link: str,
         source: str = "Бот оформил заявку.",
+        courses: str = "",
     ) -> None:
         """Уведомить управляющего филиала о новом лиде.
 
@@ -2245,7 +2218,7 @@ class MoyKlassCRM:
             await self.notify_new_lead_admin(
                 mgr_phone, mgr_name,
                 name=name, phone=phone, age=age, experience=experience,
-                preference=preference, wa_link=wa_link, source=source,
+                preference=preference, wa_link=wa_link, source=source, courses=courses,
             )
 
     async def notify_client_callback_request(
@@ -2263,6 +2236,8 @@ class MoyKlassCRM:
         Филиал неизвестен → никому не шлём; модель должна дожать филиал у клиента.
         Тест-номер CRM сюда не подмешиваем — callback всегда на реального управляющего.
         """
+        if SCHOOL_ADMIN.search(matched_key or ""):
+            return "СИСТЕМНОЕ: Запрос нашему управляющему не отправляй. Ответь: " + school_admin_reply()
         recipients = _callback_recipients(filial_id, matched_key)
         if not recipients:
             logger.warning(
@@ -2331,53 +2306,6 @@ class MoyKlassCRM:
             "из MGR_PHONE как backup. НЕ упоминай никаких ошибок или технических проблем."
         )
 
-    async def _post_join_with_retry(self, client: httpx.AsyncClient, headers: dict, join_payload: dict):
-        """POST /joins с авто-повторами:
-        - 401/403 → обновить токен и повторить
-        - 400 «end statuses» → повторить без statusId (MoyKlass подставит дефолтный начальный)
-        """
-        try:
-            resp = await client.post(f"{MOYKLASS_BASE_URL}/joins", headers=headers, json=join_payload)
-            logger.info(f"create_lead: POST /joins -> {resp.status_code} {resp.text[:300]}")
-        except Exception as e:
-            logger.error(f"create_lead: исключение POST /joins: {e}")
-            return None
-
-        if resp.status_code in (401, 403):
-            logger.warning("create_lead: /joins вернул 401/403 — обновляю токен и повторяю один раз")
-            self.token = None
-            new_headers = await self._get_headers()
-            if not new_headers:
-                return resp
-            try:
-                resp = await client.post(f"{MOYKLASS_BASE_URL}/joins", headers=new_headers, json=join_payload)
-                logger.info(f"create_lead: POST /joins retry(auth) -> {resp.status_code} {resp.text[:300]}")
-                headers = new_headers
-            except Exception as e:
-                logger.error(f"create_lead: исключение при retry(auth) POST /joins: {e}")
-                return resp
-
-        body_lower = (getattr(resp, "text", "") or "").lower()
-        if (
-            resp.status_code == 400
-            and "statusId" in join_payload
-            and ("end statuses" in body_lower or "end status" in body_lower)
-        ):
-            logger.warning(
-                "create_lead: statusId=%s — конечный статус в MoyKlass, повторяю POST /joins без statusId",
-                join_payload.get("statusId"),
-            )
-            payload_no_status = {k: v for k, v in join_payload.items() if k != "statusId"}
-            try:
-                resp2 = await client.post(f"{MOYKLASS_BASE_URL}/joins", headers=headers, json=payload_no_status)
-                logger.info(f"create_lead: POST /joins retry(no statusId) -> {resp2.status_code} {resp2.text[:300]}")
-                return resp2
-            except Exception as e:
-                logger.error(f"create_lead: исключение при retry(no statusId) POST /joins: {e}")
-                return resp
-
-        return resp
-
 crm = MoyKlassCRM(MOYKLASS_API_KEY)
 
 # --- 4. TOOLS ---
@@ -2394,7 +2322,8 @@ tools = [
                     "client_phone": {"type": "string", "description": "Телефон: в WhatsApp укажи номер из чата, если клиент не дал другой явно"},
                     "client_age": {"type": "string", "description": "Возраст (ребёнка или клиента)"},
                     "experience": {"type": "string", "description": "Опыт в шахматах / разряд"},
-                    "preference": {"type": "string", "description": "Выбранный филиал или формат обучения"}
+                    "preference": {"type": "string", "description": "Один выбранный филиал или формат обучения"},
+                    "courses": {"type": "string", "description": "Выбранные курсы: шахматы, английский, математика; несколько через запятую"}
                 },
                 "required": ["client_name", "client_phone", "client_age", "experience", "preference"]
             }
@@ -2548,15 +2477,19 @@ def _is_pure_acknowledgment(text: str) -> bool:
 
 def _ack_accepts_offer(chat_id: str, text: str) -> bool:
     """'Хорошо' accepts an explicit offer, but never reopens a completed handoff."""
-    if chat_id in handoff_completed or chat_id in session_registered_leads or chat_id in crm_notify_recent:
-        return False
     normalized = " ".join(_normalize_ack_phrase(_bare_client_text(text)).split())
     if normalized not in {"хорошо", "ок", "окей", "ok", "okay", "ладно", "жақсы", "жарайды", "хорошо спасибо"} and text.strip() != "👍":
         return False
+    store = _campaign_store()
+    campaign = store.context(chat_id.split('@')[0]) if store else None
     for message in reversed(chat_history.get(chat_id, [])):
         role = message.get("role") if isinstance(message, dict) else getattr(message, "role", None)
         if role == "assistant" and _history_message_content(message):
             content = _history_message_content(message)
+            if campaign and content == campaign['message']:
+                return True
+            if chat_id in handoff_completed or chat_id in session_registered_leads or chat_id in crm_notify_recent:
+                return False
             return "?" in content and bool(re.search(
                 r"записать|запишем|оформить.*заявк|передать.*управляющ|"
                 r"хотите.*(?:пробн|запис)|жазайын|жазылайық", content, re.I))
@@ -2727,15 +2660,20 @@ def _guess_filial_from_text(text: str):
     if not low:
         return None
     # Более длинные ключи раньше (айтеке би / қадыр мырза).
-    for key in sorted(FILIALS_MAP.keys(), key=len, reverse=True):
-        if key in low:
-            return FILIALS_MAP[key]
-    return None
+    if SCHOOL_ADMIN.search(low):
+        return None
+    matches = {f_id for key, f_id in FILIALS_MAP.items() if key in low}
+    if SCHOOL_59.search(low) and SCHOOL_59_FILIAL_ID:
+        matches.add(SCHOOL_59_FILIAL_ID)
+    return next(iter(matches)) if len(matches) == 1 else None
 
 
 def _matched_key_from_text(text: str) -> Optional[str]:
     low = (text or "").lower()
-    if not low:
+    if SCHOOL_59.search(low) and not SCHOOL_ADMIN.search(low) and not any(
+            key in low for key, fid in FILIALS_MAP.items() if fid != SCHOOL_59_FILIAL_ID):
+        return "school59"
+    if not low or _guess_filial_from_text(text) is None:
         return None
     for key in sorted(FILIALS_MAP.keys(), key=len, reverse=True):
         if key in low:
@@ -2757,7 +2695,7 @@ def _remember_session_branch(
     """
     matched_key = _matched_key_from_text(preference)
     if filial_id is None:
-        filial_id = FILIALS_MAP.get(matched_key) if matched_key else _guess_filial_from_text(preference)
+        filial_id = _guess_filial_from_text(preference)
     mgr_name, mgr_phone = crm._pick_manager_info(filial_id, matched_key)
     dossier = client_dossiers.get(chat_id) or {}
     if client_name:
@@ -3055,7 +2993,7 @@ def _should_skip_stale_incoming(data: dict) -> bool:
     return False
 
 
-async def send_whatsapp(chat_id, text, *, sanitize_fallback: str = "handoff", sanitize: bool = True, before_send=None) -> bool:
+async def send_whatsapp(chat_id, text, *, sanitize_fallback: str = "handoff", sanitize: bool = True, before_send=None, delivery_result=None) -> bool:
     # Доп. нормализация на случай прямых вызовов (голосовые ошибки и т.д.).
     # sanitize=False — для служебных сообщений сотрудникам (сохраняем формат/переносы).
     # Возвращает True только при подтверждённой отправке (Green API отдал idMessage).
@@ -3100,15 +3038,23 @@ async def send_whatsapp(chat_id, text, *, sanitize_fallback: str = "handoff", sa
     except Exception as e:
         # Timeout messages can be empty; exception text may contain the API token.
         logger.error("send_whatsapp: сетевая ошибка при отправке %s (%s)", chat_id, type(e).__name__)
+        if delivery_result is not None:
+            delivery_result.update(state='uncertain', reason='transport_' + type(e).__name__)
         return False
 
     if resp.status_code != 200:
+        if delivery_result is not None:
+            delivery_result.update(state='uncertain' if resp.status_code >= 500 or resp.status_code == 408 else 'failed',
+                                   reason='http_' + str(resp.status_code))
         logger.error(
             "send_whatsapp: Green API %s -> %s %s",
             chat_id, resp.status_code, (resp.text or "")[:300],
         )
         if _wa_is_flood_response(resp.status_code, resp.text or ""):
             _wa_trip_flood_pause(f"HTTP {resp.status_code}")
+            store = _campaign_store()
+            if store:
+                store.pause_all('provider_restriction')
         return False
 
     # При успехе Green API возвращает {"idMessage": "..."}; его отсутствие = не доставлено.
@@ -3117,6 +3063,8 @@ async def send_whatsapp(chat_id, text, *, sanitize_fallback: str = "handoff", sa
     except Exception:
         body = None
     if not (isinstance(body, dict) and body.get("idMessage")):
+        if delivery_result is not None:
+            delivery_result.update(state='uncertain', reason='missing_message_id')
         logger.warning(
             "send_whatsapp: ответ без idMessage %s -> %s",
             chat_id, (resp.text or "")[:200],
@@ -3125,15 +3073,111 @@ async def send_whatsapp(chat_id, text, *, sanitize_fallback: str = "handoff", sa
             _wa_trip_flood_pause("body without idMessage")
         return False
     _wa_mark_sent_ok()
+    if delivery_result is not None:
+        delivery_result.update(state='accepted', message_id=str(body['idMessage']), reason='')
     kind = "service"
     if context and context[0] == chat_id:
-        kind = "followup" if context[2] == "followup" else "reply"
+        kind = context[2] if context[2] in ("followup", "campaign") else "reply"
     if chat_id == phone_to_chat_id(DAILY_REPORT_PHONE):
         kind = "report"
     _record_event(kind, chat_id, "outgoing:" + str(body["idMessage"]))
     return True
 
 # --- 6. ЛОГИКА ДИАЛОГА ---
+def _campaign_store():
+    # Ordinary dialogs don't create a campaign database as a side effect.
+    return CampaignStore(CAMPAIGN_STATE_FILE) if Path(CAMPAIGN_STATE_FILE).exists() else None
+
+
+def _campaign_directive(chat_id):
+    store = _campaign_store()
+    return campaign_dialog_context(store.context(chat_id.split('@')[0])) if store else ''
+
+
+async def _campaign_tick():
+    if not CAMPAIGNS_ENABLED:
+        return
+    store = _campaign_store()
+    if not store or message_buffers or pending_answers or any(incoming_pending.values()):
+        return
+    # Keep at least half of the shared sending budget for conversations/service.
+    now = time.time()
+    if _wa_paused_until > now or any(
+            limit > 0 and _wa_count_since(now, span) >= max(1, limit // 2)
+            for limit, span in ((WA_MAX_PER_HOUR, 3600), (WA_MAX_PER_DAY, 86400))):
+        return
+    entry = store.claim(now)
+    if not entry:
+        return
+    phone, campaign = entry['phone'], entry['campaign']
+    chat_id = phone_to_chat_id(phone)
+    result = {'state': 'skipped', 'reason': 'pre_send_cancelled'}
+    token = _outbound_context.set((chat_id, incoming_versions[chat_id], 'campaign'))
+    try:
+        async with _dialog_lock(chat_id):
+            await _hydrate_chat_history(chat_id)
+            def return_unsent(reason):
+                retry_at = max(time.time() + 60, last_activity.get(chat_id, 0) + 24 * 3600 + 1)
+                if (chat_id in contact_opt_out or _is_internal_chat(chat_id)
+                        or not store.defer(campaign, phone, retry_at, reason)):
+                    store.result(campaign, phone, 'skipped', reason=reason)
+            async def eligible():
+                return (store.eligible(campaign, phone) and _outbound_allowed(chat_id)
+                        and not _is_internal_chat(chat_id) and not message_buffers and not pending_answers
+                        and not any(incoming_pending.values())
+                        and time.time() - last_activity.get(chat_id, 0) > 24 * 3600)
+            if not await eligible():
+                return_unsent('pre_send_deferred')
+                return
+            # Verify account health before starting this one marketing message.
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    response = await client.get(f'{GREEN_API_URL}/waInstance{GREEN_API_ID}/getStateInstance/{GREEN_API_TOKEN}')
+                    response.raise_for_status()
+                    authorized = response.json().get('stateInstance') == 'authorized'
+                if not authorized:
+                    raise RuntimeError('account_not_authorized')
+            except Exception:
+                return_unsent('account_health_unavailable')
+                store.pause_all('account_health_unavailable')
+                return
+            await send_whatsapp(chat_id, entry['message'], sanitize=False, before_send=eligible, delivery_result=result)
+            if result['state'] == 'skipped':
+                return_unsent(result['reason'])
+            else:
+                store.result(campaign, phone, **result)
+            if result['state'] == 'accepted':
+                chat_history.setdefault(chat_id, [{'role': 'system', 'content': SYSTEM_PROMPT}]).append(
+                    {'role': 'assistant', 'content': entry['message']})
+                # No unsolicited follow-up is started by a marketing send.
+                _block_followup(chat_id, 'campaign_no_followup')
+                _save_conversation(chat_id)
+    except BaseException:
+        # A lost result is never retried automatically (including cancellation).
+        store.result(campaign, phone, 'uncertain', reason='campaign_worker_interrupted')
+        raise
+    finally:
+        _outbound_context.reset(token)
+
+
+async def _campaign_loop():
+    while True:
+        try:
+            await _campaign_tick()
+        except Exception:
+            logger.exception('Campaign worker paused after an error')
+        await asyncio.sleep(30)
+
+
+@app.on_event('startup')
+async def _start_campaign_worker():
+    store = _campaign_store()
+    if store:
+        store.recover()
+    if CAMPAIGNS_ENABLED:
+        _spawn_task(_campaign_loop())
+
+
 async def _refresh_pending_incoming(chat_id):
     """Best-effort recovery of recent text messages whose webhooks are delayed.
 
@@ -3314,7 +3358,7 @@ async def _refresh_student_context(chat_id):
 def _student_dialog_directive(chat_id):
     facts = conversation_facts.get(chat_id, {})
     if not _student_support(chat_id):
-        return qualification_directive(facts)
+        return qualification_directive(facts) + _campaign_directive(chat_id)
     dossier = client_dossiers.get(chat_id, {})
     lookup = crm_lookup_state.get(chat_id, {})
     fresh = lookup.get("status") == "found" and time.time() - lookup.get("checked_at", 0) < SESSION_TIMEOUT
@@ -3332,7 +3376,7 @@ def _student_dialog_directive(chat_id):
         "При недоступности CRM продолжай поддержку; это не означает, что клиент новый. "
         "Подтверждённая по номеру информация: " + json.dumps(context, ensure_ascii=False) +
         ". Текущее обучение подтверждено CRM: " + str(bool(fresh and lookup.get("enrollment_confirmed"))) +
-        ". Если нет свежего расписания, не называй дату/время из старой переписки."
+        ". Если нет свежего расписания, не называй дату/время из старой переписки." + _campaign_directive(chat_id)
     )
 
 
@@ -3446,7 +3490,7 @@ async def _process_dialog(chat_id):
             and time.time() - crm_notify_recent[chat_id] <= CRM_NOTIFY_CONTEXT_SEC
         )
         bare_user = _bare_client_text(user_text)
-        if recent_crm and (
+        if recent_crm and not _ack_accepts_offer(chat_id, user_text) and (
             _is_pure_acknowledgment(user_text)
             or _FOLLOWUP_CLOSED_RE.search(bare_user or "")
             or _CRM_GREETING_ONLY_RE.match(bare_user or "")
@@ -3464,6 +3508,17 @@ async def _process_dialog(chat_id):
 
         chat_history[chat_id].append({"role": "user", "content": user_payload})
         facts = conversation_facts.setdefault(chat_id, {})
+        campaign_store = _campaign_store()
+        campaign_context = campaign_store.context(chat_id.split('@')[0]) if campaign_store else None
+        if campaign_context:
+            if facts.get('campaign_interest') != campaign_context['campaign']:
+                # Old chess qualification must not answer the new invitation.
+                facts.pop('courses', None)
+                facts.pop('preference', None)
+                facts.pop('campaign_branch', None)
+            facts['campaign_interest'] = campaign_context['campaign']
+            if re.search(r'аркад|камал', bare_user, re.I):
+                facts['campaign_branch'] = 'Камал' if re.search(r'камал', bare_user, re.I) else 'Аркада'
         previous_question = next((_history_message_content(m) for m in reversed(chat_history[chat_id])
                                   if isinstance(m, dict) and m.get("role") == "assistant"), "")
         for message in buffer["messages"]:
@@ -3483,6 +3538,13 @@ async def _process_dialog(chat_id):
         _update_followup_tracking(chat_id, user_text)
 
         student_support = _student_support(chat_id)
+        # Schools administered externally never enter our sales/callback flow.
+        # A fresh explicit internal branch choice can move the conversation on.
+        school_context = bare_user if SCHOOL_ADMIN.search(bare_user) else facts.get("preference", "")
+        if SCHOOL_ADMIN.search(school_context) and not any(key in bare_user.lower() for key in FILIALS_MAP):
+            _block_followup(chat_id, "school_administration")
+            await _deliver_dialog_answer(chat_id, school_admin_reply(facts.get("language")))
+            return
         if (not student_support and crm_lookup_state.get(chat_id, {}).get("status") == "unavailable"
                 and _CRM_GREETING_ONLY_RE.fullmatch(bare_user.strip())):
             await _deliver_dialog_answer(chat_id, "Сәлеметсіз бе! Қалай көмектесе аламын?"
@@ -3502,7 +3564,7 @@ async def _process_dialog(chat_id):
                 await _deliver_dialog_answer(chat_id, "Сәлеметсіз бе! Сабақтарыңыз бойынша қалай көмектесе аламын?"
                     if facts.get("language") == "kk" else "Здравствуйте! Чем могу помочь по вашим занятиям?")
                 return
-            if reports_existing_student(bare_user) and not has_question(bare_user):
+            if reports_existing_student(bare_user) and not has_question(bare_user) and not campaign_context:
                 await _deliver_dialog_answer(chat_id, _student_support_fallback(chat_id))
                 return
 
@@ -3648,6 +3710,8 @@ async def _process_dialog(chat_id):
                                 age=args.get("client_age", "-"),
                                 experience=args.get("experience", "-"),
                                 preference=preference,
+                                courses=args.get("courses") or ", ".join(facts.get("courses") or []) or
+                                        ("Диагностика GM Intellect" if facts.get('campaign_interest') else ""),
                             )
                             lead_registered_this_turn |= "ЗАЯВКА ОФОРМЛЕНА В CRM" in result_text
                             if "ЗАЯВКА ОФОРМЛЕНА В CRM" in result_text:
@@ -3675,7 +3739,17 @@ async def _process_dialog(chat_id):
                         client_phone = chat_id.split("@")[0]
                         client_name = dossier.get("name") or "Клиент"
                         filial_id = dossier.get("filial_id")
-                        if filial_id is None:
+                        callback_reason = args.get("reason", "") or user_text[:200]
+                        campaign_callback = bool(campaign_context and re.search(
+                            r'intellect|интеллект|диагност|английск|математик|нов\w*\s+направлен',
+                            callback_reason, re.I))
+                        callback_key = dossier.get("matched_key") or _matched_key_from_text(user_text)
+                        if campaign_callback:
+                            selected_branch = facts.get('campaign_branch', '')
+                            filial_id = _guess_filial_from_text(selected_branch)
+                            callback_key = _matched_key_from_text(selected_branch)
+                            callback_reason = 'Отклик на рассылку GM Intellect: ' + callback_reason
+                        elif filial_id is None:
                             # Досье пустое (новый лид) — ищем филиал в причине,
                             # тексте клиента и недавней истории чата.
                             hist_blob = " ".join(
@@ -3688,7 +3762,9 @@ async def _process_dialog(chat_id):
                             )
                         try:
                             last_callback = session_manager_notified.get(chat_id, 0)
-                            if time.time() - last_callback < MANAGER_CALLBACK_DEDUP_SECONDS:
+                            if campaign_callback and filial_id is None:
+                                result_text = 'СИСТЕМНОЕ: запрос пока не отправлен. Уточни филиал для диагностики GM Intellect: Аркада или Камал. После ответа повтори request_manager_callback.'
+                            elif time.time() - last_callback < MANAGER_CALLBACK_DEDUP_SECONDS:
                                 result_text = "СИСТЕМНОЕ СООБЩЕНИЕ: ЗАПРОС УЖЕ ПЕРЕДАН УПРАВЛЯЮЩЕМУ. Повторно отправлять не нужно."
                                 callback_sent_this_turn = True
                             else:
@@ -3696,8 +3772,8 @@ async def _process_dialog(chat_id):
                                     client_name=client_name,
                                     client_phone=client_phone,
                                     filial_id=filial_id,
-                                    reason=args.get("reason", "") or user_text[:200],
-                                    matched_key=dossier.get("matched_key") or _matched_key_from_text(user_text),
+                                    reason=callback_reason,
+                                    matched_key=callback_key,
                                 )
                                 callback_sent_this_turn |= "MGR_PHONE=" in result_text
                                 if "MGR_PHONE=" in result_text:
@@ -3705,7 +3781,7 @@ async def _process_dialog(chat_id):
                             # Помечаем только если реально ушло (есть MGR_PHONE).
                             if "MGR_PHONE=" in result_text:
                                 session_manager_notified[chat_id] = time.time()
-                                if filial_id is not None:
+                                if filial_id is not None and not campaign_callback:
                                     _remember_session_branch(
                                         chat_id, filial_id=filial_id, client_name=client_name
                                     )
@@ -3963,6 +4039,16 @@ async def handle_webhook(request: Request):
         return "ok"
     if not isinstance(data, dict):
         return "ok"
+    if data.get('typeWebhook') in ('outgoingMessageStatus', 'stateInstanceChanged'):
+        instance = data.get('instanceData')
+        if isinstance(instance, dict) and str(instance.get('idInstance')) == str(GREEN_API_ID):
+            store = _campaign_store()
+            if store:
+                if data['typeWebhook'] == 'outgoingMessageStatus' and isinstance(data.get('idMessage'), str) and data['idMessage']:
+                    store.delivery(str(data.get('idMessage') or ''), data.get('status'))
+                elif data['typeWebhook'] == 'stateInstanceChanged' and data.get('stateInstance') != 'authorized':
+                    store.pause_all('instance_' + str(data.get('stateInstance')))
+        return 'ok'
     if data.get("typeWebhook") != "incomingMessageReceived":
         return "ok"
 
@@ -3975,6 +4061,9 @@ async def handle_webhook(request: Request):
 
     msg_data = data.get("messageData") or {}
     if STOP_CONTACT.search(_extract_main_text(msg_data)):
+        store = _campaign_store()
+        if store:
+            store.inbound(sender.split('@')[0], _extract_main_text(msg_data), str(data.get('idMessage') or time.time_ns()))
         _stop_contact(sender)
         return "ok"
     if sender in contact_opt_out or _is_internal_chat(sender):
@@ -3996,6 +4085,11 @@ def _queue_incoming(sender, msg_data, id_message, timestamp):
         dq.append(id_message)
 
     _record_event("incoming", sender, "incoming:" + sender + ":" + str(id_message) if id_message else None)
+    msg_data = dict(msg_data)
+    msg_data['_campaign_message_id'] = str(id_message or time.time_ns())
+    store = _campaign_store()
+    if store:
+        store.inbound(sender.split('@')[0], _extract_main_text(msg_data) or '[голосовое/медиа]', msg_data['_campaign_message_id'])
     pending_answers.pop(sender, None)
 
     if timestamp is not None:
@@ -4078,6 +4172,16 @@ async def _buffer_incoming(sender, msg_data):
 
     if not text:
         return "ok"
+
+    store = _campaign_store()
+    if store and store.inbound(sender.split('@')[0], _bare_client_text(text),
+                               str(msg_data.get('_campaign_message_id') or msg_data.get('idMessage') or time.time_ns())):
+        _block_followup(sender, 'campaign_declined')
+        pending_answers.pop(sender, None)
+        old_buffer = message_buffers.pop(sender, None)
+        if old_buffer and old_buffer.get('timer'):
+            old_buffer['timer'].cancel()
+        return 'ok'
 
     if STOP_CONTACT.search(_bare_client_text(text)):
         _stop_contact(sender)
@@ -4293,6 +4397,7 @@ def build_new_lead_admin_message(
     preference: str,
     wa_link: str,
     source: str = "Бот оформил заявку.",
+    courses: str = "",
 ) -> str:
     """Текст служебного уведомления управляющему о новом лиде."""
     return (
@@ -4301,6 +4406,7 @@ def build_new_lead_admin_message(
         f"Телефон: {phone or '-'}\n"
         f"Возраст: {age or '-'}\n"
         f"Опыт: {experience or '-'}\n"
+        f"Курсы: {courses or '-'}\n"
         f"Филиал/формат: {preference or '-'}\n"
         f"WhatsApp: {wa_link or '-'}"
     )
@@ -4863,7 +4969,7 @@ async def _handle_new_lead_admin_notification(event: str, obj: dict) -> dict:
 
     Покрывает лиды из любого источника (менеджер вручную, сайт, бот). Получатель —
     управляющий филиала лида (по filial_id); если филиал не определён — только
-    default (не всем админам). Дедуп по userId: если этот лид только что создал бот
+    никому. Дедуп по userId: если этот лид только что создал бот
     и уже уведомил управляющего из create_lead — повторно не шлём.
     """
     user_id = obj.get("userId")
@@ -4878,12 +4984,10 @@ async def _handle_new_lead_admin_notification(event: str, obj: dict) -> dict:
     name = (user or {}).get("name") or obj.get("userName") or obj.get("name") or "-"
     phone = (user or {}).get("phone") or obj.get("phone") or ""
 
-    # Филиал нужен только для текста сообщения (получатель — центральный админ).
+    # Route to the actual primary branch, never to filials[0] in a mixed card.
     filial_id = obj.get("filialId")
     if filial_id is None and user:
-        filials = user.get("filials") or []
-        if filials:
-            filial_id = filials[0]
+        filial_id = _primary_filial(user)
 
     wa_link = f"https://wa.me/{re.sub(r'[^0-9]', '', phone)}" if phone else "-"
 
@@ -5085,16 +5189,14 @@ async def _poll_new_leads_once() -> None:
             logger.info("lead-poll: userId=%s уже уведомлён ботом напрямую — пропуск (dedup)", uid)
         else:
             phone = u.get("phone") or ""
-            filials = u.get("filials") or []
-            # В списке /users filials иногда пустой — дотягиваем карточку.
-            if not filials:
+            filial_id = _primary_filial(u)
+            if filial_id is None:
                 try:
                     full = await crm.get_user_by_id(uid)
                     if full:
-                        filials = full.get("filials") or []
+                        filial_id = _primary_filial(full)
                 except Exception as e:
                     logger.warning("lead-poll: get_user_by_id(%s) failed: %s", uid, e)
-            filial_id = filials[0] if filials else None
             if filial_id is None:
                 logger.warning(
                     "lead-poll: userId=%s без филиала — никому не отправляю (нужен филиал)",

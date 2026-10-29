@@ -25,6 +25,26 @@ EXTERNAL_OUTPUT = re.compile(
 PRICE_QUESTION = re.compile(r'цен[ауы]|ценам|стоимост|баға|қанша|сколько\s+стоят', re.I)
 VISIT_NOW = re.compile(r'(?:қазір|бүгін).{0,45}(?:бар|кел)|(?:сейчас|сегодня).{0,45}(?:прийти|приехать|подойти)|(?:прийти|приехать|подойти).{0,45}(?:сейчас|сегодня)', re.I)
 
+SCHOOL_ADMIN = re.compile(r'\bharmony\b|хармони|хормони|\bngs\b|\bнгс\b|энджиес|\bquantum\b|квантум', re.I)
+SCHOOL_59 = re.compile(r'(?:школ\w*|мектеп\w*|school)\s*(?:№|номер|number|n)?\s*59\b|\b59\s*[-–]?\s*(?:школ\w*|мектеп\w*|school)', re.I)
+SCHOOL_ADMIN_REPLY = 'Для записи на шахматный кружок при данной школе вам необходимо обратиться к администрации школы'
+COURSES = ((r'шахмат|chess', 'шахматы'), (r'английск|ағылшын|english', 'английский'),
+           (r'математ|math', 'математика'))
+
+
+def mentioned_courses(text):
+    return [label for pattern, label in COURSES if re.search(pattern, text or '', re.I)]
+
+
+def school_admin_reply(language='ru'):
+    return ('Осы мектептегі шахмат үйірмесіне жазылу үшін мектеп әкімшілігіне хабарласуыңыз қажет'
+            if language == 'kk' else SCHOOL_ADMIN_REPLY)
+
+
+def non_chess_course(facts):
+    courses = facts.get('courses') or []
+    return (bool(courses) and 'шахматы' not in courses) or (bool(facts.get('campaign_interest')) and not courses)
+
 
 def reports_existing_student(text):
     """A client's claim selects support, but never verifies a CRM identity."""
@@ -81,6 +101,12 @@ def student_age(facts):
 
 
 def qualification_directive(facts):
+    if non_chess_course(facts):
+        return ('Клиента интересует: ' + ', '.join(facts.get('courses') or ['диагностика GM Intellect']) + '. '
+                'Английский и математика доступны в Аркаде, Камале и школе №59. '
+                'Уточняй возраст, выбранный курс и филиал; не спрашивай шахматный разряд, '
+                'не применяй шахматные ограничения по возрасту и взрослым. '
+                'Цена — по новому прайсу выбранной площадки. Дни, длительность, возрастные группы уточняет администратор.')
     age = student_age(facts)
     if age is None:
         return ('Возраст ученика неизвестен. «Для себя» НЕ означает взрослый. '
@@ -126,6 +152,8 @@ def child_lesson_options(facts):
 
 def guard_student_options(answer, facts, user_text):
     """Do not let an earlier adult assumption hide a child's group option."""
+    if non_chess_course(facts):
+        return answer
     age = student_age(facts)
     adult = bool(re.search(r'для\s+взросл|вы\s+взросл|ересектер', answer, re.I))
     individual = bool(re.search(r'индивидуал|жеке\s+сабақ', answer, re.I))
@@ -161,7 +189,7 @@ def closure_reason(user_text='', answer='', facts=None):
     if DEFER.search(user_text):
         return 'client_deferred'
     try:
-        if float((facts or {}).get('age', '100').replace(',', '.')) < 5:
+        if not non_chess_course(facts or {}) and float((facts or {}).get('age', '100').replace(',', '.')) < 5:
             return 'under_age'
     except (ValueError, AttributeError):
         pass
@@ -187,6 +215,15 @@ def deferred_price_reply(facts, text):
     if not DEFER.search(text) or not PRICE_QUESTION.search(text) or facts.get('preference') not in ('Камал', 'Аркада', 'онлайн'):
         return None
     kk = facts.get('language') == 'kk'
+    if non_chess_course(facts):
+        if facts.get('preference') == 'онлайн':
+            return None
+        return ('Бір курс: 1 ай — 30 000, 3 ай — 80 000, 6 ай — 145 000 теңге. '
+                'Екі курс: 55 000 / 155 000 / 280 000 теңге. '
+                'Үш курс: 80 000 / 220 000 / 405 000 теңге (1 / 3 / 6 ай).'
+                if kk else 'Один курс: 1 месяц — 30 000, 3 месяца — 80 000, 6 месяцев — 145 000 тг. '
+                'Два курса: 55 000 / 155 000 / 280 000 тг. '
+                'Три курса: 80 000 / 220 000 / 405 000 тг (за 1 / 3 / 6 месяцев).')
     age = student_age(facts)
     if age is None and facts.get('audience') == 'для себя':
         return None

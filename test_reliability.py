@@ -38,7 +38,7 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        for name in ('CRM_SENT_STATE_FILE', 'FOLLOWUP_BLOCKED_FILE', 'FAILED_LEADS_FILE', 'CONVERSATION_STATE_FILE', 'USAGE_STATE_FILE'):
+        for name in ('CRM_SENT_STATE_FILE', 'FOLLOWUP_BLOCKED_FILE', 'FAILED_LEADS_FILE', 'CONVERSATION_STATE_FILE', 'USAGE_STATE_FILE', 'CAMPAIGN_STATE_FILE'):
             self.enterContext(patch.object(bot, name, str(Path(self.tmp.name) / name)))
         self.enterContext(patch.object(attendance, 'ATTENDANCE_STATE_FILE', str(Path(self.tmp.name) / 'attendance.json')))
         # Unexpected network use fails the test, including indirect API paths.
@@ -231,10 +231,10 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
             await bot.process_dialog(self.chat)
             notify.assert_not_awaited()
 
-    async def test_shared_school_branch_routes_by_name(self):
+    async def test_external_school_redirects_without_callback(self):
         result = await bot.crm.notify_client_callback_request(client_name='Тест', client_phone='77001234567', filial_id=54672, matched_key='quantum')
-        self.assertIn('MGR_PHONE=', result)
-        self.assertEqual(self.send.call_args.args[0], bot.phone_to_chat_id(bot.QUANTUM_MANAGER_PHONE))
+        self.assertIn('обратиться к администрации школы', result)
+        self.send.assert_not_awaited()
 
     async def test_failed_callback_does_not_claim_delivery(self):
         self.send.return_value = False

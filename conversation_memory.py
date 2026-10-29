@@ -3,7 +3,7 @@ import json
 from contextlib import closing
 import re
 import sqlite3
-from dialog_policy import detect_language, chess_rank, reports_existing_student
+from dialog_policy import detect_language, chess_rank, reports_existing_student, mentioned_courses, SCHOOL_59
 
 
 def save_snapshot(path, chat_id, payload):
@@ -26,7 +26,7 @@ STOP_CONTACT = re.compile(
     r'|\bне\s+хочу\s*,?\s*чтобы\s+(?:вы|ты)\s+(?:мне\s+|нам\s+)?(?:писал|звонил|беспокоил)'
     r'|\b(?:перестан\w*|прекрат\w*|хватит)\s+(?:мне\s+|нам\s+)?(?:писать|звонить|рассыл\w*)'
     r'|\bотпиши(?:те)?\b|\bотписка\b|\bудал\w*\s+(?:мой\s+(?:номер|контакт)|меня\s+из\s+рассыл\w*)'
-    r'|\bотстан\w*|\b(?:stop|unsubscribe)\b'
+    r'|\bотстан\w*|\b(?:стоп|stop|unsubscribe)\b'
     r'|\b(?:жазба|хабарласпа|мазалама)(?:ңыз(?:дар)?|ңдар)?\b', re.I)
 
 
@@ -118,13 +118,21 @@ def update_facts(facts, text, *, last_question=''):
         facts['lesson_format'] = 'индивидуально' if re.search(r'индивидуал|жеке', format_choice.group(1)) else 'группа'
     if re.search(r'как\s+зовут|имя\s+реб|аты\s+кім|аты\s+қандай', last_question, re.I):
         if re.fullmatch(r'[А-ЯЁӘІҢҒҮҰҚӨҺA-Z][а-яёәіңғүұқөһa-z-]{1,30}(?:\s+[А-ЯЁӘІҢҒҮҰҚӨҺA-Z][а-яёәіңғүұқөһa-z-]{1,30})?', text.strip()):
-            if low.strip() not in {'спасибо', 'хорошо', 'рахмет', 'рақмет', 'жақсы', 'камал', 'аркада', 'онлайн'}:
+            if (low.strip() not in {'спасибо', 'хорошо', 'рахмет', 'рақмет', 'жақсы', 'камал', 'аркада', 'онлайн'}
+                    and not mentioned_courses(text)):
                 facts['name'] = text.strip()
+    courses = mentioned_courses(text)
+    if courses and not re.search(r'\bне\b', low):
+        if re.search(r'^(?:и\b|ещ[её]\b|также\b|плюс\b)|добав', low):
+            courses = list(dict.fromkeys((facts.get('courses') or []) + courses))
+        facts['courses'] = courses
     # A question/comparison or negated option is not a chosen branch.
     if '?' not in low and not re.search(r'\b(?:или|либо|не)\b', low):
         branches = [label for pattern, label in (
             (r'аркад', 'Аркада'), (r'камал', 'Камал'), (r'онлайн', 'онлайн'),
-            (r'quantum|квантум', 'Quantum'), (r'harmony|хармони', 'Harmony'))
+            (r'quantum|квантум', 'Quantum'), (r'harmony\s+global|хармони\s+глобал', 'Harmony Global'),
+            (r'harmony(?!\s+global)|хармони(?!\s+глобал)', 'Harmony'),
+            (r'\bngs\b|\bнгс\b|энджиес', 'NGS'), (SCHOOL_59, 'Школа №59'))
             if re.search(pattern, low)]
         if len(branches) == 1:
             facts['preference'] = branches[0]
