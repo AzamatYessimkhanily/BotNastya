@@ -23,7 +23,7 @@ from dialog_policy import (LANGUAGE_POLICY, closure_reason, DEFER, EMPLOYMENT, E
                            deferred_price_reply, confirmed_handoff, polish_kazakh,
                            qualification_directive, guard_student_options,
                            reports_existing_student, TRAINER_CONTACT, SUPPORT_SALES_REPLY,
-                           SCHOOL_ADMIN, SCHOOL_59, school_admin_reply, mentioned_courses)
+                           SCHOOL_ADMIN, SCHOOL_59, school_admin_reply, mentioned_courses, detect_language)
 from usage_reporting import UsageLedger
 from campaigns import CampaignStore, dialog_context as campaign_dialog_context
 
@@ -909,9 +909,15 @@ def _stop_contact(chat_id):
 
 
 def _outbound_allowed(chat_id):
-    if chat_id in contact_opt_out:
-        return False
     context = _outbound_context.get()
+    if chat_id in contact_opt_out:
+        # A freshly reserved, single acknowledgement is the only exception.
+        # Normal dialog, CRM and follow-up sends remain blocked throughout.
+        if (context and context[0] == chat_id and context[2] == 'refusal_ack'
+                and incoming_versions[chat_id] == context[1] and not _is_internal_chat(chat_id)):
+            store = _campaign_store()
+            return bool(store and store.refusal_ack_allowed(chat_id.split('@')[0]))
+        return False
     if context and context[0] == chat_id:
         if _is_internal_chat(chat_id) or incoming_versions[chat_id] != context[1] or incoming_pending[chat_id]:
             return False
@@ -2309,6 +2315,15 @@ class MoyKlassCRM:
 crm = MoyKlassCRM(MOYKLASS_API_KEY)
 
 # --- 4. TOOLS ---
+CAMPAIGN_REFUSAL_TOOL = {
+    'type': 'function', 'function': {
+        'name': 'decline_campaign',
+        'description': 'Отказ от рассылки или негативная реакция на рекламное сообщение. '
+                       'Исключает текущего собеседника из рассылок и один раз извиняется. '
+                       'Не для вопросов о цене, отсутствии опыта или жалоб на занятия/оплату.',
+        'parameters': {'type': 'object', 'properties': {}, 'required': [], 'additionalProperties': False},
+    },
+}
 tools = [
     {
         "type": "function",
@@ -3094,6 +3109,52 @@ def _campaign_directive(chat_id):
     return campaign_dialog_context(store.context(chat_id.split('@')[0])) if store else ''
 
 
+def _handle_contact_refusal(chat_id, text, message_id, *, acknowledge=True, semantic_decline=False):
+    """Persist a refusal before cancelling sales work or scheduling an apology."""
+    store = _campaign_store()
+    phone = chat_id.split('@')[0]
+    declined = store.inbound(phone, text, message_id) if store else False
+    if semantic_decline and store and store.context(phone):
+        declined = True
+    if not declined and not STOP_CONTACT.search(text):
+        return False
+    already_stopped = chat_id in contact_opt_out
+    if already_stopped:
+        return True
+    _stop_contact(chat_id)
+    if (acknowledge and not _is_internal_chat(chat_id)
+            and store and store.context(phone) and store.reserve_refusal_ack(phone, message_id)):
+        history = chat_history.setdefault(chat_id, [{'role': 'system', 'content': SYSTEM_PROMPT}])
+        if not history or history[-1] != {'role': 'user', 'content': text}:
+            history.append({'role': 'user', 'content': text})
+        _save_conversation(chat_id)
+        _spawn_task(_send_refusal_ack(chat_id, text, incoming_versions[chat_id]))
+    return True
+
+
+async def _send_refusal_ack(chat_id, incoming_text, version):
+    store = _campaign_store()
+    phone = chat_id.split('@')[0]
+    language = detect_language(incoming_text, conversation_facts.get(chat_id, {}).get('language', 'ru'))
+    text = ('Мазалағанымыз үшін кешіріңіз. Сізге енді жарнамалық хабарламалар жібермейміз.'
+            if language == 'kk' else
+            'Извините, что побеспокоили. Больше не будем присылать вам рекламные сообщения.')
+    result = {'state': 'skipped'}
+    token = _outbound_context.set((chat_id, version, 'refusal_ack'))
+    try:
+        if await send_whatsapp(chat_id, text, sanitize=False, delivery_result=result):
+            result['state'] = 'accepted'
+            chat_history.setdefault(chat_id, []).append({'role': 'assistant', 'content': text})
+            _save_conversation(chat_id)
+    except BaseException:
+        # A timeout/restart must never trigger another apology or generic reply.
+        result['state'] = 'uncertain'
+        raise
+    finally:
+        _outbound_context.reset(token)
+        store.finish_refusal_ack(phone, result['state'], result.get('message_id'))
+
+
 async def _campaign_tick():
     if not CAMPAIGNS_ENABLED:
         return
@@ -3220,7 +3281,7 @@ async def _refresh_pending_incoming(chat_id):
         if _should_skip_stale_incoming(event):
             continue
         if STOP_CONTACT.search(text):
-            _stop_contact(chat_id)
+            _handle_contact_refusal(chat_id, text, str(message['idMessage']))
             return
         # Share webhook deduplication and the per-chat ingress lock. A webhook
         # arriving during the request or later cannot queue the same text twice.
@@ -3436,7 +3497,8 @@ async def _process_dialog(chat_id):
 
         _outbound_context.set((chat_id, incoming_versions[chat_id], "dialog"))
         if STOP_CONTACT.search(_bare_client_text(user_text)):
-            _stop_contact(chat_id)
+            _handle_contact_refusal(chat_id, _bare_client_text(user_text),
+                                    str(seen_incoming_ids[chat_id][-1] if seen_incoming_ids[chat_id] else time.time_ns()))
             return
         if chat_id in contact_opt_out or _is_internal_chat(chat_id):
             _block_followup(chat_id, "internal_or_opt_out")
@@ -3629,7 +3691,8 @@ async def _process_dialog(chat_id):
                     "Язык ответа: " + ("казахский" if facts.get("language") == "kk" else "русский") +
                     ". Имена сохраняй точно. Разряд подтверждает опыт, выбранный филиал — формат. " +
                     _student_dialog_directive(chat_id)}],
-                tools=[t for t in tools if not student_support or t["function"]["name"] != "register_client_request"],
+                tools=[t for t in tools if not student_support or t["function"]["name"] != "register_client_request"]
+                      + ([CAMPAIGN_REFUSAL_TOOL] if campaign_context else []),
                 tool_choice="auto",
                 temperature=0.2
             )
@@ -3642,6 +3705,13 @@ async def _process_dialog(chat_id):
             tool_results = {}
 
             if msg.tool_calls:
+                # Refusal wins over any simultaneous sales/callback tool call.
+                # Do not append unexecuted tool calls to the conversation.
+                if campaign_context and any(t.function.name == 'decline_campaign' for t in msg.tool_calls):
+                    _handle_contact_refusal(chat_id, bare_user,
+                        str(seen_incoming_ids[chat_id][-1] if seen_incoming_ids[chat_id] else time.time_ns()),
+                        semantic_decline=True)
+                    return
                 chat_history[chat_id].append(msg)
                 # КАЖДЫЙ tool_call ОБЯЗАН получить парный ответ role:"tool" — иначе
                 # история становится невалидной и все следующие запросы к OpenAI
@@ -4061,10 +4131,8 @@ async def handle_webhook(request: Request):
 
     msg_data = data.get("messageData") or {}
     if STOP_CONTACT.search(_extract_main_text(msg_data)):
-        store = _campaign_store()
-        if store:
-            store.inbound(sender.split('@')[0], _extract_main_text(msg_data), str(data.get('idMessage') or time.time_ns()))
-        _stop_contact(sender)
+        _handle_contact_refusal(sender, _extract_main_text(msg_data), str(data.get('idMessage') or time.time_ns()),
+                                acknowledge=not _should_skip_stale_incoming(data))
         return "ok"
     if sender in contact_opt_out or _is_internal_chat(sender):
         _block_followup(sender, "internal_or_opt_out")
@@ -4087,9 +4155,8 @@ def _queue_incoming(sender, msg_data, id_message, timestamp):
     _record_event("incoming", sender, "incoming:" + sender + ":" + str(id_message) if id_message else None)
     msg_data = dict(msg_data)
     msg_data['_campaign_message_id'] = str(id_message or time.time_ns())
-    store = _campaign_store()
-    if store:
-        store.inbound(sender.split('@')[0], _extract_main_text(msg_data) or '[голосовое/медиа]', msg_data['_campaign_message_id'])
+    if _handle_contact_refusal(sender, _extract_main_text(msg_data) or '[голосовое/медиа]', msg_data['_campaign_message_id']):
+        return
     pending_answers.pop(sender, None)
 
     if timestamp is not None:
@@ -4173,18 +4240,8 @@ async def _buffer_incoming(sender, msg_data):
     if not text:
         return "ok"
 
-    store = _campaign_store()
-    if store and store.inbound(sender.split('@')[0], _bare_client_text(text),
+    if _handle_contact_refusal(sender, _bare_client_text(text),
                                str(msg_data.get('_campaign_message_id') or msg_data.get('idMessage') or time.time_ns())):
-        _block_followup(sender, 'campaign_declined')
-        pending_answers.pop(sender, None)
-        old_buffer = message_buffers.pop(sender, None)
-        if old_buffer and old_buffer.get('timer'):
-            old_buffer['timer'].cancel()
-        return 'ok'
-
-    if STOP_CONTACT.search(_bare_client_text(text)):
-        _stop_contact(sender)
         return "ok"
     if AUTO_REPLY.search(_bare_client_text(text)):
         _block_followup(sender, "auto_reply")

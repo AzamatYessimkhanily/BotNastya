@@ -1,5 +1,6 @@
 """Offline tests of real queue persistence, send failures and reply context."""
 from datetime import datetime, timedelta
+import asyncio
 import json
 from pathlib import Path
 import tempfile
@@ -226,6 +227,49 @@ class QueueTests(unittest.TestCase):
         path.write_text('Телефон\n87771234567\n')
         self.assertEqual(read_contacts(path)[0]['consent'] if 'consent' in read_contacts(path)[0] else '', '')
 
+    def test_faster_limits_keep_previous_attempts_and_durable_daily_budget(self):
+        self.store.import_rows(self.cid, [row for n in range(302) for row in rows(str(77001234000 + n))])
+        self.store.control(self.cid, 'activate', NOW)
+        self.store.claim(NOW)
+        self.store.set_limits(self.cid, 60, 60, 300)
+        reopened = CampaignStore(self.store.path)
+        self.assertIsNone(reopened.claim(NOW + 59))
+        self.assertIsNotNone(reopened.claim(NOW + 60))
+        with self.store.db() as db:
+            for n in range(300):
+                db.execute("UPDATE recipients SET state='accepted',attempt_at=? WHERE phone=?",
+                           (NOW-4000-n, str(77001234000+n)))
+        self.assertIsNone(reopened.claim(NOW + 120))
+        self.assertRaises(ValueError, reopened.set_limits, self.cid, 10, 200, 1000)
+        self.assertEqual(reopened.report(self.cid)['daily'], 300)
+
+    def test_complaint_detection_preserves_questions_and_partial_course_choices(self):
+        self.active()
+        self.store.claim(NOW)
+        for n, text in enumerate(('Нет опыта', 'Нет, ребёнку 8 лет', 'Дорого. Есть скидки?',
+                'Английский не интересует, хочу математику', 'Можно заехать сегодня?',
+                'У меня жалоба на преподавателя', 'Где номер управляющего?',
+                'Мен мазаламаймын', 'Спасибо, всё понятно')):
+            with self.subTest(text=text):
+                self.assertFalse(self.store.inbound('77001234567', text, str(n), NOW))
+        for n, text in enumerate(('Что за спам?!', 'Вы достали своей рекламой', 'Откуда у вас мой номер?',
+                'Я не подписывалась на рассылку', 'Пошли нахуй', 'Спасибо, но не интересно',
+                'Мне не нужна ваша реклама', 'Маған қызық емес')):
+            with self.subTest(text=text):
+                self.assertTrue(self.store.inbound('77001234567', text, 'negative'+str(n), NOW))
+
+    def test_apology_reservation_is_unique_and_expires_without_retry(self):
+        phone = '77001234567'
+        self.assertFalse(self.store.reserve_refusal_ack(phone, 'id', NOW))
+        self.store.suppress(phone, 'refused', NOW)
+        self.assertTrue(self.store.reserve_refusal_ack(phone, 'id', NOW))
+        reopened = CampaignStore(self.store.path)
+        self.assertFalse(reopened.reserve_refusal_ack(phone, 'id2', NOW))
+        self.assertTrue(reopened.refusal_ack_allowed(phone, NOW+299))
+        self.assertFalse(reopened.refusal_ack_allowed(phone, NOW+300))
+        reopened.finish_refusal_ack(phone, 'uncertain')
+        self.assertFalse(reopened.refusal_ack_allowed(phone, NOW+1))
+
 
 class CampaignDialogTests(unittest.IsolatedAsyncioTestCase):
     enterContext = reliability.ReliabilityTests.enterContext
@@ -266,6 +310,29 @@ class CampaignDialogTests(unittest.IsolatedAsyncioTestCase):
         await bot.process_dialog(self.chat)
         self.assertIn('GM Intellect', self.ai.call_args.kwargs['messages'][-1]['content'])
         self.assertNotIn('register_client_request', [tool['function']['name'] for tool in self.ai.call_args.kwargs['tools']])
+
+    async def test_semantic_refusal_takes_priority_over_sales_and_sends_only_apology(self):
+        self.accepted()
+        self.ai.side_effect = [completion(calls=[tool('register_client_request', {}, 'sale'),
+                                                tool('decline_campaign', {}, 'refusal')])]
+        with patch.object(bot.crm, 'create_lead', AsyncMock()) as lead:
+            self.queue('Подобным предложениям не место в моём телефоне')
+            await bot.process_dialog(self.chat)
+            await asyncio.gather(*list(bot._background_tasks))
+        lead.assert_not_awaited()
+        self.ai.assert_awaited_once()
+        self.send.assert_awaited_once()
+        self.assertIn('Извините', self.send.call_args.args[1])
+        self.assertIn(self.chat, bot.contact_opt_out)
+        self.assertNotIn(self.chat, bot.followups)
+        self.assertIn('decline_campaign', [t['function']['name'] for t in self.ai.call_args.kwargs['tools']])
+        self.assertFalse(any(isinstance(m, dict) and m.get('tool_calls') for m in bot.chat_history[self.chat]))
+
+    async def test_semantic_refusal_tool_is_not_offered_without_campaign(self):
+        self.ai.side_effect = [completion('Подскажите возраст ребёнка.')]
+        self.queue('Хочу узнать про математику')
+        await bot.process_dialog(self.chat)
+        self.assertNotIn('decline_campaign', [t['function']['name'] for t in self.ai.call_args.kwargs['tools']])
 
     async def test_diagnostic_callback_uses_chosen_branch_preserving_enrollment(self):
         self.accepted()
@@ -323,14 +390,105 @@ class CampaignDialogTests(unittest.IsolatedAsyncioTestCase):
         self.send.assert_not_awaited()
         self.assertEqual(self.store.report(self.cid)['counts'], {'pending': 1})
 
-    async def test_decline_stops_campaign_without_bot_reply(self):
+    async def test_decline_apologizes_once_and_cancels_pending_sales(self):
         self.accepted()
+        self.queue('Старый вопрос')
+        bot.pending_answers[self.chat] = {'text': 'Старый ответ'}
         await bot._buffer_incoming(self.chat, {'typeMessage': 'textMessage', 'textMessageData': {'textMessage': 'Нет, спасибо'}})
+        await asyncio.gather(*list(bot._background_tasks))
         self.assertFalse(bot.message_buffers)
-        self.send.assert_not_awaited()
+        self.assertNotIn(self.chat, bot.pending_answers)
+        self.send.assert_awaited_once()
+        self.assertEqual(self.send.call_args.args[1], 'Извините, что побеспокоили. Больше не будем присылать вам рекламные сообщения.')
         self.ai.assert_not_awaited()
-        bot._stop_contact(self.chat)
         self.assertIn(self.chat, bot.contact_opt_out)
+        self.assertFalse(bot._outbound_allowed(self.chat))
+        bot.contact_opt_out.clear()
+        await bot._load_conversations()
+        self.assertIn(self.chat, bot.contact_opt_out)
+        await bot._buffer_incoming(self.chat, {'typeMessage': 'textMessage', 'textMessageData': {'textMessage': 'Отстаньте'}})
+        self.send.assert_awaited_once()
+
+    async def test_duplicate_stop_webhooks_send_only_one_apology_via_real_sender(self):
+        self.accepted()
+        data = {'typeWebhook': 'incomingMessageReceived', 'idMessage': 'stop-1', 'timestamp': int(bot.time.time()),
+                'senderData': {'chatId': self.chat},
+                'messageData': {'typeMessage': 'textMessage', 'textMessageData': {'textMessage': 'СТОП'}}}
+        with patch.object(bot, 'send_whatsapp', REAL_SEND), \
+                patch.object(bot, '_wa_acquire_send_slot', AsyncMock(return_value=True)), \
+                patch('httpx.AsyncClient.send', AsyncMock(return_value=httpx.Response(200, json={'idMessage': 'ack-1'}))) as http:
+            await bot.handle_webhook(SimpleNamespace(json=AsyncMock(return_value=data)))
+            await bot.handle_webhook(SimpleNamespace(json=AsyncMock(return_value=data)))
+            await asyncio.gather(*list(bot._background_tasks))
+            self.assertEqual(http.await_count, 1)
+            self.assertFalse(await REAL_SEND(self.chat, 'Обычная реклама'))
+            self.assertEqual(http.await_count, 1)
+        self.assertFalse(self.store.refusal_ack_allowed('77001234567'))
+        self.ai.assert_not_awaited()
+
+    async def test_apology_timeout_never_retries_or_reopens_optout(self):
+        self.accepted()
+        with patch.object(bot, 'send_whatsapp', REAL_SEND), \
+                patch.object(bot, '_wa_acquire_send_slot', AsyncMock(return_value=True)), \
+                patch('httpx.AsyncClient.send', AsyncMock(side_effect=httpx.ReadTimeout('timeout'))) as http:
+            bot._queue_incoming(self.chat, {'typeMessage': 'textMessage', 'textMessageData': {'textMessage': 'Что за спам?!'}}, 'bad-1', None)
+            await asyncio.gather(*list(bot._background_tasks))
+            bot._queue_incoming(self.chat, {'typeMessage': 'textMessage', 'textMessageData': {'textMessage': 'Отстаньте'}}, 'bad-2', None)
+            await asyncio.gather(*list(bot._background_tasks))
+            self.assertEqual(http.await_count, 1)
+        self.assertNotIn(self.chat, bot.pending_answers)
+        self.assertIn(self.chat, bot.contact_opt_out)
+        self.assertEqual(self.store.report(self.cid)['suppressed_contacts'], 1)
+
+    async def test_voice_refusal_uses_kazakh_apology(self):
+        self.accepted()
+        transcription = SimpleNamespace(text='Маған жазбаңыз', usage=None)
+        with patch('httpx.AsyncClient.send', AsyncMock(return_value=httpx.Response(200, content=b'voice', request=httpx.Request('GET', 'https://example.com/voice.ogg')))), \
+                patch.object(bot.openai_client.audio.transcriptions, 'create', AsyncMock(return_value=transcription)):
+            await bot._buffer_incoming(self.chat, {'typeMessage': 'voiceMessage', 'voiceMessageData': {'downloadUrl': 'https://example.com/voice.ogg'}})
+        await asyncio.gather(*list(bot._background_tasks))
+        self.send.assert_awaited_once()
+        self.assertIn('кешіріңіз', self.send.call_args.args[1])
+        self.assertIn(self.chat, bot.contact_opt_out)
+
+    async def test_old_stop_suppresses_without_sending_late_apology(self):
+        self.accepted()
+        data = {'typeWebhook': 'incomingMessageReceived', 'idMessage': 'old-stop', 'timestamp': 1,
+                'senderData': {'chatId': self.chat},
+                'messageData': {'typeMessage': 'textMessage', 'textMessageData': {'textMessage': 'СТОП'}}}
+        with patch.object(bot, 'WA_SKIP_OLD_INCOMING', True):
+            await bot.handle_webhook(SimpleNamespace(json=AsyncMock(return_value=data)))
+        self.assertIn(self.chat, bot.contact_opt_out)
+        self.send.assert_not_awaited()
+
+    async def test_apology_rechecks_expiry_after_send_cooldown(self):
+        self.accepted()
+        current = bot.time.time()
+        async def delayed_slot(chat_id):
+            with self.store.db() as db:
+                db.execute('UPDATE refusal_acks SET created=?', (current-301,))
+            return True
+        with patch.object(bot, 'send_whatsapp', REAL_SEND), \
+                patch.object(bot, '_wa_acquire_send_slot', side_effect=delayed_slot), \
+                patch('httpx.AsyncClient.send', AsyncMock()) as http:
+            bot._handle_contact_refusal(self.chat, 'СТОП', 'stop-1')
+            await asyncio.gather(*list(bot._background_tasks))
+        http.assert_not_awaited()
+        self.assertIn(self.chat, bot.contact_opt_out)
+
+    async def test_one_minute_campaign_has_room_in_shared_sender_and_keeps_reply_reserve(self):
+        self.store.set_limits(self.cid, 60, 60, 300)
+        bot._wa_send_times.extend([NOW-100] * 59)
+        with patch.multiple(bot, WA_MAX_PER_HOUR=120, WA_MAX_PER_DAY=600), \
+                patch.object(bot.time, 'time', return_value=NOW), \
+                patch('httpx.AsyncClient.send', AsyncMock(return_value=httpx.Response(200,
+                    json={'stateInstance': 'authorized'}, request=httpx.Request('GET', 'https://example.com')))):
+            await bot._campaign_tick()
+            self.send.assert_awaited_once()
+            self.send.reset_mock()
+            bot._wa_send_times.append(NOW-100)
+            await bot._campaign_tick()
+            self.send.assert_not_awaited()
 
     async def test_sending_uses_shared_sender_and_records_exact_message(self):
         async def state(request, **kwargs):

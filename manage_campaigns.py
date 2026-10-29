@@ -23,6 +23,11 @@ def main():
     imp.add_argument('--consent-note', default='', help='Подтверждение оператора о согласии всего списка; заполняет только пустое согласие, не отменяет явный отказ')
     for action in ('preview', 'report', 'activate', 'pause', 'cancel'):
         commands.add_parser(action).add_argument('campaign')
+    limits = commands.add_parser('set-limits')
+    limits.add_argument('campaign')
+    limits.add_argument('--interval-sec', type=int, required=True)
+    limits.add_argument('--hourly', type=int, required=True)
+    limits.add_argument('--daily', type=int, required=True)
     export = commands.add_parser('export')
     export.add_argument('campaign')
     export.add_argument('output')
@@ -35,6 +40,9 @@ def main():
         result = store.report(spec['id'])
     elif args.action == 'import':
         result = store.import_rows(args.campaign, read_contacts(args.file, args.sheet), consent_note=args.consent_note)
+    elif args.action == 'set-limits':
+        store.set_limits(args.campaign, args.interval_sec, args.hourly, args.daily)
+        result = store.report(args.campaign)
     elif args.action in ('activate', 'pause', 'cancel'):
         if args.action == 'activate' and os.getenv('CAMPAIGNS_ENABLED', '0').lower() not in ('1', 'true', 'yes'):
             raise ValueError('Сначала включите CAMPAIGNS_ENABLED в окружении службы и перезапустите её, затем активируйте кампанию')

@@ -11,7 +11,29 @@ from zoneinfo import ZoneInfo
 TZ = ZoneInfo('Asia/Almaty')
 WORK_START_HOUR = 9
 WORK_END_HOUR = 20
-DECLINE = re.compile(r'^\s*(?:нет(?:[,\s]+спасибо)?|не\s*интересно|не\s*надо|не\s*нужно|отказ|стоп|жоқ|керек\s+емес)[.!\s]*$', re.I)
+DECLINE = re.compile(r'^\s*(?:(?:спасибо|рахмет|рақмет)[,\s]+(?:но\s+)?)?'
+    r'(?:нет(?:[,\s]+спасибо)?|(?:(?:нам|мне|это)\s+)?не\s*(?:интересно|актуально|надо|нужно)|'
+    r'отказ|стоп|жоқ|керек\s+емес|(?:маған\s+)?қызық\s+емес)[.!\s]*$', re.I)
+CAMPAIGN_COMPLAINT = re.compile(
+    r'\b(?:спам(?:ите|ить|еры?|ом|а)?|за[её]б(?:ал|ала|али)|отвали\w*|достали|задолбали|надоели|лохотрон|мошенники)\b'
+    r'|\b(?:пош[её]л|пошли|иди(?:те)?)\s+(?:на\s*х\w*|к\s+ч[её]рту)\b'
+    r'|\b(?:пожалуюсь|заблокирую|забаню)\b'
+    r'|\bжалоб\w*\b.{0,35}\b(?:рассыл\w*|реклам\w*|сообщени\w*)'
+    r'|\bоткуда\b.{0,35}\b(?:мой|наш|мои|наши)\s+(?:номер|контакт)\w*\b'
+    r'|\bгде\b.{0,15}\b(?:взяли|нашли|получили)\b.{0,25}\b(?:номер|контакт)\w*\b'
+    r'|\bзачем\s+(?:вы\s+)?(?:мне\s+|нам\s+)?(?:пишете|присылаете|отправляете)\b'
+    r'|\b(?:я|мы)\s+не\s+(?:подписывал\w*|соглашал\w*|давал\w*\s+соглас\w*)'
+    r'|\b(?:не\s+нужн\w*|не\s+хоч\w*)\b.{0,30}\b(?:реклам\w*|рассыл\w*|предложени\w*)'
+    r'|\b(?:уберите|исключите|удалите)\s+(?:пожалуйста\s+)?(?:меня|наш\s+номер)\b'
+    r'|\b(?:ошиблись\s+номером|не\s+туда\s+(?:пишете|попали)|нет\s+детей)\b'
+    r'|\b(?:жазбаңыз\w*|шағымданам\w*)\b', re.I)
+
+
+def validate_limits(interval_sec, hourly, daily):
+    values = tuple(int(v) for v in (interval_sec, hourly, daily))
+    if values[0] < 60 or not 1 <= values[1] <= 60 or not 1 <= values[2] <= 300:
+        raise ValueError('Интервал от 60 секунд, максимум 60 в час и 300 за 24 часа')
+    return values
 
 
 def normalize_phone(value):
@@ -46,6 +68,9 @@ class CampaignStore:
               text TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY(campaign, phone, message_id));
             CREATE TABLE IF NOT EXISTS suppressed (phone TEXT PRIMARY KEY, reason TEXT NOT NULL, at REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS receipts (message_id TEXT PRIMARY KEY, status TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS refusal_acks (
+              phone TEXT PRIMARY KEY, incoming_id TEXT NOT NULL, created REAL NOT NULL,
+              state TEXT NOT NULL, message_id TEXT);
             CREATE INDEX IF NOT EXISTS recipient_phone ON recipients(phone, attempt_at);
             ''')
             if 'defer_until' not in {r['name'] for r in db.execute('PRAGMA table_info(recipients)')}:
@@ -77,11 +102,17 @@ class CampaignStore:
             raise ValueError('Текст должен содержать от 1 до 4000 символов')
         interval, hourly, daily = (int(spec.get(k, default)) for k, default in
                                     [('interval_sec', 600), ('hourly', 6), ('daily', 30)])
-        if interval < 60 or not 1 <= hourly <= 20 or not 1 <= daily <= 100:
-            raise ValueError('Недопустимые ограничения кампании')
+        interval, hourly, daily = validate_limits(interval, hourly, daily)
         with self.db() as db:
             db.execute('INSERT INTO campaigns(id,title,message,brief,expires,created,interval_sec,hourly,daily) VALUES(?,?,?,?,?,?,?,?,?)',
                        (spec['id'], spec['title'], spec['message'], spec['brief'], expiry, now, interval, hourly, daily))
+
+    def set_limits(self, campaign, interval_sec, hourly, daily):
+        limits = validate_limits(interval_sec, hourly, daily)
+        with self.db() as db:
+            if not db.execute("UPDATE campaigns SET interval_sec=?,hourly=?,daily=? WHERE id=? AND status NOT IN ('completed','cancelled')",
+                              (*limits, campaign)).rowcount:
+                raise ValueError('Кампания отсутствует или завершена')
 
     def import_rows(self, campaign, rows, consent_note=''):
         counts = {'pending': 0, 'no_consent': 0, 'duplicate': 0, 'invalid': 0, 'suppressed': 0}
@@ -221,6 +252,25 @@ class CampaignStore:
             db.execute('INSERT OR REPLACE INTO suppressed VALUES(?,?,?)', (phone, reason, now))
             db.execute("UPDATE recipients SET state='suppressed',reason=? WHERE phone=? AND state IN ('pending','sending')", (reason, phone))
 
+    def reserve_refusal_ack(self, phone, incoming_id, now=None):
+        """At most one acknowledgement per contact, including after a restart."""
+        now = time.time() if now is None else now
+        with self.db() as db:
+            return bool(db.execute('''INSERT OR IGNORE INTO refusal_acks(phone,incoming_id,created,state)
+                SELECT ?,?,?,'reserved' WHERE EXISTS(SELECT 1 FROM suppressed WHERE phone=?)''',
+                (phone, incoming_id, now, phone)).rowcount)
+
+    def refusal_ack_allowed(self, phone, now=None):
+        now = time.time() if now is None else now
+        with self.db() as db:
+            return bool(db.execute("SELECT 1 FROM refusal_acks WHERE phone=? AND state='reserved' AND created>?",
+                                   (phone, now - 300)).fetchone())
+
+    def finish_refusal_ack(self, phone, state, message_id=None):
+        with self.db() as db:
+            db.execute("UPDATE refusal_acks SET state=?,message_id=? WHERE phone=? AND state='reserved'",
+                       (state, message_id, phone))
+
     def inbound(self, phone, text, message_id, now=None):
         now = time.time() if now is None else now
         context = self.context(phone)
@@ -236,7 +286,8 @@ class CampaignStore:
         # A bare "no" answers the invitation only on the first response. Later
         # it may answer a normal qualification question (e.g. prior experience).
         bare_no = text.strip().lower().strip('.! ') in ('нет', 'жоқ')
-        declined = bool(context and DECLINE.fullmatch(text) and (not bare_no or first_reply))
+        declined = bool(context and ((DECLINE.fullmatch(text) and (not bare_no or first_reply))
+                                    or CAMPAIGN_COMPLAINT.search(text)))
         if declined:
             self.suppress(phone, 'campaign_declined', now)
         return declined
@@ -291,6 +342,11 @@ def dialog_context(campaign, now=None):
     return ('\n[КОНТЕКСТ РАССЫЛКИ GM INTELLECT]\n'
             'Клиент получил/мог получить это предложение. Короткий отклик может относиться к нему; '
             'если клиент явно сменил тему, отвечай на его текущий вопрос. '
+            'Если клиент недоволен именно рассылкой, раздражён нежелательной рекламой или отказывается '
+            'получать предложения, сразу вызови decline_campaign. Это сохранит отказ и отправит одно '
+            'короткое извинение; не уговаривай, не задавай вопросов и не вызывай другие инструменты. '
+            'Не используй decline_campaign для жалобы на урок/оплату, вопроса о цене, отсутствия опыта '
+            'или отказа от одного курса при интересе к другому. '
             'Не начинай заново продажу шахмат. «+» — интерес к диагностике, не бронь. '
             '«Камал»/«Аркада» — выбранный филиал. Уточни только недостающие имя/возраст/филиал. '
             'Для действующего ученика также обсуждай новые направления; для связи используй request_manager_callback. '
