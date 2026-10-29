@@ -243,6 +243,30 @@ class QueueTests(unittest.TestCase):
         self.assertRaises(ValueError, reopened.set_limits, self.cid, 10, 200, 1000)
         self.assertEqual(reopened.report(self.cid)['daily'], 300)
 
+    def test_unlimited_daily_queue_runs_full_window_and_keeps_minute_spacing_after_restart(self):
+        self.store.import_rows(self.cid, [row for n in range(661) for row in rows(str(77001234000+n))])
+        self.store.set_limits(self.cid, 60, 60, 0)
+        self.store.control(self.cid, 'activate', NOW)
+        start = datetime(2026, 10, 28, 9, tzinfo=TZ).timestamp()
+        self.assertIsNone(self.store.claim(start-1))
+        for minute in range(660):
+            at = start + minute*60
+            if minute == 300:
+                self.store = CampaignStore(self.store.path)
+                self.store.recover()
+                self.store.control(self.cid, 'activate', at)
+            entry = self.store.claim(at)
+            self.assertIsNotNone(entry, minute)
+            self.store.result(self.cid, entry['phone'], 'accepted', 'sent-'+str(minute), now=at)
+            if minute in (0, 299, 300, 659):
+                self.assertIsNone(self.store.claim(at+59))
+        self.assertEqual(self.store.report(self.cid)['counts'], {'accepted': 660, 'pending': 1})
+        self.assertIsNone(self.store.claim(start + 11*3600))
+        self.assertFalse(self.store.eligible(self.cid, entry['phone'], start + 11*3600))
+        self.assertIsNotNone(self.store.claim(start + 86400))
+        self.assertRaises(ValueError, self.store.set_limits, self.cid, 60, 60, -1)
+        self.assertEqual(self.store.report(self.cid)['daily'], 0)
+
     def test_complaint_detection_preserves_questions_and_partial_course_choices(self):
         self.active()
         self.store.claim(NOW)
@@ -477,9 +501,10 @@ class CampaignDialogTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(self.chat, bot.contact_opt_out)
 
     async def test_one_minute_campaign_has_room_in_shared_sender_and_keeps_reply_reserve(self):
-        self.store.set_limits(self.cid, 60, 60, 300)
+        self.store.set_limits(self.cid, 60, 60, 0)
+        bot._wa_send_times.extend([NOW-7200] * 700)
         bot._wa_send_times.extend([NOW-100] * 59)
-        with patch.multiple(bot, WA_MAX_PER_HOUR=120, WA_MAX_PER_DAY=600), \
+        with patch.multiple(bot, WA_MAX_PER_HOUR=120, WA_MAX_PER_DAY=0), \
                 patch.object(bot.time, 'time', return_value=NOW), \
                 patch('httpx.AsyncClient.send', AsyncMock(return_value=httpx.Response(200,
                     json={'stateInstance': 'authorized'}, request=httpx.Request('GET', 'https://example.com')))):

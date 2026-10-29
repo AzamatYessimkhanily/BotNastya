@@ -27,7 +27,7 @@ def main():
     limits.add_argument('campaign')
     limits.add_argument('--interval-sec', type=int, required=True)
     limits.add_argument('--hourly', type=int, required=True)
-    limits.add_argument('--daily', type=int, required=True)
+    limits.add_argument('--daily', type=int, required=True, help='Лимит за 24 часа; 0 — без суточного лимита')
     export = commands.add_parser('export')
     export.add_argument('campaign')
     export.add_argument('output')

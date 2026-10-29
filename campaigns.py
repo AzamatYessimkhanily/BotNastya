@@ -31,8 +31,8 @@ CAMPAIGN_COMPLAINT = re.compile(
 
 def validate_limits(interval_sec, hourly, daily):
     values = tuple(int(v) for v in (interval_sec, hourly, daily))
-    if values[0] < 60 or not 1 <= values[1] <= 60 or not 1 <= values[2] <= 300:
-        raise ValueError('Интервал от 60 секунд, максимум 60 в час и 300 за 24 часа')
+    if values[0] < 60 or not 1 <= values[1] <= 60 or values[2] < 0:
+        raise ValueError('Интервал от 60 секунд, максимум 60 в час; суточный лимит от 0 (0 — без лимита)')
     return values
 
 
@@ -186,7 +186,8 @@ class CampaignStore:
                 return None
             # Durable rolling budgets are shared across campaigns and survive restarts.
             times = [r[0] for r in db.execute('SELECT attempt_at FROM recipients WHERE attempt_at>?', (now - 86400,))]
-            if len(times) >= c['daily'] or sum(t > now - 3600 for t in times) >= c['hourly']:
+            if ((c['daily'] > 0 and len(times) >= c['daily'])
+                    or sum(t > now - 3600 for t in times) >= c['hourly']):
                 return None
             if times and now - max(times) < c['interval_sec']:
                 return None

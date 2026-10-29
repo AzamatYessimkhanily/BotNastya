@@ -176,7 +176,7 @@ venv/bin/python manage_campaigns.py preview gm-intellect-2026-10
 ```sh
 venv/bin/python manage_campaigns.py activate gm-intellect-2026-10
 venv/bin/python manage_campaigns.py report gm-intellect-2026-10
-venv/bin/python manage_campaigns.py set-limits gm-intellect-2026-10 --interval-sec 60 --hourly 60 --daily 300
+venv/bin/python manage_campaigns.py set-limits gm-intellect-2026-10 --interval-sec 60 --hourly 60 --daily 0
 venv/bin/python manage_campaigns.py pause gm-intellect-2026-10
 venv/bin/python manage_campaigns.py cancel gm-intellect-2026-10
 venv/bin/python manage_campaigns.py export gm-intellect-2026-10 /private/path/campaign-report.json
@@ -184,14 +184,17 @@ venv/bin/python manage_campaigns.py export gm-intellect-2026-10 /private/path/ca
 
 Одновременно активна одна кампания. Отправка только 09:00–20:00 Asia/Almaty.
 Для GM Intellect по запросу владельца от 29.10.2026: интервал от 60 секунд,
-максимум 60 попыток за скользящий час и 300 за 24 часа. При отсутствии параметров
+максимум 60 попыток за скользящий час, без отдельного суточного лимита (`daily: 0`).
+За полное окно 09:00–20:00 теоретически доступно 660 отправок; ожидание ответа,
+транспорта и другие проверки могут уменьшить фактическое число. При отсутствии параметров
 в новом описании кампании используются 10 минут, 6 в час и 30 в сутки.
 Эти значения — ограничения нагрузки, а не «безопасный порог» WhatsApp.
 Они сохраняются в SQLite между перезапусками и действуют совместно с общим
 лимитом WhatsApp. Диалоги и служебные сообщения имеют приоритет: кампания
 не стартует при ожидающих ответах и расходовании половины общей квоты.
-Для этого режима общие `WA_MAX_PER_HOUR=120`, `WA_MAX_PER_DAY=600`,
-`WA_WARMUP_MODE=0` оставляют половину бюджета для диалогов. Ответы клиентам
+Для этого режима общие `WA_MAX_PER_HOUR=120`, `WA_MAX_PER_DAY=0`,
+`WA_WARMUP_MODE=0`: общего суточного потолка нет, половина часового бюджета
+остаётся для диалогов. Ответы клиентам
 могут уменьшить фактический объём рассылки. `set-limits` меняет только темп,
 сохраняя историю попыток, отказы, текущий статус и израсходованные квоты.
 Сотрудники и отписавшиеся исключаются, недавно активные чаты откладываются
