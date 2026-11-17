@@ -31,7 +31,7 @@ class SchoolGradeIsNotAge(unittest.TestCase):
 
 class ClosedBranchesAreNotRouted(unittest.TestCase):
     def test_closed_partner_schools_not_guessed(self):
-        for text in ("Riviera", "в ривьеру", "Steppe school", "МША", "у нас тест по математике"):
+        for text in ("Riviera", "в ривьеру", "Steppe school", "МША", "РФМШ", "у нас тест по математике"):
             self.assertIsNone(bot._guess_filial_from_text(text), text)
 
     def test_our_branches_still_recognized(self):
@@ -46,6 +46,7 @@ class PromptCarriesAuditRules(unittest.TestCase):
         self.assertIn("ЗАКРЫТЫЕ ШКОЛЫ", prompt)
         self.assertIn("ВОЗРАСТ ПО КЛАССУ", prompt)
         self.assertNotIn("GM Legends Riviera International School: Томирис", prompt)
+        self.assertNotIn("РФМШ: Томирис", prompt)
         self.assertIn("ул. Айтеке би 15", prompt)
 
     def test_fallback_no_longer_says_not_confirmed(self):
