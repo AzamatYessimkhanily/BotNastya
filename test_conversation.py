@@ -402,7 +402,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         with patch('httpx.AsyncClient.post', AsyncMock(return_value=response)) as post:
             await HYDRATE(self.chat)
             await HYDRATE(self.chat)
-            post.assert_awaited_once()
+            self.assertEqual(post.await_count, 2)
         self.assertEqual([m['content'] for m in bot.chat_history[self.chat] if m['role'] != 'system'],
                          ['Ребёнок 11 лет, 4 разряд', 'Какой филиал?'])
         self.assertEqual(bot.conversation_facts[self.chat]['age'], '11')

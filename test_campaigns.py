@@ -96,6 +96,50 @@ class QueueTests(unittest.TestCase):
         self.assertIsNone(self.store.claim(NOW + 4*86400))
         self.assertEqual(self.store.report(self.cid)['reason'], 'expired')
 
+    def test_health_retry_survives_restart_and_holds_entire_queue_without_quota_cost(self):
+        self.store.import_rows(self.cid, rows() + rows('77001234568'))
+        self.store.control(self.cid, 'activate', NOW)
+        entry = self.store.claim(NOW)
+        self.assertTrue(self.store.defer(self.cid, entry['phone'], NOW+300, 'account_health_unavailable'))
+        self.store.retry_health(self.cid, NOW+300)
+        reopened = CampaignStore(self.store.path)
+        reopened.recover()
+        self.assertEqual(reopened.report(self.cid)['status'], 'active')
+        self.assertEqual(reopened.report(self.cid)['counts'], {'pending': 2})
+        with reopened.db() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM recipients WHERE attempt_at IS NOT NULL').fetchone()[0], 0)
+        self.assertIsNone(reopened.claim(NOW+299))
+        self.assertEqual(reopened.claim(NOW+300)['phone'], entry['phone'])
+        reopened.health_ready(self.cid)
+        self.assertEqual(reopened.report(self.cid)['retry_after'], 0)
+        self.assertEqual(reopened.report(self.cid)['reason'], '')
+
+    def test_health_retry_never_overrides_operator_or_provider_pause(self):
+        self.active()
+        for reason in ('operator_pause', 'provider_restriction', 'instance_blocked'):
+            with self.subTest(reason=reason):
+                self.store.control(self.cid, 'activate', NOW)
+                self.store.retry_health(self.cid, NOW+300)
+                self.store.pause_all(reason)
+                # A late failed/successful health response cannot undo the pause.
+                self.store.retry_health(self.cid, NOW+600)
+                self.store.health_ready(self.cid)
+                self.store.recover()
+                report = self.store.report(self.cid)
+                self.assertEqual((report['status'], report['reason']), ('paused', reason))
+                self.assertIsNone(self.store.claim(NOW+1000))
+        self.store.control(self.cid, 'cancel', NOW)
+        self.store.retry_health(self.cid, NOW+600)
+        self.store.health_ready(self.cid)
+        self.assertEqual(self.store.report(self.cid)['status'], 'cancelled')
+
+    def test_health_retry_still_obeys_working_window_and_expiry(self):
+        self.active()
+        self.store.retry_health(self.cid, NOW+300)
+        self.assertIsNone(self.store.claim(NOW+9*3600))
+        self.assertIsNone(self.store.claim(NOW+4*86400))
+        self.assertEqual(self.store.report(self.cid)['reason'], 'expired')
+
     def test_no_sending_in_quiet_hours_or_without_consent(self):
         self.assertRaises(ValueError, self.store.control, self.cid, 'activate', NOW)
         self.active()
@@ -413,6 +457,77 @@ class CampaignDialogTests(unittest.IsolatedAsyncioTestCase):
             await bot._campaign_tick()
         self.send.assert_not_awaited()
         self.assertEqual(self.store.report(self.cid)['counts'], {'pending': 1})
+
+    async def test_health_timeout_retries_after_restart_then_sends_exactly_once(self):
+        calls = []
+        async def http(request, **kwargs):
+            calls.append(request.method)
+            if len(calls) == 1:
+                raise httpx.ReadTimeout('temporary outage', request=request)
+            body = {'stateInstance': 'authorized'} if request.method == 'GET' else {'idMessage': 'after-recovery'}
+            return httpx.Response(200, request=request, json=body)
+        with patch.object(bot, 'send_whatsapp', REAL_SEND), \
+                patch.object(bot, '_wa_acquire_send_slot', AsyncMock(return_value=True)), \
+                patch('httpx.AsyncClient.send', side_effect=http), \
+                patch.object(bot.time, 'time', return_value=NOW) as clock:
+            await bot._campaign_tick()
+            report = self.store.report(self.cid)
+            self.assertEqual(report['status'], 'active')
+            self.assertEqual(report['counts'], {'pending': 1})
+            self.assertEqual(report['retry_after'], NOW+300)
+            self.assertIsNone(self.store.context('77001234567'))
+            CampaignStore(self.store.path).recover()
+            clock.return_value = NOW+299
+            await bot._campaign_tick()
+            self.assertEqual(calls, ['GET'])
+            clock.return_value = NOW+300
+            await bot._campaign_tick()
+            await bot._campaign_tick()
+        self.assertEqual(calls, ['GET', 'GET', 'POST'])
+        self.assertEqual(self.store.report(self.cid)['counts'], {'accepted': 1})
+        self.assertEqual(self.store.report(self.cid)['retry_after'], 0)
+        self.assertEqual(self.store.context('77001234567')['message_id'], 'after-recovery')
+
+    async def test_temporary_health_failures_keep_retrying_without_sending(self):
+        responses = [httpx.Response(code, request=httpx.Request('GET', 'https://example.com'))
+                     for code in (408, 429, 503)]
+        responses += [httpx.Response(200, request=httpx.Request('GET', 'https://example.com'), content=b'bad json'),
+                      httpx.Response(200, request=httpx.Request('GET', 'https://example.com'), json=[])]
+        with patch('httpx.AsyncClient.send', side_effect=responses) as http, \
+                patch.object(bot.time, 'time', return_value=NOW) as clock:
+            for index in range(len(responses)):
+                clock.return_value = NOW+300*index
+                await bot._campaign_tick()
+                report = self.store.report(self.cid)
+                self.assertEqual(report['status'], 'active')
+                self.assertEqual(report['counts'], {'pending': 1})
+                self.assertEqual(report['retry_after'], NOW+300*(index+1))
+            self.assertEqual(http.await_count, len(responses))
+        self.send.assert_not_awaited()
+
+    async def test_unauthorized_health_state_requires_manual_action(self):
+        for state in ('blocked', 'notAuthorized', 'yellowCard'):
+            with self.subTest(state=state):
+                self.store.control(self.cid, 'activate', NOW)
+                with patch('httpx.AsyncClient.send', return_value=httpx.Response(200,
+                        request=httpx.Request('GET', 'https://example.com'), json={'stateInstance': state})), \
+                        patch.object(bot.time, 'time', return_value=NOW+600):
+                    await bot._campaign_tick()
+                report = self.store.report(self.cid)
+                self.assertEqual((report['status'], report['reason']), ('paused', 'instance_'+state))
+                # Make the deferred row available for the next independent case.
+                with self.store.db() as db:
+                    db.execute('UPDATE recipients SET defer_until=0')
+        self.send.assert_not_awaited()
+
+    async def test_health_permission_error_is_not_automatically_retried(self):
+        with patch('httpx.AsyncClient.send', return_value=httpx.Response(403,
+                request=httpx.Request('GET', 'https://example.com'))), \
+                patch.object(bot.time, 'time', return_value=NOW):
+            await bot._campaign_tick()
+        report = self.store.report(self.cid)
+        self.assertEqual((report['status'], report['reason']), ('paused', 'account_health_http_403'))
+        self.send.assert_not_awaited()
 
     async def test_decline_apologizes_once_and_cancels_pending_sales(self):
         self.accepted()

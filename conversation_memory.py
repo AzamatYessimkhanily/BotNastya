@@ -19,6 +19,14 @@ def load_snapshots(path):
         return [(chat, json.loads(payload)) for chat, payload in db.execute('SELECT chat_id, payload FROM conversations')]
 
 
+def recovery_epoch(path, initial):
+    """Keep the first recovery activation across restarts; don't replay pre-upgrade chats."""
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute('CREATE TABLE IF NOT EXISTS recovery_metadata (key TEXT PRIMARY KEY, value REAL NOT NULL)')
+        db.execute("INSERT OR IGNORE INTO recovery_metadata VALUES ('enabled_since', ?)", (initial,))
+        return float(db.execute("SELECT value FROM recovery_metadata WHERE key='enabled_since'").fetchone()[0])
+
+
 STOP_CONTACT = re.compile(
     r'\bне\s+(?:(?:надо|нужно|хочу|смейте?)\s+)?(?:мне\s+|нам\s+|больше\s+)*'
     r'(?:пиши(?:те)?|писать|звони(?:те)?|звонить|беспокой(?:те)?|беспокоить|'

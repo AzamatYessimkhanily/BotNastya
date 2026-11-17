@@ -75,6 +75,8 @@ class CampaignStore:
             ''')
             if 'defer_until' not in {r['name'] for r in db.execute('PRAGMA table_info(recipients)')}:
                 db.execute('ALTER TABLE recipients ADD COLUMN defer_until REAL NOT NULL DEFAULT 0')
+            if 'retry_after' not in {r['name'] for r in db.execute('PRAGMA table_info(campaigns)')}:
+                db.execute('ALTER TABLE campaigns ADD COLUMN retry_after REAL NOT NULL DEFAULT 0')
         Path(self.path).chmod(0o600)
 
     @contextmanager
@@ -162,14 +164,27 @@ class CampaignStore:
                 if not db.execute("SELECT 1 FROM recipients WHERE campaign=? AND state='pending'", (campaign,)).fetchone():
                     raise ValueError('Нет получателей с подтверждённым согласием')
             status = {'activate': 'active', 'pause': 'paused', 'cancel': 'cancelled'}[action]
-            db.execute('UPDATE campaigns SET status=?,reason=? WHERE id=?', (status, 'operator_' + action, campaign))
+            db.execute('UPDATE campaigns SET status=?,reason=?,retry_after=0 WHERE id=?', (status, 'operator_' + action, campaign))
             if action == 'cancel':
                 db.execute("UPDATE recipients SET state='cancelled' WHERE campaign=? AND state='pending'", (campaign,))
 
     def recover(self):
         with self.db() as db:
             db.execute("UPDATE recipients SET state='uncertain',reason='process_restarted' WHERE state='sending'")
-            db.execute("UPDATE campaigns SET status='paused',reason='process_restarted' WHERE status='active'")
+            # A failed GET never sent a message. Its durable retry can continue
+            # after a restart without undoing an operator/provider pause.
+            db.execute("""UPDATE campaigns SET status='paused',reason='process_restarted'
+                WHERE status='active' AND reason!='account_health_unavailable'""")
+
+    def retry_health(self, campaign, until):
+        with self.db() as db:
+            db.execute("""UPDATE campaigns SET reason='account_health_unavailable',retry_after=?
+                WHERE id=? AND status='active'""", (until, campaign))
+
+    def health_ready(self, campaign):
+        with self.db() as db:
+            db.execute("""UPDATE campaigns SET reason='',retry_after=0
+                WHERE id=? AND status='active' AND reason='account_health_unavailable'""", (campaign,))
 
     def pause_all(self, reason):
         with self.db() as db:
@@ -182,7 +197,7 @@ class CampaignStore:
             db.execute('BEGIN IMMEDIATE')
             db.execute("UPDATE campaigns SET status='completed',reason='expired' WHERE status='active' AND expires>0 AND expires<=?", (now,))
             c = db.execute("SELECT * FROM campaigns WHERE status='active' ORDER BY created LIMIT 1").fetchone()
-            if not c or not WORK_START_HOUR <= local.hour < WORK_END_HOUR:
+            if not c or c['retry_after'] > now or not WORK_START_HOUR <= local.hour < WORK_END_HOUR:
                 return None
             # Durable rolling budgets are shared across campaigns and survive restarts.
             times = [r[0] for r in db.execute('SELECT attempt_at FROM recipients WHERE attempt_at>?', (now - 86400,))]

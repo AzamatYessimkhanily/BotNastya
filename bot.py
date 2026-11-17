@@ -7,7 +7,7 @@ import io
 import logging
 import time
 from contextvars import ContextVar
-from conversation_memory import save_snapshot, load_snapshots, STOP_CONTACT, AUTO_REPLY, update_facts, remove_answered_questions, has_question
+from conversation_memory import save_snapshot, load_snapshots, recovery_epoch, STOP_CONTACT, AUTO_REPLY, update_facts, remove_answered_questions, has_question
 from weakref import WeakValueDictionary
 from collections import defaultdict, deque
 from datetime import date, datetime, timedelta
@@ -52,6 +52,7 @@ DAILY_REPORT_ENABLED = os.getenv("DAILY_REPORT_ENABLED", "1").lower() in ("1", "
 DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "9"))
 CAMPAIGNS_ENABLED = os.getenv("CAMPAIGNS_ENABLED", "0").lower() in ("1", "true", "yes")
 CAMPAIGN_STATE_FILE = os.getenv("CAMPAIGN_STATE_FILE", "campaigns.sqlite3")
+CAMPAIGN_HEALTH_RETRY_SEC = 300
 if not 0 <= DAILY_REPORT_HOUR <= 23:
     raise ValueError("DAILY_REPORT_HOUR must be 0..23")
 MOYKLASS_API_KEY = os.getenv("MOYKLASS_API_KEY")
@@ -85,8 +86,12 @@ WA_FLOOD_PAUSE_SEC = float(os.getenv("WA_FLOOD_PAUSE_SEC", "180") or "180")
 # Входящие WhatsApp, накопленные пока бот был выключен / слишком старые — не отвечаем.
 _SKIP_OLD_IN_ENV = os.getenv("WA_SKIP_OLD_INCOMING", "1").strip().lower()
 WA_SKIP_OLD_INCOMING = _SKIP_OLD_IN_ENV in ("1", "true", "yes", "on")
-WA_INCOMING_MAX_AGE_SEC = int(os.getenv("WA_INCOMING_MAX_AGE_SEC", "600") or "600")
+WA_INCOMING_MAX_AGE_SEC = int(os.getenv("WA_INCOMING_MAX_AGE_SEC", "86400") or "86400")
 WA_INCOMING_CLOCK_SKEW_SEC = int(os.getenv("WA_INCOMING_CLOCK_SKEW_SEC", "30") or "30")
+INCOMING_RECOVERY_ENABLED = os.getenv("INCOMING_RECOVERY_ENABLED", "1").lower() in ("1", "true", "yes", "on")
+INCOMING_RECOVERY_SINCE = BOT_STARTED_AT
+GREEN_HISTORY_MIN_INTERVAL_SEC = 1.05  # Provider limit: one getChatHistory per second per instance.
+INCOMING_DEDUP_LIMIT = 10000  # At least the entire maximum incoming journal response.
 # Режим «прогрева» нового/разбаненного номера: жёстче лимиты, пока WA_WARMUP_MODE=1.
 _WA_WARMUP_ENV = os.getenv("WA_WARMUP_MODE", "1").strip().lower()
 WA_WARMUP_MODE = _WA_WARMUP_ENV in ("1", "true", "yes", "on")
@@ -142,6 +147,7 @@ _SCHOOL_TZ = ZoneInfo("Asia/Almaty")
 # --- Монитор посещаемости (долг на 2-м визите / не отмечен через N минут) ---
 # По умолчанию ВЫКЛ в коде; на сервере включаем ATTENDANCE_MONITOR_ENABLED=1 + тест-номер.
 import attendance_monitor as _attendance_monitor  # noqa: E402
+import teacher_reminders as _teacher_reminders  # noqa: E402
 
 _QUANTUM_CONTACT_LINE = "Quantum STEM School: запись через администрацию школы."
 
@@ -772,6 +778,10 @@ latest_incoming_timestamps: Dict[str, int] = {}
 history_hydrated: set = set()
 _outbound_context = ContextVar("outbound_context", default=None)
 pending_answers: Dict[str, dict] = {}
+pending_inputs: Dict[str, list] = {}
+_processing_inputs: Dict[str, list] = {}
+_history_lock = None
+_history_last_request = 0.0
 
 
 def _ledger():
@@ -826,6 +836,8 @@ def _save_conversation(chat_id):
         "crm_notice": crm_notify_recent.get(chat_id), "last_activity": last_activity.get(chat_id),
         "manager_notified": session_manager_notified.get(chat_id),
         "pending_answer": pending_answers.get(chat_id),
+        "pending_inputs": pending_inputs.get(chat_id, []),
+        "latest_incoming_timestamp": latest_incoming_timestamps.get(chat_id),
         "followup": followups.get(chat_id),
         "followup_blocked": chat_id in followup_blocked,
         "known_user": {k: v for k, v in known_users.get(chat_id, {}).items()
@@ -837,6 +849,8 @@ def _save_conversation(chat_id):
 
 @app.on_event("startup")
 async def _load_conversations():
+    global INCOMING_RECOVERY_SINCE
+    INCOMING_RECOVERY_SINCE = recovery_epoch(CONVERSATION_STATE_FILE, BOT_STARTED_AT)
     # Fail startup on unreadable state: never silently forget a contact refusal.
     for chat_id, state in load_snapshots(CONVERSATION_STATE_FILE):
         if state.get("history"):
@@ -854,6 +868,10 @@ async def _load_conversations():
             crm_lookup_state[chat_id] = state["crm_lookup"]
         if state.get("pending_answer"):
             pending_answers[chat_id] = state["pending_answer"]
+        if state.get("latest_incoming_timestamp"):
+            latest_incoming_timestamps[chat_id] = state["latest_incoming_timestamp"]
+        if state.get("pending_inputs"):
+            pending_inputs[chat_id] = state["pending_inputs"]
         # Backfill facts newly recognized by this version without replacing
         # facts already persisted from the full (possibly trimmed) conversation.
         recovered_facts = {}
@@ -869,7 +887,7 @@ async def _load_conversations():
         # Earlier integer-only parsing read «4,5 года» as «5 года».
         if re.fullmatch(r'\d{1,2}[.,]\d+', recovered_facts.get("age", "")):
             conversation_facts[chat_id]["age"] = recovered_facts["age"]
-        seen_incoming_ids[chat_id].extend(state.get("incoming_ids", [])[-400:])
+        seen_incoming_ids[chat_id].extend(state.get("incoming_ids", [])[-INCOMING_DEDUP_LIMIT:])
         for key, target in (("opt_out", contact_opt_out), ("hydrated", history_hydrated), ("internal", internal_chats),
                             ("followup_sent", followup_sent), ("registered", session_registered_leads)):
             if state.get(key):
@@ -892,6 +910,18 @@ async def _load_conversations():
             _block_followup(chat_id, "restored_closed_dialog")
         elif state.get("followup") and not _chat_looks_followup_closed(chat_id):
             followups[chat_id] = state["followup"]
+    for chat_id, inputs in list(pending_inputs.items()):
+        if chat_id in contact_opt_out or _is_internal_chat(chat_id):
+            pending_inputs.pop(chat_id, None)
+            _save_conversation(chat_id)
+            continue
+        for item in list(inputs):
+            if item.get("timestamp") is not None and _should_skip_stale_incoming({"timestamp": item["timestamp"]}):
+                _consume_inputs(chat_id, [item["id"]])
+                _save_conversation(chat_id)
+                continue
+            data = dict(item["data"], _history_saved=bool(item.get("in_history")))
+            _queue_incoming(chat_id, data, item["id"], item.get("timestamp"), restoring=True)
 
 
 def _stop_contact(chat_id):
@@ -900,6 +930,7 @@ def _stop_contact(chat_id):
         campaign_store.suppress(chat_id.split('@')[0], 'contact_opt_out')
     contact_opt_out.add(chat_id)
     pending_answers.pop(chat_id, None)
+    pending_inputs.pop(chat_id, None)
     incoming_versions[chat_id] += 1
     pending = message_buffers.pop(chat_id, None)
     if pending and pending.get("timer"):
@@ -969,7 +1000,7 @@ _FOLLOWUP_REFUSAL_RE = re.compile(
     re.IGNORECASE,
 )
 # Защита от повторной доставки одного и того же входящего (Green API) и гонок при обработке
-seen_incoming_ids: Dict[str, deque] = defaultdict(lambda: deque(maxlen=400))
+seen_incoming_ids: Dict[str, deque] = defaultdict(lambda: deque(maxlen=INCOMING_DEDUP_LIMIT))
 _dialog_locks = WeakValueDictionary()
 _incoming_locks = WeakValueDictionary()
 
@@ -2993,10 +3024,10 @@ def _should_skip_stale_incoming(data: dict) -> bool:
             return True
         return False
     now = int(time.time())
-    if ts < BOT_STARTED_AT - WA_INCOMING_CLOCK_SKEW_SEC:
+    if ts < INCOMING_RECOVERY_SINCE - WA_INCOMING_CLOCK_SKEW_SEC:
         logger.info(
             "anti-ban: входящее timestamp=%s < старт=%s — бэклог, пропуск",
-            ts, BOT_STARTED_AT,
+            ts, INCOMING_RECOVERY_SINCE,
         )
         return True
     if WA_INCOMING_MAX_AGE_SEC > 0 and (now - ts) > WA_INCOMING_MAX_AGE_SEC:
@@ -3039,10 +3070,12 @@ async def send_whatsapp(chat_id, text, *, sanitize_fallback: str = "handoff", sa
             return False
 
     context = _outbound_context.get()
-    if context and context[0] == chat_id and context[2] == "dialog":
-        # Webhooks can lag behind WhatsApp. Check again after any send cooldown,
-        # before committing a response based on an incomplete client reply.
-        await _refresh_pending_incoming(chat_id)
+    if context and context[0] == chat_id and context[2] in ("dialog", "followup"):
+        # Check after the send cooldown too. A reminder requires a successful
+        # check; a normal reply can still proceed during a journal outage.
+        checked = await _refresh_pending_incoming(chat_id)
+        if context[2] == "followup" and not checked:
+            return False
         if not _outbound_allowed(chat_id):
             return False
 
@@ -3177,8 +3210,8 @@ async def _campaign_tick():
     try:
         async with _dialog_lock(chat_id):
             await _hydrate_chat_history(chat_id)
-            def return_unsent(reason):
-                retry_at = max(time.time() + 60, last_activity.get(chat_id, 0) + 24 * 3600 + 1)
+            def return_unsent(reason, retry_delay=60):
+                retry_at = max(time.time() + retry_delay, last_activity.get(chat_id, 0) + 24 * 3600 + 1)
                 if (chat_id in contact_opt_out or _is_internal_chat(chat_id)
                         or not store.defer(campaign, phone, retry_at, reason)):
                     store.result(campaign, phone, 'skipped', reason=reason)
@@ -3195,13 +3228,29 @@ async def _campaign_tick():
                 async with httpx.AsyncClient(timeout=15) as client:
                     response = await client.get(f'{GREEN_API_URL}/waInstance{GREEN_API_ID}/getStateInstance/{GREEN_API_TOKEN}')
                     response.raise_for_status()
-                    authorized = response.json().get('stateInstance') == 'authorized'
-                if not authorized:
-                    raise RuntimeError('account_not_authorized')
-            except Exception:
-                return_unsent('account_health_unavailable')
-                store.pause_all('account_health_unavailable')
+                    body = response.json()
+                    account_state = body.get('stateInstance') if isinstance(body, dict) else None
+                    if not isinstance(account_state, str) or not account_state:
+                        raise ValueError('missing_account_state')
+            except (httpx.HTTPError, ValueError) as exc:
+                status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+                if status is not None and status not in (408, 429) and status < 500:
+                    return_unsent('account_health_http_' + str(status))
+                    store.pause_all('account_health_http_' + str(status))
+                    logger.error('Campaign health check rejected: HTTP %s; campaign paused', status)
+                    return
+                return_unsent('account_health_unavailable', CAMPAIGN_HEALTH_RETRY_SEC)
+                store.retry_health(campaign, time.time() + CAMPAIGN_HEALTH_RETRY_SEC)
+                # Never log exception text: the URL can contain the API token.
+                logger.warning('Campaign health check unavailable (%s, HTTP %s); retry in %ss',
+                               type(exc).__name__, status, CAMPAIGN_HEALTH_RETRY_SEC)
                 return
+            if account_state != 'authorized':
+                return_unsent('account_not_authorized')
+                store.pause_all('instance_' + account_state)
+                logger.error('Campaign account is not authorized; campaign paused')
+                return
+            store.health_ready(campaign)
             await send_whatsapp(chat_id, entry['message'], sanitize=False, before_send=eligible, delivery_result=result)
             if result['state'] == 'skipped':
                 return_unsent(result['reason'])
@@ -3239,6 +3288,51 @@ async def _start_campaign_worker():
         _spawn_task(_campaign_loop())
 
 
+async def _get_chat_history(chat_id, count=60):
+    """Share the provider's per-instance history quota across all readers."""
+    global _history_lock, _history_last_request
+    if _history_lock is None:
+        _history_lock = asyncio.Lock()
+    async with _history_lock:
+        wait = _history_last_request + GREEN_HISTORY_MIN_INTERVAL_SEC - time.monotonic()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        try:
+            url = f"{GREEN_API_URL}/waInstance{GREEN_API_ID}/getChatHistory/{GREEN_API_TOKEN}"
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                response = await client.post(url, json={"chatId": chat_id, "count": count})
+            response.raise_for_status()
+            messages = response.json()
+            if not isinstance(messages, list):
+                raise ValueError("Invalid history response")
+            return messages
+        finally:
+            # Space requests from completion too, including slow connections.
+            _history_last_request = time.monotonic()
+
+
+def _journal_text(message):
+    text = message.get("textMessage")
+    if isinstance(text, str) and text.strip():
+        return text
+    extended = message.get("extendedTextMessage")
+    if isinstance(extended, dict) and isinstance(extended.get("text"), str):
+        return extended["text"]
+    return ""
+
+
+def _journal_message_data(message):
+    kind = message.get("typeMessage")
+    if kind in ("textMessage", "extendedTextMessage", "quotedMessage"):
+        text = _journal_text(message)
+        if text.strip():
+            return {"typeMessage": "textMessage", "textMessageData": {"textMessage": text},
+                    "quotedMessage": message.get("quotedMessage")}
+    if kind in ("audioMessage", "voiceMessage") and message.get("downloadUrl"):
+        return {"typeMessage": kind, "fileMessageData": {"downloadUrl": message["downloadUrl"]}}
+    return None
+
+
 async def _refresh_pending_incoming(chat_id):
     """Best-effort recovery of recent text messages whose webhooks are delayed.
 
@@ -3246,98 +3340,100 @@ async def _refresh_pending_incoming(chat_id):
     old history, other chats, or messages already accepted through either path.
     """
     since = latest_incoming_timestamps.get(chat_id)
-    if since is None or not _outbound_allowed(chat_id):
-        return
+    if since is None:
+        since = followups.get(chat_id, {}).get("last_client_ts") or last_activity.get(chat_id)
+    if not _outbound_allowed(chat_id):
+        return False
     try:
-        url = f"{GREEN_API_URL}/waInstance{GREEN_API_ID}/getChatHistory/{GREEN_API_TOKEN}"
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            response = await client.post(url, json={"chatId": chat_id, "count": 20})
-        response.raise_for_status()
-        messages = response.json()
-        if not isinstance(messages, list):
-            raise ValueError("Invalid history response")
+        messages = await _get_chat_history(chat_id)
     except Exception as error:
         logger.warning("Fresh history unavailable for %s (%s)", chat_id, type(error).__name__)
-        return
+        return False
     if not _outbound_allowed(chat_id):
-        return
+        return False
     recovered = 0
     for message in reversed(messages):
         if not isinstance(message, dict) or message.get("chatId") != chat_id:
             continue
         timestamp = _incoming_message_timestamp(message)
         if (message.get("type") != "incoming" or message.get("isDeleted")
-                or timestamp is None or timestamp < since
+                or timestamp is None or (since is not None and timestamp < since)
                 or not message.get("idMessage")
                 or message["idMessage"] in seen_incoming_ids[chat_id]):
             continue
-        if message.get("typeMessage") not in ("textMessage", "extendedTextMessage", "quotedMessage"):
+        data = _journal_message_data(message)
+        if data is None:
             continue
-        extended = message.get("extendedTextMessage") or {}
-        text = message.get("textMessage") or (extended.get("text") if isinstance(extended, dict) else "")
-        if not isinstance(text, str) or not text.strip():
-            continue
-        event = {"timestamp": timestamp}
-        if _should_skip_stale_incoming(event):
-            continue
+        text = _extract_main_text(data)
         if STOP_CONTACT.search(text):
-            _handle_contact_refusal(chat_id, text, str(message['idMessage']))
-            return
+            _handle_contact_refusal(chat_id, text, str(message['idMessage']), acknowledge=False)
+            return False
+        if _should_skip_stale_incoming({"timestamp": timestamp}):
+            context = _outbound_context.get()
+            if context and context[0] == chat_id and context[2] == "followup":
+                _block_followup(chat_id, "unanswered_historical_input")
+                return False
+            continue
         # Share webhook deduplication and the per-chat ingress lock. A webhook
         # arriving during the request or later cannot queue the same text twice.
-        _queue_incoming(chat_id, {
-            "typeMessage": "textMessage", "textMessageData": {"textMessage": text},
-            "quotedMessage": message.get("quotedMessage"),
-        }, message["idMessage"], timestamp)
+        _queue_incoming(chat_id, data, message["idMessage"], timestamp)
         recovered += 1
     if recovered:
         logger.info("dialog: recovered %d delayed incoming message(s) for %s; discarded stale answer",
                     recovered, chat_id)
+    return True
 
 
 async def _hydrate_chat_history(chat_id):
-    """Read this chat only, once; never send messages or scan unrelated chats.
+    """Merge missed earlier inputs before each dialog without replacing local tool history.
 
     Green API returns newest first: https://green-api.com/en/docs/api/journals/GetChatHistory/
     """
-    if chat_id in history_hydrated or chat_id in chat_history:
-        return
+    existing = bool(chat_history.get(chat_id))
     try:
-        url = f"{GREEN_API_URL}/waInstance{GREEN_API_ID}/getChatHistory/{GREEN_API_TOKEN}"
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            response = await client.post(url, json={"chatId": chat_id, "count": 60})
-        response.raise_for_status()
-        messages = response.json()
-        if not isinstance(messages, list):
-            raise ValueError("Invalid history response")
+        messages = await _get_chat_history(chat_id)
     except Exception as error:
         # URLs contain credentials; do not log the HTTP exception text.
         logger.warning("History unavailable for %s (%s)", chat_id, type(error).__name__)
         return
     history_hydrated.add(chat_id)
-    history = [{"role": "system", "content": SYSTEM_PROMPT},
+    history = chat_history.get(chat_id) or [{"role": "system", "content": SYSTEM_PROMPT},
                {"role": "system", "content": "[ТЕЛЕФОН КЛИЕНТА]: " + chat_id.split("@")[0] +
                 ". Номер известен из WhatsApp; используй для заявки, не спрашивай повторно."}]
     facts = conversation_facts.setdefault(chat_id, {})
+    recovered_facts = {}
+    previous_question = ""
+    current_timestamp = latest_incoming_timestamps.get(chat_id)
     for message in reversed(messages):
         if not isinstance(message, dict) or message.get("chatId") != chat_id:
             continue
-        if message.get("idMessage") in seen_incoming_ids[chat_id] or message.get("isDeleted"):
+        if message.get("isDeleted"):
             continue
-        content = message.get("textMessage") or ""
-        if not isinstance(content, str) or not content.strip():
+        content = _journal_text(message)
+        if not content.strip():
+            continue
+        if message.get("type") == "outgoing" and message.get("statusMessage") in ("sent", "delivered", "read"):
+            previous_question = content
+        if message.get("idMessage") in seen_incoming_ids[chat_id]:
             continue
         if message.get("type") == "incoming":
+            timestamp = _incoming_message_timestamp(message)
+            # A newer input must go through the normal queue and cancel this
+            # answer, rather than be marked seen by a context-only import.
+            if current_timestamp is not None and timestamp is not None and timestamp > current_timestamp:
+                continue
             if STOP_CONTACT.search(content):
                 _stop_contact(chat_id)
             if AUTO_REPLY.search(content):
                 _block_followup(chat_id, "historical_auto_reply")
-            previous_question = next((m["content"] for m in reversed(history) if m["role"] == "assistant"), "")
-            update_facts(facts, content, last_question=previous_question)
-            history.append({"role": "user", "content": content})
+            update_facts(recovered_facts, content, last_question=previous_question)
+            # Legacy snapshots didn't store IDs for every history message.
+            if not any(m.get("role") == "user" and _bare_client_text(m.get("content")) == content
+                       for m in history if isinstance(m, dict)):
+                history.append({"role": "user", "content": content})
             if message.get("idMessage"):
                 seen_incoming_ids[chat_id].append(message["idMessage"])
-        elif message.get("type") == "outgoing" and message.get("statusMessage") in ("sent", "delivered", "read"):
+        elif not existing and message.get("type") == "outgoing" and message.get("statusMessage") in ("sent", "delivered", "read"):
             history.append({"role": "assistant", "content": content})
             if content == FOLLOWUP_MESSAGE or content.startswith("Вы ранее интересовались развитием интеллекта через шахматы"):
                 followup_sent.add(chat_id)
@@ -3350,23 +3446,32 @@ async def _hydrate_chat_history(chat_id):
                 crm_notify_recent[chat_id] = time.time()
                 known_users[chat_id] = {"phone": chat_id.split("@")[0], "_from_crm_notify": True}
                 _block_followup(chat_id, "historical_crm_notification")
+    # Prior messages supply missing facts; never undo a later explicit correction.
+    for key, value in recovered_facts.items():
+        facts.setdefault(key, value)
     chat_history[chat_id] = history
     _save_conversation(chat_id)
 
 
 async def process_dialog(chat_id):
     token = _outbound_context.set((chat_id, incoming_versions[chat_id], "dialog"))
+    completed = False
     try:
         await _process_dialog(chat_id)
+        completed = True
     except Exception:
         logger.exception("Ошибка обработки диалога %s", chat_id)
         _repair_dangling_tool_calls(chat_id)
         if _outbound_allowed(chat_id):
             await _deliver_dialog_answer(chat_id, _dialog_error_text(chat_id))
+        completed = True
     finally:
         try:
+            if completed:
+                _consume_inputs(chat_id)
             _save_conversation(chat_id)
         finally:
+            _processing_inputs.pop(chat_id, None)
             _outbound_context.reset(token)
 
 
@@ -3492,6 +3597,7 @@ async def _process_dialog(chat_id):
         buffer = message_buffers.pop(chat_id, None)
         if not buffer:
             return
+        _processing_inputs[chat_id] = buffer.get("ids", [])
         user_text = " ".join(buffer["messages"])
         logger.info(f"Обработка для {chat_id}: {user_text}")
 
@@ -3528,6 +3634,7 @@ async def _process_dialog(chat_id):
 
         if _is_pure_acknowledgment(user_text) and not _ack_accepts_offer(chat_id, user_text):
             chat_history[chat_id].append({"role": "user", "content": user_text})
+            _consume_inputs(chat_id)
             _block_followup(chat_id, "acknowledgment")
             return
 
@@ -3561,6 +3668,7 @@ async def _process_dialog(chat_id):
         ):
             logger.info("crm-notify ack/greeting для %s: %r", chat_id, user_text)
             chat_history[chat_id].append({"role": "user", "content": user_payload})
+            _consume_inputs(chat_id)
             _block_followup(chat_id, "crm_ack")
             return
 
@@ -3568,7 +3676,14 @@ async def _process_dialog(chat_id):
             logger.info("post-handoff: новый вопрос от %s", chat_id)
             handoff_completed.pop(chat_id, None)
 
-        chat_history[chat_id].append({"role": "user", "content": user_payload})
+        # A restart during generation replays the durable input, whose user
+        # message may already be saved in history. Do not append it twice.
+        restored_history = buffer.get("ids") and set(buffer["ids"]) <= set(buffer.get("history_saved_ids", []))
+        if not restored_history:
+            chat_history[chat_id].append({"role": "user", "content": user_payload})
+        for item in pending_inputs.get(chat_id, []):
+            if item["id"] in _processing_inputs.get(chat_id, []):
+                item["in_history"] = True
         facts = conversation_facts.setdefault(chat_id, {})
         campaign_store = _campaign_store()
         campaign_context = campaign_store.context(chat_id.split('@')[0]) if campaign_store else None
@@ -4005,6 +4120,7 @@ async def _deliver_dialog_answer(chat_id, text):
         return False
     entry = {"text": text, "created": time.time(), "retry_at": time.time(), "attempts": 0}
     pending_answers[chat_id] = entry
+    _consume_inputs(chat_id)
     _save_conversation(chat_id)
     return await _attempt_pending_answer(chat_id, entry)
 
@@ -4082,6 +4198,8 @@ async def _maintenance_loop(kind):
         try:
             if kind == "reports":
                 await _daily_report_tick()
+            elif kind == "incoming":
+                await _recover_incoming_tick()
             else:
                 await _retry_pending_answers()
         except Exception:
@@ -4098,6 +4216,52 @@ async def _start_reporting_and_retries():
             raise ValueError("Invalid DAILY_REPORT_PHONE")
         _spawn_task(_maintenance_loop("reports"))
     _spawn_task(_maintenance_loop("replies"))
+    if INCOMING_RECOVERY_ENABLED:
+        _spawn_task(_maintenance_loop("incoming"))
+
+
+async def _recover_incoming_tick():
+    """Reconcile an overlapping journal window, including chats with no webhook.
+
+    Do not advance a timestamp cursor: an older entry can appear late. The saved
+    message IDs deduplicate recovery, normal webhooks and restarts.
+    """
+    url = f"{GREEN_API_URL}/waInstance{GREEN_API_ID}/lastIncomingMessages/{GREEN_API_TOKEN}"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(url, params={"minutes": 1440})
+        response.raise_for_status()
+        messages = response.json()
+        if not isinstance(messages, list):
+            raise ValueError("Invalid incoming journal")
+    except Exception as error:
+        logger.warning("incoming-recovery: journal unavailable (%s)", type(error).__name__)
+        return
+    recovered = 0
+    for message in sorted((m for m in messages if isinstance(m, dict)),
+                          key=lambda m: _incoming_message_timestamp(m) or 0):
+        chat_id = message.get("chatId")
+        identity = message.get("idMessage")
+        timestamp = _incoming_message_timestamp(message)
+        if (message.get("type") != "incoming" or message.get("isDeleted")
+                or not isinstance(chat_id, str) or not re.fullmatch(r"[0-9]{10,15}@c\.us", chat_id)
+                or not isinstance(identity, str) or not identity or timestamp is None
+                or timestamp < INCOMING_RECOVERY_SINCE
+                or identity in seen_incoming_ids[chat_id]
+                or chat_id in contact_opt_out or _is_internal_chat(chat_id)):
+            continue
+        data = _journal_message_data(message)
+        if data is None:
+            continue
+        text = _extract_main_text(data)
+        if STOP_CONTACT.search(text):
+            _handle_contact_refusal(chat_id, text, identity, acknowledge=False)
+            continue
+        if _should_skip_stale_incoming({"timestamp": timestamp}):
+            continue
+        _queue_incoming(chat_id, data, identity, timestamp)
+        recovered += 1
+    logger.info("incoming-recovery: checked=%d recovered=%d", len(messages), recovered)
 
 
 # --- 7. ВЕБХУК ---
@@ -4138,21 +4302,23 @@ async def handle_webhook(request: Request):
         _block_followup(sender, "internal_or_opt_out")
         return "ok"
     if _should_skip_stale_incoming(data):
+        _record_event("incoming_skipped", sender, "skipped:" + sender + ":" + str(data.get("idMessage") or time.time_ns()))
         return "ok"
     id_message = data.get("idMessage") or msg_data.get("idMessage")
     _queue_incoming(sender, msg_data, id_message, _incoming_message_timestamp(data))
     return "ok"
 
 
-def _queue_incoming(sender, msg_data, id_message, timestamp):
-    if id_message:
+def _queue_incoming(sender, msg_data, id_message, timestamp, *, restoring=False):
+    if id_message and not restoring:
         dq = seen_incoming_ids[sender]
         if id_message in dq:
             logger.info(f"Повтор webhook idMessage={id_message} для {sender}, пропуск")
             return
         dq.append(id_message)
 
-    _record_event("incoming", sender, "incoming:" + sender + ":" + str(id_message) if id_message else None)
+    if not restoring:
+        _record_event("incoming", sender, "incoming:" + sender + ":" + str(id_message) if id_message else None)
     msg_data = dict(msg_data)
     msg_data['_campaign_message_id'] = str(id_message or time.time_ns())
     if _handle_contact_refusal(sender, _extract_main_text(msg_data) or '[голосовое/медиа]', msg_data['_campaign_message_id']):
@@ -4163,21 +4329,53 @@ def _queue_incoming(sender, msg_data, id_message, timestamp):
         latest_incoming_timestamps[sender] = max(timestamp, latest_incoming_timestamps.get(sender, 0))
     incoming_versions[sender] += 1
     incoming_pending[sender] += 1
+    if not restoring:
+        pending_inputs.setdefault(sender, []).append({
+            "id": msg_data['_campaign_message_id'], "data": msg_data, "timestamp": timestamp})
+    # A 200 response to the webhook means the input is durable, even if the
+    # process stops before transcription, the 8-second buffer or model call.
+    try:
+        _save_conversation(sender)
+    except Exception:
+        # A retry must not be acknowledged as a duplicate if disk persistence
+        # failed before the original webhook could be safely acknowledged.
+        if id_message in seen_incoming_ids[sender]:
+            seen_incoming_ids[sender].remove(id_message)
+        if not restoring:
+            _consume_inputs(sender, [msg_data['_campaign_message_id']])
+        incoming_pending[sender] = max(0, incoming_pending[sender] - 1)
+        raise
     # Acknowledge immediately, including voice messages. One ingress lock per
     # chat preserves voice/text order while other chats remain independent.
     lock = _incoming_locks.setdefault(sender, asyncio.Lock())
     _spawn_task(_receive_incoming(sender, msg_data, lock))
 
 
+def _consume_inputs(chat_id, identities=None):
+    identities = set(_processing_inputs.get(chat_id, []) if identities is None else identities)
+    remaining = [item for item in pending_inputs.get(chat_id, []) if item["id"] not in identities]
+    if remaining:
+        pending_inputs[chat_id] = remaining
+    else:
+        pending_inputs.pop(chat_id, None)
+
+
 async def _receive_incoming(sender, msg_data, lock):
     async with lock:
+        finished = False
         try:
             await _buffer_incoming(sender, msg_data)
+            finished = True
         except Exception:
             logger.exception("Ошибка входящего сообщения %s", sender)
             await send_whatsapp(sender, _DIALOG_ERROR_FALLBACK)
+            finished = True
         finally:
             incoming_pending[sender] = max(0, incoming_pending[sender] - 1)
+            identity = msg_data.get('_campaign_message_id')
+            if finished and identity not in message_buffers.get(sender, {}).get("ids", []):
+                _consume_inputs(sender, [identity])
+                _save_conversation(sender)
 
 
 async def _buffer_incoming(sender, msg_data):
@@ -4258,6 +4456,10 @@ async def _buffer_incoming(sender, msg_data):
         message_buffers[sender] = {"messages": []}
 
     message_buffers[sender]["messages"].append(text)
+    if msg_data.get('_campaign_message_id'):
+        message_buffers[sender].setdefault("ids", []).append(msg_data['_campaign_message_id'])
+        if msg_data.get('_history_saved'):
+            message_buffers[sender].setdefault("history_saved_ids", []).append(msg_data['_campaign_message_id'])
     message_buffers[sender]["timer"] = _spawn_task(wait_user_input(sender))
     return "ok"
 
@@ -5340,6 +5542,34 @@ async def _start_attendance_monitor() -> None:
     ))
 
 
+async def _dispatch_teacher_attendance(phone, before_send):
+    actual_chat = phone_to_chat_id(phone)
+    if not actual_chat or actual_chat in contact_opt_out:
+        return {"state": "skipped", "reason": "invalid_or_opted_out_staff"}
+    # Only an assigned teacher reaches this path; don't treat staff replies as leads.
+    internal_chats.add(actual_chat)
+    _block_followup(actual_chat, "teacher_attendance_reminder")
+    _save_conversation(actual_chat)
+    target = phone_to_chat_id(MOYKLASS_WEBHOOK_TEST_PHONE) if _webhook_test_mode_active() else actual_chat
+    if not target:
+        return {"state": "skipped", "reason": "invalid_test_phone"}
+    result = {"state": "not_sent"}
+    sent = await send_whatsapp(target, _teacher_reminders.MESSAGE, sanitize=False,
+                               before_send=before_send, delivery_result=result)
+    if sent:
+        result["state"] = "accepted"
+    return result
+
+
+@app.on_event("startup")
+async def _start_teacher_attendance_reminders():
+    if _teacher_reminders.ENABLED:
+        _spawn_task(_teacher_reminders.reminder_loop(
+            crm=crm, base_url=MOYKLASS_BASE_URL, dispatch=_dispatch_teacher_attendance))
+    else:
+        logger.info("teacher-attendance: disabled")
+
+
 # --- 10. АВТО-РЕАКТИВАЦИЯ «СПЯЩИХ» ЛИДОВ ---
 def _followup_in_quiet_hours(now_local: datetime) -> bool:
     """Тихие часы — follow-up «через 2 часа» откладываем (ночью не пишем)."""
@@ -5417,6 +5647,8 @@ async def _send_followup_message(chat_id: str, *, expected_plan=None) -> bool:
             return False
         token = _outbound_context.set((chat_id, incoming_versions[chat_id], "followup"))
         try:
+            if not await _check_followup_history(chat_id) or not _outbound_allowed(chat_id):
+                return False
             reminder = ("Шахмат сабақтары туралы сұрақтарыңыз қалды ма?"
                         if conversation_facts.get(chat_id, {}).get("language") == "kk" else FOLLOWUP_MESSAGE)
             ok = await send_whatsapp(chat_id, reminder, sanitize=False)
@@ -5429,6 +5661,10 @@ async def _send_followup_message(chat_id: str, *, expected_plan=None) -> bool:
             return ok
         finally:
             _outbound_context.reset(token)
+
+
+async def _check_followup_history(chat_id):
+    return await _refresh_pending_incoming(chat_id)
 
 
 async def _followup_tick() -> None:

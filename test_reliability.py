@@ -46,9 +46,12 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.ai = self.enterContext(patch.object(bot.openai_client.chat.completions, 'create', AsyncMock(side_effect=AssertionError('Unexpected AI'))))
         self.send = self.enterContext(patch.object(bot, 'send_whatsapp', AsyncMock(return_value=True)))
         self.hydrate = self.enterContext(patch.object(bot, '_hydrate_chat_history', AsyncMock()))
+        self.followup_history = self.enterContext(patch.object(bot, '_check_followup_history', AsyncMock(return_value=True)))
+        self.enterContext(patch.object(bot, 'GREEN_HISTORY_MIN_INTERVAL_SEC', 0))
+        self.enterContext(patch.object(bot, 'INCOMING_RECOVERY_SINCE', bot.BOT_STARTED_AT))
         self.lookup = self.enterContext(patch.object(bot.crm, 'find_user_smart', AsyncMock(return_value=None)))
         for name in ('chat_history', 'message_buffers', 'known_users', 'client_dossiers', 'crm_lookup_state', 'last_activity',
-                     'followups', 'pending_answers', 'handoff_completed', 'session_manager_notified', 'seen_incoming_ids',
+                     'followups', 'pending_answers', 'pending_inputs', '_processing_inputs', 'handoff_completed', 'session_manager_notified', 'seen_incoming_ids',
                      'crm_notify_recent', 'conversation_facts', 'incoming_versions', 'incoming_pending', 'latest_incoming_timestamps', '_dialog_locks', '_incoming_locks', '_wa_last_chat_ts'):
             getattr(bot, name).clear()
         for name in ('_crm_sent_keys', '_crm_inflight_keys', 'followup_blocked', 'session_registered_leads', 'contact_opt_out', 'internal_chats', 'followup_sent', 'history_hydrated', '_wa_send_times'):
@@ -56,6 +59,8 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
         attendance._missed_sent.clear()
         attendance._debt_sent.clear()
         bot._wa_send_lock = None
+        bot._history_lock = None
+        bot._history_last_request = 0
         bot._wa_last_send_ts = 0
         bot._wa_paused_until = 0
         self.chat = '77001234567@c.us'

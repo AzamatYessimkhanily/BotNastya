@@ -25,6 +25,10 @@ evaluation_usage.sqlite3*
 # Private CRM audit snapshots (student/contact data).
 local_reports/
 campaigns.sqlite3*
+teacher_attendance.sqlite3*
 # Private campaign audiences; keep originals out of source control.
 /Телефоны_родител*.xlsx
 .campaign-imports/
+
+# Server incident backups may contain credentials and runtime state.
+.incident-backups/
