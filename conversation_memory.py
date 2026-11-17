@@ -57,7 +57,30 @@ CHILD = r'\b(?:ребен\w*|сын(?:у|а|ом)?|доч\w*|балам\w*|ба�
 SELF_REQUEST = re.compile(r'\bдля\s+(?:себя|меня)\b|\bөзім(?:е|\s+үшін)\b|^\s*өзім[.!]?\s*$', re.I)
 
 
+SCHOOL_GRADE = re.compile(
+    r'(?<![\d.,])(?P<grade>\d{1,2})\s*(?:[-–]?\s*(?:й|ой|ый|ом|м))?\s*'
+    r'(?:класс\w*|сынып\w*)', re.I)
+
+
+def age_from_school_grade(low):
+    """«6 класс» / «в 3 классе» / «5 сынып» → примерный возраст (класс + 6).
+
+    Родители часто называют класс вместо возраста; без этого «Сын 6 класс»
+    читалось как «6 лет» и ребёнку ~12 лет предлагали группу для дошкольников.
+    """
+    grade = SCHOOL_GRADE.search(low)
+    if not grade:
+        return None
+    number = int(grade.group('grade'))
+    if not 0 <= number <= 11:
+        return None
+    return str(number + 6)
+
+
 def student_age_from_text(low, facts, last_question):
+    grade_age = age_from_school_grade(low)
+    if grade_age is not None and not re.search(r'\d{1,2}\s*' + AGE_UNIT, low):
+        return grade_age
     # Prefer the pupil's age over the parent's, irrespective of sentence order.
     child_age = re.search(CHILD + r'\s*(?:сейчас\s+|уже\s+|исполнилось\s+)?' + AGE_NUMBER, low)
     self_age = re.search(r'\b(?:мне\s+(?:сейчас\s+|уже\s+|исполнилось\s+)?|менің\s+жасым\s+)' + AGE_NUMBER, low)
